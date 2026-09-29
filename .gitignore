@@ -1,0 +1,17 @@
+# Big binary data folders (competition benchmarks & caches)
+snapshots/
+embeddings/
+graphs/
+wheels/
+results/
+docker/
+backups/
+*.npz
+*.whl
+*.tar.gz
+*.tar
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+test.txt
