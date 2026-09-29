@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""fast-grep: Ranked AST-Aware Keyword and Regex Search across Workspace.
+"""fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents.
 
-Searches codebase via git grep (with pure Python fallback), ranks matches by
-architectural relevance (core definitions > references > tests > docs),
-and automatically flashes the top 3 complete, deterministic enclosing Python
-functions using AST parsing.
-
-Always returns exit code 0.
-
-Usage:
-    python3 grep.py <pattern> [search_path]
+Eats ANY input format:
+- Single terms, multiple terms (searched as OR/union)
+- Unescaped regex or literal code snippets
+- Dotted symbols, function calls, or raw keywords
+- Automatically skips benchmarks, lockfiles, docs, and non-code spam
+- Flashes top 3 enclosing functions with complete decorators via AST
+- Always exits 0 and never crashes.
 """
 
 import ast
@@ -20,11 +18,11 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+# Noisy non-code directories that pollute search results
 SKIP_DIRS = {
-    "__pycache__",
-    "build",
-    "dist",
     ".git",
+    ".hg",
+    ".svn",
     ".tox",
     ".nox",
     ".mypy_cache",
@@ -32,44 +30,70 @@ SKIP_DIRS = {
     "node_modules",
     "venv",
     ".venv",
+    "benchmarks",
+    "docs",
+    "doc",
+    "build",
+    "dist",
+    "site-packages",
+    "__pycache__",
 }
 
-TEXT_EXTENSIONS = {
+# Ignored data/lock/telemetry files that swamp search with hash collisions
+SKIP_EXTENSIONS = {
+    ".lock",
+    ".json",
+    ".csv",
+    ".tsv",
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".pyc",
+    ".whl",
+    ".tar",
+    ".gz",
+    ".tgz",
+    ".zip",
+    ".so",
+    ".dylib",
+    ".min.js",
+    ".map",
+}
+
+ALLOWED_CODE_EXTENSIONS = {
     ".py",
+    ".pyi",
     ".md",
     ".rst",
     ".txt",
     ".toml",
     ".yaml",
     ".yml",
-    ".json",
-    ".ini",
-    ".cfg",
     ".sh",
     ".bash",
 }
 
 
 def get_workspace_dir() -> pathlib.Path:
-    """Robustly and deterministically locate the active target repository workspace directory."""
-    # a) Check caller stack frame for _orig_cwd (set by ADK in _materialize_and_run)
+    """Deterministically locate the active repository workspace."""
     try:
         f = sys._getframe()
         while f:
-            if "_orig_cwd" in f.f_locals and f.f_locals["_orig_cwd"]:
+            if "_orig_cwd" in f.f_locals:
                 p = pathlib.Path(f.f_locals["_orig_cwd"])
                 if p.is_dir() and (
                     (p / ".git").exists()
                     or (p / "pyproject.toml").exists()
                     or (p / "setup.py").exists()
-                    or (p / "setup.cfg").exists()
                 ):
                     return p.resolve()
             f = f.f_back
     except Exception:
         pass
 
-    # d) Environment variable overrides (SWEGEMMA_WORKSPACE or WORKSPACE_DIR)
     for env_var in ("SWEGEMMA_WORKSPACE", "WORKSPACE_DIR"):
         val = os.environ.get(env_var)
         if val:
@@ -77,293 +101,326 @@ def get_workspace_dir() -> pathlib.Path:
             if p.is_dir():
                 return p.resolve()
 
-    # b) Check standard competition container workspace (/workspace)
     ws = pathlib.Path("/workspace")
     if ws.is_dir():
         return ws.resolve()
 
-    # c) Check current working directory and its parents for repo markers
-    cur = pathlib.Path.cwd().resolve()
-    for parent in [cur] + list(cur.parents):
-        if (
-            (parent / ".git").exists()
-            or (parent / "pyproject.toml").exists()
-            or (parent / "setup.py").exists()
-            or (parent / "setup.cfg").exists()
-        ):
-            return parent
-
-    # e) Fall back safely to current working directory
-    return cur
+    return pathlib.Path.cwd().resolve()
 
 
-def resolve_target(target_str: str | None, ws: pathlib.Path) -> pathlib.Path:
-    """Resolve any given search path against the workspace."""
-    if not target_str or str(target_str).strip() in (".", "./", "/workspace", "/workspace/"):
-        return ws
-
-    clean = str(target_str).strip()
-    if clean.startswith("/workspace/"):
-        clean = clean[len("/workspace/"):]
-    elif clean == "/workspace":
-        return ws
-    clean = clean.lstrip("/")
-
-    cand = ws / clean
-    if cand.exists():
-        return cand
-
-    try:
-        matches = list(ws.glob(f"**/{clean}"))
-        if matches:
-            return matches[0]
-    except Exception:
-        pass
-
-    return ws
+def clean_search_term(term: str) -> str:
+    """Normalize terms without destroying useful symbols."""
+    t = term.strip()
+    # Strip wrapping quotes if LLM passed '"pattern"' or "'pattern'"
+    if len(t) >= 2 and (
+        (t.startswith('"') and t.endswith('"'))
+        or (t.startswith("'") and t.endswith("'"))
+        or (t.startswith("`") and t.endswith("`"))
+    ):
+        t = t[1:-1].strip()
+    return t
 
 
-def run_git_grep(pattern: str, search_target: pathlib.Path, ws: pathlib.Path) -> List[str] | None:
-    """Attempt fast git grep if git is available."""
-    try:
-        rel_target = search_target.relative_to(ws)
-        path_arg = str(rel_target) if str(rel_target) != "." else ""
-    except ValueError:
-        path_arg = ""
+def parse_args(args: List[str], ws: pathlib.Path) -> Tuple[List[str], pathlib.Path]:
+    """Omnivorous argument parser: handles multiple search terms and optional path target."""
+    raw_terms: List[str] = []
+    target_path = ws
 
-    cmd = ["git", "grep", "-n", "-i", "-I", "--line-number", pattern]
-    if path_arg:
-        cmd.extend(["--", path_arg])
+    for a in args:
+        cleaned = clean_search_term(a)
+        if not cleaned:
+            continue
+        # Check if argument is a directory or file in workspace
+        cand = ws / cleaned.lstrip("/")
+        if cand.exists() and cand != ws:
+            target_path = cand
+        elif cleaned in (".", "./", "/workspace", "/workspace/"):
+            target_path = ws
+        else:
+            raw_terms.append(cleaned)
 
+    return raw_terms, target_path
+
+
+def run_git_grep(terms: List[str], target: pathlib.Path, ws: pathlib.Path) -> List[str]:
+    """Execute git grep with extended regex and path exclusions."""
+    if not (ws / ".git").exists():
+        return []
+
+    # Build pattern: if multiple terms, search as OR regex: (term1|term2|term3)
+    # Escape metacharacters safely if they look like plain code with parens
+    safe_terms = []
+    for t in terms:
+        # If term has unescaped regex syntax like '(' but not '|', escape it
+        if any(c in t for c in "()[]{}?+*") and "|" not in t:
+            safe_terms.append(re.escape(t))
+        else:
+            safe_terms.append(t)
+
+    combined_pattern = "|".join(safe_terms) if len(safe_terms) > 1 else safe_terms[0]
+
+    # Target path relative to workspace
+    rel_target = "."
+    if target != ws:
+        try:
+            rel_target = str(target.relative_to(ws))
+        except ValueError:
+            rel_target = "."
+
+    # Build path exclusions for git grep
+    path_args = [rel_target]
+    for d in SKIP_DIRS:
+        path_args.append(f":(exclude){d}/**")
+        path_args.append(f":(exclude)**/{d}/**")
+    for ext in SKIP_EXTENSIONS:
+        path_args.append(f":(exclude)*{ext}")
+        path_args.append(f":(exclude)**/*{ext}")
+
+    # 1. Try extended regex (-E)
+    cmd = ["git", "grep", "-n", "-I", "-E", "-e", combined_pattern, "--"] + path_args
     try:
         res = subprocess.run(
-            cmd,
-            cwd=ws,
-            capture_output=True,
-            text=True,
-            timeout=15,
+            cmd, cwd=ws, capture_output=True, text=True, timeout=10, check=False
         )
-        if res.returncode in (0, 1):
-            return res.stdout.strip().splitlines() if res.stdout.strip() else []
+        if res.returncode == 0 and res.stdout.strip():
+            return [line for line in res.stdout.splitlines() if line.strip()]
     except Exception:
         pass
-    return None
 
-
-def run_python_grep(pattern: str, search_target: pathlib.Path, ws: pathlib.Path, max_matches: int = 150) -> List[str]:
-    """Pure Python fallback for regex and text searching."""
-    try:
-        regex = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        regex = re.compile(re.escape(pattern), re.IGNORECASE)
-
-    matches: List[str] = []
-
-    if search_target.is_file():
-        file_list = [search_target]
-    else:
-        file_list = []
-        for root, dirs, files in os.walk(search_target):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS and not d.endswith(".egg-info")]
-            for f in sorted(files):
-                if f.startswith("."):
-                    continue
-                ext = os.path.splitext(f)[1].lower()
-                if ext in TEXT_EXTENSIONS or f in ("Makefile", "Dockerfile", "pyproject.toml", "setup.cfg"):
-                    file_list.append(pathlib.Path(root) / f)
-
-    for p in file_list:
-        if len(matches) >= max_matches:
-            break
+    # 2. Fallback to fixed-strings (-F) for each term
+    all_lines: List[str] = []
+    for t in terms:
+        cmd_fixed = ["git", "grep", "-n", "-I", "-F", "-e", t, "--"] + path_args
         try:
-            rel_display = p.relative_to(ws)
-        except ValueError:
-            rel_display = p
-
-        try:
-            with open(p, "r", encoding="utf-8", errors="replace") as f:
-                for line_idx, line in enumerate(f, 1):
-                    if regex.search(line):
-                        matches.append(f"{rel_display}:{line_idx}:{line.rstrip()}")
-                        if len(matches) >= max_matches:
-                            break
+            res = subprocess.run(
+                cmd_fixed, cwd=ws, capture_output=True, text=True, timeout=10, check=False
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                all_lines.extend(res.stdout.splitlines())
         except Exception:
-            continue
+            pass
+
+    return list(dict.fromkeys(all_lines))
+
+
+def run_python_fallback(terms: List[str], target: pathlib.Path, ws: pathlib.Path) -> List[str]:
+    """Pure Python fallback for non-git workspaces with spam filtering."""
+    matches: List[str] = []
+    root = target if target.is_dir() else ws
+
+    # Compile regexes or literal checkers
+    regexes = []
+    for t in terms:
+        try:
+            regexes.append(re.compile(t, re.IGNORECASE))
+        except re.error:
+            regexes.append(re.compile(re.escape(t), re.IGNORECASE))
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune skip dirs in-place
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in SKIP_EXTENSIONS or ext not in ALLOWED_CODE_EXTENSIONS:
+                continue
+
+            full_p = pathlib.Path(dirpath) / fn
+            try:
+                rel_p = str(full_p.relative_to(ws))
+            except ValueError:
+                rel_p = str(full_p)
+
+            try:
+                with open(full_p, "r", encoding="utf-8", errors="replace") as f:
+                    for lineno, line in enumerate(f, start=1):
+                        for rx in regexes:
+                            if rx.search(line):
+                                matches.append(f"{rel_p}:{lineno}:{line.rstrip()}")
+                                break
+            except Exception:
+                continue
+
+            if len(matches) > 300:
+                break
+        if len(matches) > 300:
+            break
 
     return matches
 
 
-def score_match(file_path: str, lineno: int, content: str, pattern: str) -> int:
-    """Compute probability/relevance score for ranking search matches."""
+def score_match(file_path: str, lineno: int, content: str, terms: List[str]) -> int:
+    """Calculate relevance score prioritizing core definitions and source code."""
     score = 0
-    # 1. Path scoring
-    if "docs/" in file_path or file_path.endswith((".md", ".rst", ".txt")):
-        score -= 50
-    elif "test" in file_path:
-        score += 10
-    elif file_path.endswith(".py"):
-        score += 50
-        if not (file_path.startswith("examples/") or file_path.startswith("benchmarks/")):
-            score += 20
+    p_lower = file_path.lower()
+    c = content.strip()
 
-    # 2. Definition vs reference scoring
-    if re.search(r"^\s*(def|class)\s+", content):
-        score += 40
-        clean_pat = re.sub(r"[^a-zA-Z0-9_]", "", pattern)
-        if clean_pat and re.search(rf"^\s*(def|class)\s+{clean_pat}\b", content, re.IGNORECASE):
-            score += 30
+    # Prefer python source files
+    if file_path.endswith(".py"):
+        score += 30
+    elif file_path.endswith((".pyi", ".toml")):
+        score += 10
+
+    # Demote tests and docs
+    if "test" in p_lower:
+        score -= 25
+    if "doc" in p_lower or file_path.endswith((".md", ".rst")):
+        score -= 40
+    if "bench" in p_lower or "example" in p_lower:
+        score -= 50
+
+    # Boost definitions and calls
+    for t in terms:
+        t_clean = re.sub(r"[^a-zA-Z0-9_]", "", t)
+        if not t_clean:
+            continue
+        if re.search(rf"\b(def|class)\s+{t_clean}\b", c):
+            score += 60
+        elif re.search(rf"\b{t_clean}\b", c):
+            score += 25
+        elif t in c:
+            score += 10
 
     return score
 
 
 def extract_function_scope(file_path: pathlib.Path, target_line: int) -> Optional[Dict[str, Any]]:
-    """Extract the complete, deterministic enclosing Python function using AST."""
-    if not file_path.is_file() or file_path.suffix != ".py":
-        return None
-
+    """Extract enclosing function or class scope including all decorators."""
     try:
-        source = file_path.read_text(encoding="utf-8", errors="replace")
-        tree = ast.parse(source, filename=str(file_path))
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(text, filename=str(file_path))
     except Exception:
         return None
 
-    parent_map = {}
-    for parent in ast.walk(tree):
-        for child in ast.iter_child_nodes(parent):
-            parent_map[child] = parent
+    best_node = None
+    best_size = float("inf")
 
-    candidates = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
-                if node.lineno <= target_line <= node.end_lineno:
-                    candidates.append(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            # Include decorators in start line
+            start = node.lineno
+            if node.decorator_list:
+                start = min(d.lineno for d in node.decorator_list)
+            end = getattr(node, "end_lineno", start + 20)
 
-    if not candidates:
+            if start <= target_line <= end:
+                size = end - start
+                if size < best_size:
+                    best_size = size
+                    best_node = (node, start, end)
+
+    if not best_node:
         return None
 
-    # Pick innermost enclosing function
-    candidates.sort(key=lambda n: n.end_lineno - n.lineno)
-    best = candidates[0]
-
-    # Resolve qualified name (e.g. ClassName.method_name)
-    name_parts = [best.name]
-    curr = parent_map.get(best)
-    while curr:
-        if isinstance(curr, ast.ClassDef):
-            name_parts.insert(0, curr.name)
-        curr = parent_map.get(curr)
-
-    qual_name = ".".join(name_parts)
-    raw_lines = source.splitlines()
-    fn_lines = raw_lines[best.lineno - 1 : best.end_lineno]
+    node, start, end = best_node
+    lines = text.splitlines()[start - 1 : end]
+    name = getattr(node, "name", "scope")
+    kind = "class" if isinstance(node, ast.ClassDef) else "def"
 
     return {
-        "name": qual_name,
-        "start_line": best.lineno,
-        "end_line": best.end_lineno,
-        "line_count": len(fn_lines),
-        "lines": fn_lines,
+        "name": f"{kind} {name}",
+        "start_line": start,
+        "end_line": end,
+        "line_count": len(lines),
+        "lines": lines,
     }
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("[fast-grep] No search pattern provided.")
-        print("Usage: python3 grep.py <pattern> [search_path]")
-        return 0
+    try:
+        raw_args = sys.argv[1:]
+        if not raw_args:
+            print("[fast-grep] No search term provided. Usage: run_skill_script('fast-grep', 'grep.py', args=['<term>'])")
+            return 0
 
-    pattern = sys.argv[1].strip()
-    target_arg = sys.argv[2].strip() if len(sys.argv) > 2 else "."
+        ws = get_workspace_dir()
+        terms, target = parse_args(raw_args, ws)
 
-    ws = get_workspace_dir()
-    search_target = resolve_target(target_arg, ws)
+        if not terms:
+            print("[fast-grep] No valid search terms provided.")
+            return 0
 
-    # 1. Execute search
-    results = run_git_grep(pattern, search_target, ws)
-    if results is None:
-        results = run_python_grep(pattern, search_target, ws)
+        # Execute search: git grep first, then pure Python fallback
+        results = run_git_grep(terms, target, ws)
+        if not results:
+            results = run_python_fallback(terms, target, ws)
 
-    if not results:
-        print(f"[fast-grep] 0 matches found for pattern: '{pattern}' in {search_target.name or '.'}")
-        return 0
+        if not results:
+            terms_str = ", ".join(repr(t) for t in terms)
+            print(f"[fast-grep] 0 matches found for: {terms_str}")
+            return 0
 
-    # 2. Parse and rank matches by probability/relevance
-    parsed_matches = []
-    for r in results:
-        parts = r.split(":", 2)
-        if len(parts) >= 2 and parts[1].isdigit():
-            file_s = parts[0]
-            line_i = int(parts[1])
-            content_s = parts[2] if len(parts) > 2 else ""
-            sc = score_match(file_s, line_i, content_s, pattern)
-            parsed_matches.append({
-                "file": file_s,
-                "lineno": line_i,
-                "content": content_s,
-                "score": sc,
-                "raw": r,
-            })
+        # Parse and rank
+        parsed = []
+        for r in results:
+            parts = r.split(":", 2)
+            if len(parts) >= 2 and parts[1].isdigit():
+                fp = parts[0]
+                lineno = int(parts[1])
+                content = parts[2] if len(parts) > 2 else ""
+                sc = score_match(fp, lineno, content, terms)
+                parsed.append({"file": fp, "lineno": lineno, "content": content, "score": sc})
 
-    parsed_matches.sort(key=lambda m: m["score"], reverse=True)
+        parsed.sort(key=lambda m: m["score"], reverse=True)
 
-    # 3. Extract top 3 unique enclosing functions via AST
-    seen_funcs: Set[Tuple[str, str]] = set()
-    flashed_funcs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        # Extract top 3 unique function scopes
+        flashed: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        seen = set()
+        for m in parsed:
+            p = ws / m["file"]
+            if not p.suffix == ".py" or not p.exists():
+                continue
+            scope = extract_function_scope(p, m["lineno"])
+            if scope:
+                key = (m["file"], scope["name"])
+                if key not in seen:
+                    seen.add(key)
+                    flashed.append((m, scope))
+                    if len(flashed) >= 3:
+                        break
 
-    for m in parsed_matches:
-        p = ws / m["file"]
-        if not p.suffix == ".py":
-            continue
-        scope = extract_function_scope(p, m["lineno"])
-        if scope:
-            key = (m["file"], scope["name"])
-            if key not in seen_funcs:
-                seen_funcs.add(key)
-                flashed_funcs.append((m, scope))
-                if len(flashed_funcs) == 3:
-                    break
+        # Output results concisely (capped under ADK 5000 char limit)
+        terms_display = " | ".join(terms)
+        print(f"[fast-grep] Search: '{terms_display}' ({len(parsed)} matches, top {len(flashed)} scopes flashed):\n")
 
-    # 4. Display flashed top 3 functions
-    print(f"[fast-grep] Pattern: '{pattern}' ({len(parsed_matches)} total matches, top 3 functions flashed):\n")
-
-    if flashed_funcs:
-        for idx, (m, sc) in enumerate(flashed_funcs, 1):
-            f_path = m["file"]
-            q_name = sc["name"]
+        for idx, (m, sc) in enumerate(flashed, start=1):
+            fp = m["file"]
+            qname = sc["name"]
             s_line = sc["start_line"]
             e_line = sc["end_line"]
-            total_l = sc["line_count"]
             lines = sc["lines"]
+            total = len(lines)
 
             print("=" * 80)
-            print(f"⭐ TOP {idx} [Score {m['score']:+d}]: {f_path} (lines {s_line}-{e_line}) | {q_name} ({total_l} lines)")
+            print(f"⭐ TOP {idx} [Score {m['score']:+d}]: {fp}:{m['lineno']} in {qname} (lines {s_line}-{e_line})")
             print("=" * 80)
 
-            # Cap huge functions (e.g. >100 lines) safely to preserve context budget
-            if total_l > 100:
-                for i, line in enumerate(lines[:70], start=s_line):
-                    print(f"{i:4d}: {line}")
-                omitted = total_l - 90
-                print(f"      ... [{omitted} lines omitted in large function] ...")
-                for i, line in enumerate(lines[-20:], start=e_line - 19):
-                    print(f"{i:4d}: {line}")
+            # Cap function lines safely
+            if total > 50:
+                for i, l in enumerate(lines[:35], start=s_line):
+                    print(f"{i:4d}: {l}")
+                print(f"      ... [{total - 45} lines omitted in large scope] ...")
+                for i, l in enumerate(lines[-10:], start=e_line - 9):
+                    print(f"{i:4d}: {l}")
             else:
-                for i, line in enumerate(lines, start=s_line):
-                    print(f"{i:4d}: {line}")
+                for i, l in enumerate(lines, start=s_line):
+                    print(f"{i:4d}: {l}")
             print()
 
-    # 5. Display concise list of remaining/other matches
-    print("-" * 80)
-    print("📋 ALL RANKED MATCHES (Top 25 summary):")
-    for m in parsed_matches[:25]:
-        content_preview = m["content"].strip()[:70]
-        print(f"  [{m['score']:+3d}] {m['file']}:{m['lineno']}: {content_preview}")
+        # Summary of other ranked matches
+        print("-" * 80)
+        print("📋 TOP MATCH PREVIEWS:")
+        for m in parsed[:15]:
+            snippet = m["content"].strip()[:80]
+            print(f"  [{m['score']:+3d}] {m['file']}:{m['lineno']}: {snippet}")
 
-    if len(parsed_matches) > 25:
-        print(f"  ... ({len(parsed_matches) - 25} more matches truncated)")
+        if len(parsed) > 15:
+            print(f"  ... ({len(parsed) - 15} additional matches truncated)")
 
-    return 0
+        return 0
+    except Exception as e:
+        print(f"[fast-grep] Search completed with fallback: {e}")
+        return 0
 
 
 if __name__ == "__main__":

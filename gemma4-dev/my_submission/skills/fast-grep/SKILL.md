@@ -18,10 +18,11 @@ Fast, omnivorous codebase search tool for locating strings, regex patterns, func
 
 ### Via ADK `run_skill_script`
 ```python
+# Single or multi-term searches (searched across codebase as union/OR):
 run_skill_script(
     skill_name="fast-grep",
     file_path="grep.py",
-    args=["<pattern>"]
+    args=["term1", "term2", "term3"]
 )
 ```
 

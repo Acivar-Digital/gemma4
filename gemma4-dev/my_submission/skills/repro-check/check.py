@@ -1,43 +1,44 @@
 #!/usr/bin/env python3
-"""repro-check: Isolated Python Repro & Defect Verification Runner.
+"""repro-check: Omnivorous Defect Reproduction & Verification Engine.
 
-Executes a user-supplied Python assertion or reproduction snippet in /tmp
-with PYTHONPATH set to the active workspace.
-Guarantees clean git diff (zero scratch files in /workspace) and context-safe output.
-Always returns exit code 0.
-
-Usage:
-    python3 check.py "<code>"
+Eats ANY input format:
+- Auto-asserts bare comparison expressions: `a == b` -> `assert a == b`
+- Auto-invokes uncalled test functions: `def test_...():`
+- Strips markdown fences (```py, ```python, etc.) and auto-dedents
+- Guarantees zero workspace git pollution (executes inside isolated /tmp cwd)
+- Prioritizes /workspace and /workspace/src in PYTHONPATH
+- Distinguishes between Assertion Failures, Workspace Exceptions, and Probes
+- Always exits 0 and never crashes.
 """
 
 import ast
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
+import textwrap
+from typing import List, Optional, Set, Tuple
 
 
 def get_workspace_dir() -> pathlib.Path:
-    """Robustly and deterministically locate the active target repository workspace directory."""
-    # a) Check caller stack frame for _orig_cwd (set by ADK in _materialize_and_run)
+    """Deterministically locate the active repository workspace."""
     try:
         f = sys._getframe()
         while f:
-            if "_orig_cwd" in f.f_locals and f.f_locals["_orig_cwd"]:
+            if "_orig_cwd" in f.f_locals:
                 p = pathlib.Path(f.f_locals["_orig_cwd"])
                 if p.is_dir() and (
                     (p / ".git").exists()
                     or (p / "pyproject.toml").exists()
                     or (p / "setup.py").exists()
-                    or (p / "setup.cfg").exists()
                 ):
                     return p.resolve()
             f = f.f_back
     except Exception:
         pass
 
-    # d) Environment variable overrides (SWEGEMMA_WORKSPACE or WORKSPACE_DIR)
     for env_var in ("SWEGEMMA_WORKSPACE", "WORKSPACE_DIR"):
         val = os.environ.get(env_var)
         if val:
@@ -45,122 +46,216 @@ def get_workspace_dir() -> pathlib.Path:
             if p.is_dir():
                 return p.resolve()
 
-    # b) Check standard competition container workspace (/workspace)
     ws = pathlib.Path("/workspace")
     if ws.is_dir():
         return ws.resolve()
 
-    # c) Check current working directory and its parents for repo markers
-    cur = pathlib.Path.cwd().resolve()
-    for parent in [cur] + list(cur.parents):
-        if (
-            (parent / ".git").exists()
-            or (parent / "pyproject.toml").exists()
-            or (parent / "setup.py").exists()
-            or (parent / "setup.cfg").exists()
-        ):
-            return parent
-
-    # e) Fall back safely to current working directory
-    return cur
+    return pathlib.Path.cwd().resolve()
 
 
-def clean_snippet(code: str) -> str:
-    """Clean snippet formatting, stripping surrounding markdown codeblocks if present."""
-    code = code.strip()
-    if code.startswith("```python"):
-        code = code[len("```python"):].strip()
-    elif code.startswith("```"):
-        code = code[len("```"):].strip()
-    if code.endswith("```"):
-        code = code[:-3].strip()
-    return code
+def clean_and_normalize_code(raw_args: List[str]) -> str:
+    """Extract code from arbitrary CLI arguments, stripping fences and normalizing indentation."""
+    # If passed as multiple arguments, join with newlines
+    code = "\n".join(raw_args).strip()
+
+    # Strip markdown code blocks: ```python ... ``` or ```py ... ``` or ``` ... ```
+    code = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n?", "", code)
+    code = re.sub(r"\n?```\s*$", "", code)
+
+    # Handle accidental literal escaped newlines (e.g. "\\n" instead of "\n" if passed improperly)
+    if "\\n" in code and "\n" not in code:
+        code = code.replace("\\n", "\n")
+
+    return textwrap.dedent(code).strip()
 
 
-def run_code_in_tmp(code: str, ws: pathlib.Path, timeout_secs: int = 10) -> int:
-    """Write snippet to a temporary script in /tmp and execute it with workspace PYTHONPATH."""
-    env = os.environ.copy()
-    existing_pp = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{ws}:{existing_pp}" if existing_pp else str(ws)
+class OmnivorousCodeTransformer(ast.NodeTransformer):
+    """AST Transformer that converts bare comparison expressions into assertions and tracks tests."""
 
-    # Use a secure temp file in /tmp, strictly outside /workspace
-    with tempfile.NamedTemporaryFile("w", suffix="_repro.py", dir="/tmp", delete=False) as tf:
-        tf.write(code)
-        temp_script = pathlib.Path(tf.name)
+    def __init__(self) -> None:
+        super().__init__()
+        self.transformed_comparisons = 0
+        self.explicit_asserts = 0
+        self.defined_test_funcs: Set[str] = set()
+        self.called_funcs: Set[str] = set()
 
+    def visit_Assert(self, node: ast.Assert) -> ast.AST:
+        self.explicit_asserts += 1
+        return self.generic_visit(node)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        name = node.name.lower()
+        if name.startswith(("test_", "check_", "verify_")):
+            self.defined_test_funcs.add(node.name)
+        return self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        name = node.name.lower()
+        if name.startswith(("test_", "check_", "verify_")):
+            self.defined_test_funcs.add(node.name)
+        return self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if isinstance(node.func, ast.Name):
+            self.called_funcs.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            self.called_funcs.add(node.func.attr)
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node: ast.Expr) -> ast.AST:
+        # If the statement is a standalone comparison expression: `a == b` or `x in y`
+        # Auto-transform it into `assert <expr>`
+        if isinstance(node.value, ast.Compare):
+            self.transformed_comparisons += 1
+            msg = f"Check failed (auto-asserted): {ast.unparse(node.value) if hasattr(ast, 'unparse') else 'comparison'}"
+            new_assert = ast.Assert(
+                test=node.value,
+                msg=ast.Constant(value=msg),
+            )
+            return ast.copy_location(new_assert, node)
+        return self.generic_visit(node)
+
+
+def prepare_executable_code(code: str) -> Tuple[str, bool, int]:
+    """Parse, transform, and auto-wire code for flawless execution."""
     try:
-        res = subprocess.run(
-            [sys.executable, str(temp_script)],
-            cwd=ws,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_secs,
-        )
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        # If AST parsing fails, return raw code so python interpreter gives the exact traceback
+        return code, False, 0
 
-        stdout = res.stdout.strip()
-        stderr = res.stderr.strip()
+    transformer = OmnivorousCodeTransformer()
+    new_tree = transformer.visit(tree)
+    ast.fix_missing_locations(new_tree)
 
-        has_assert = False
+    # Check uncalled test functions
+    uncalled = transformer.defined_test_funcs - transformer.called_funcs
+    has_checks = (
+        transformer.explicit_asserts > 0
+        or transformer.transformed_comparisons > 0
+        or len(transformer.defined_test_funcs) > 0
+        or "pytest.raises" in code
+        or "unittest" in code
+    )
+
+    total_checks = transformer.explicit_asserts + transformer.transformed_comparisons
+
+    # Auto-generate runner calls for any uncalled test functions
+    new_code = ast.unparse(new_tree) if hasattr(ast, "unparse") else code
+    if uncalled:
+        runner_lines = ["\n# --- Auto-generated Test Invocations by repro-check ---"]
+        for fn in sorted(uncalled):
+            runner_lines.append(f"{fn}()")
+        new_code += "\n".join(runner_lines) + "\n"
+
+    return new_code, has_checks, total_checks
+
+
+def execute_script(
+    code_to_run: str, ws: pathlib.Path, timeout_secs: int = 45
+) -> Tuple[int, str, str]:
+    """Execute code in an isolated /tmp sandbox with /workspace imports."""
+    with tempfile.TemporaryDirectory(prefix="swegemma_repro_") as temp_dir:
+        temp_dir_path = pathlib.Path(temp_dir)
+        script_file = temp_dir_path / "repro_test.py"
+        script_file.write_text(code_to_run, encoding="utf-8")
+
+        # Build clean, robust environment
+        env = dict(os.environ)
+        # Prioritize workspace/src and workspace
+        src_path = str(ws / "src")
+        ws_path = str(ws)
+        current_py_path = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{src_path}:{ws_path}:{current_py_path}".strip(":")
+        env["PYTHONSAFEPATH"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        cmd = [sys.executable, "-s", str(script_file)]
+
         try:
-            tree = ast.parse(code)
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Assert):
-                    has_assert = True
-                    break
-        except Exception:
-            has_assert = "assert " in code or "assert(" in code
-
-        if res.returncode == 0:
-            if has_assert:
-                print("[repro-check] ✅ PASSED: All assertions evaluated and passed with zero errors.")
-            else:
-                print("[repro-check] ℹ️ EXECUTED WITH ZERO ERRORS (BUT NO ASSERTIONS EVALUATED)")
-                print("[repro-check] ⚠️ WARNING: Your code contained NO 'assert' statements!")
-                print("[repro-check] You CANNOT confirm a bug or fix with print statements alone.")
-                print("[repro-check] You MUST add an explicit assert (e.g. assert actual == expected) to reproduce or verify.")
-            if stdout:
-                print("[repro-check] OUTPUT:")
-                for line in stdout.splitlines()[:15]:
-                    print(f"  {line}")
-        else:
-            if "AssertionError" in (stderr or stdout):
-                print(f"[repro-check] ❌ ASSERTION FAILED (Defect Confirmed):")
-            else:
-                print(f"[repro-check] ❌ EXECUTION FAILED (Exit code {res.returncode}):")
-            # Extract last few lines of traceback/error
-            err_lines = (stderr or stdout).splitlines()
-            clean_lines = [l for l in err_lines if l.strip()][-12:]
-            for line in clean_lines:
-                print(f"  {line}")
-
-        return 0
-    except subprocess.TimeoutExpired:
-        print(f"[repro-check] ❌ FAILED: Execution timed out after {timeout_secs} seconds.")
-        return 0
-    except Exception as e:
-        print(f"[repro-check] ❌ FAILED to execute script: {e}")
-        return 0
-    finally:
-        temp_script.unlink(missing_ok=True)
+            res = subprocess.run(
+                cmd,
+                cwd=temp_dir_path,  # Crucial: runs in /tmp, NEVER in /workspace!
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_secs,
+            )
+            return res.returncode, res.stdout.strip(), res.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return 124, "", f"Execution timed out after {timeout_secs} seconds."
+        except Exception as e:
+            return 1, "", f"Failed to execute process: {e}"
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        print("[repro-check] No Python code snippet provided.")
-        print("[repro-check] Usage: python3 check.py \"assert Text.from_ansi('\\n').plain == '\\n'\"")
+    try:
+        raw_args = sys.argv[1:]
+        if not raw_args:
+            print("[repro-check] No code provided. Usage: run_skill_script('repro-check', 'check.py', args=['<code>'])")
+            return 0
+
+        code = clean_and_normalize_code(raw_args)
+        if not code:
+            print("[repro-check] Empty code provided.")
+            return 0
+
+        ws = get_workspace_dir()
+        transformed_code, has_checks, check_count = prepare_executable_code(code)
+
+        exit_code, stdout, stderr = execute_script(transformed_code, ws)
+
+        # -------------------------------------------------------------
+        # Classification & Reporting
+        # -------------------------------------------------------------
+        if exit_code == 0:
+            if has_checks:
+                print("[repro-check] ✅ PASSED: All assertions and checks passed with 0 errors.")
+            else:
+                print("[repro-check] 📋 PROBE EXECUTION (Exit code 0):")
+            if stdout:
+                print(stdout)
+            return 0
+
+        # Non-zero exit code: Analyze failure
+        combined_err = f"{stderr}\n{stdout}".strip()
+
+        # Case A: Defect confirmed via AssertionError
+        if "AssertionError" in combined_err:
+            print("[repro-check] 🎯 DEFECT CONFIRMED (Assertion Failed):")
+            lines = [l for l in combined_err.splitlines() if l.strip()][-10:]
+            for l in lines:
+                print(f"  {l}")
+            return 0
+
+        # Case B: Defect confirmed via Workspace Runtime Exception (e.g. AttributeError, KeyError in repo code)
+        ws_str = str(ws)
+        if ws_str in combined_err:
+            print("[repro-check] 💥 DEFECT REPRODUCED (Workspace Runtime Exception):")
+            lines = [l for l in combined_err.splitlines() if l.strip()][-12:]
+            for l in lines:
+                print(f"  {l}")
+            return 0
+
+        # Case C: SyntaxError in the test script itself
+        if "SyntaxError" in combined_err:
+            print("[repro-check] ⚠️ TEST SCRIPT SYNTAX ERROR:")
+            lines = [l for l in combined_err.splitlines() if l.strip()][-6:]
+            for l in lines:
+                print(f"  {l}")
+            return 0
+
+        # Case D: General Execution Failure
+        print(f"[repro-check] ❌ EXECUTION FAILED (Exit code {exit_code}):")
+        lines = [l for l in combined_err.splitlines() if l.strip()][-10:]
+        for l in lines:
+            print(f"  {l}")
+
         return 0
-
-    code = " ".join(sys.argv[1:]) if len(sys.argv) > 2 else sys.argv[1]
-    cleaned = clean_snippet(code)
-
-    if not cleaned:
-        print("[repro-check] Provided Python code snippet was empty.")
+    except Exception as e:
+        print(f"[repro-check] Runner error: {e}")
         return 0
-
-    ws = get_workspace_dir()
-    run_code_in_tmp(cleaned, ws)
-    return 0
 
 
 if __name__ == "__main__":

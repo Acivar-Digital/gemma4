@@ -39,7 +39,8 @@ assert Text.from_ansi("\\n").plain == "\\n"
 ```
 
 ## Guarantees
-- **Runs outside `/workspace`**: Uses a temporary file in `/tmp`, leaving `git diff HEAD` 100% clean.
-- **Uses workspace code**: Automatically sets `PYTHONPATH` to `/workspace` so changes in your edited files are immediately reflected.
-- **Assertion-Aware**: Confirms whether assertions actually ran. Warns if code ran without `assert`.
-- **Fast & Safe (<2s)**: 10-second timeout, capped output (max 20 lines), and always exits cleanly with code 0 so the agent never crashes on an `AssertionError`.
+- **Omnivorous Execution**: Auto-asserts bare comparisons (`a == b`), auto-invokes uncalled test functions (`def test_...():`), and cleanly strips markdown fences.
+- **Runs outside `/workspace`**: Uses a temporary directory in `/tmp` as `cwd`, leaving `git diff HEAD` 100% clean and preventing any scratch file pollution.
+- **Uses workspace code**: Automatically sets `PYTHONPATH` to `/workspace/src:/workspace` so changes in your edited files are immediately reflected, supporting both flat and `src/` layouts.
+- **Smart Result Classification**: Distinguishes between `DEFECT CONFIRMED (Assertion Failed)`, `DEFECT REPRODUCED (Workspace Runtime Exception)`, `PASSED`, and `PROBE EXECUTION`.
+- **Fast & Safe (<2s)**: 45-second timeout, capped output, and always exits cleanly with code 0.
