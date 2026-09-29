@@ -383,26 +383,31 @@ def check_live_agent_diagnostics() -> tuple[bool, str]:
             tool_registry=tools,
             model_registry=models,
         )
-        supervisor_tool = [t for t in main_agent.tools if hasattr(t, 'agent')][0]
-        supervisor_agent = supervisor_tool.agent
-
+        subagent_tools = [t for t in main_agent.tools if hasattr(t, 'agent')]
+        
         main_resp = asyncio.run(_query_agent(main_agent, 'main'))
-        supervisor_resp = asyncio.run(_query_agent(supervisor_agent, 'supervisor'))
+        subagent_resps = []
+        for sat in subagent_tools:
+            name = getattr(sat.agent, 'name', 'subagent')
+            subagent_resps.append((name, asyncio.run(_query_agent(sat.agent, name))))
         mgr.stop(sb_id)
 
         print("\n" + "=" * 80)
-        print("🤖 [LIVE AGENT 1/2] MAIN DEVELOPER AGENT RESPONSE:")
+        print("🤖 [LIVE AGENT] MAIN DEVELOPER AGENT RESPONSE:")
         print("=" * 80)
         print(main_resp)
-        print("\n" + "=" * 80)
-        print("🛡️  [LIVE AGENT 2/2] SUPERVISOR QUALITY GATEKEEPER RESPONSE:")
-        print("=" * 80)
-        print(supervisor_resp)
+        for sname, sresp in subagent_resps:
+            print("\n" + "=" * 80)
+            print(f"🛡️  [LIVE SUBAGENT] {sname.upper()} RESPONSE:")
+            print("=" * 80)
+            print(sresp)
         print("=" * 80)
 
-        if not main_resp or not supervisor_resp:
-            return False, "Empty response received from Main or Supervisor"
-        return True, "Both Main Developer Agent and Supervisor Gatekeeper responded with full verified tool/skill awareness."
+        if not main_resp:
+            return False, "Empty response received from Main Developer Agent"
+        if subagent_tools and any(not r for _, r in subagent_resps):
+            return False, "Empty response received from subagent"
+        return True, f"Main Developer Agent ({'with ' + str(len(subagent_tools)) + ' subagents' if subagent_tools else 'lean monolith'}) responded with full verified tool/skill awareness."
     except Exception as e:
         return False, f"Live agent diagnostic failed: {e}"
 

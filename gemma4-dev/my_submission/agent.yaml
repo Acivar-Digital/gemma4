@@ -6,10 +6,8 @@ tools:
   - edit_file
   - write_file
   - get_status
+  - submit_patch
   - search_similar_code
-  - agent_tool:
-      config_path: sub_agents/supervisor.yaml
-      skip_summarization: true
 skills:
   - skills/repro-check
   - skills/blast-radius
