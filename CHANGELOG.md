@@ -5,6 +5,19 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 ## [Unreleased] - 2026-09-30
 
 ### Changed (Single-Agent Lean Monolith Migration)
+- **Omnivorous Tools Overhaul (`my_submission/skills/`)**:
+  - **`fast-grep`**:
+    - **Multi-Argument Ingestion**: Accepts any number of arguments; searches all passed terms concurrently (`term1 | term2 | term3`).
+    - **Intelligent Path vs Token Separation**: Automatically checks if any argument is an existing path; treats all other tokens as search terms.
+    - **Spam Filtering**: Automatically excludes `benchmarks/`, `docs/`, `build/`, `dist/`, `.tox/`, `venv/`, and non-code telemetry files (`*.lock`, `*.json`, `*.csv`) to eliminate commit-hash spam.
+    - **Dual Regex/Literal Engine**: Extended regex (`-E`) with silent fallback to fixed-strings (`-F`) for unescaped code snippets.
+    - **Full Decorator AST Scopes**: Captures `@app.get`, `@property`, `@classmethod` in start lines.
+  - **`repro-check`**:
+    - **AST Auto-Assertion Rewriter**: Automatically transforms bare comparison expressions (e.g. `a == b` or `func() == 3`) into assertions (`assert a == b, ...`).
+    - **Auto-Runner for Test Functions**: Automatically discovers and invokes uncalled top-level test functions (`def test_...():`).
+    - **Markdown Fence & Escape Stripper**: Cleanly strips ` ```py `, ` ```python `, and unescapes newlines without errors.
+    - **Hermetic Sandbox Isolation**: Runs child processes strictly inside `/tmp` with `PYTHONPATH=/workspace/src:/workspace` and `PYTHONSAFEPATH=1`, guaranteeing zero git pollution in `/workspace`.
+    - **Accurate Defect Classification**: Clearly distinguishes between `DEFECT CONFIRMED (Assertion Failed)`, `DEFECT REPRODUCED (Workspace Runtime Exception)`, `PASSED`, and `PROBE EXECUTION`.
 - **Git State Branching**:
   - Created persistent git branch `supervisor` (commit `d51b186`) preserving the full 2-agent architecture, supervisor subagent, and handoff contracts for archival and rollback.
 - **Architectural Simplification (`my_submission/`)**:
