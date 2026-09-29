@@ -1,0 +1,20 @@
+name: main
+model: gemma-4-31b-it-qat-w4a16-ct
+instruction: !include prompts/main.md
+tools:
+  - read_file
+  - edit_file
+  - write_file
+  - get_status
+  - search_similar_code
+  - agent_tool:
+      config_path: sub_agents/supervisor.yaml
+      skip_summarization: true
+skills:
+  - skills/repro-check
+  - skills/blast-radius
+  - skills/fast-grep
+  - skills/repo-map
+  - skills/code-graph
+  - skills/diff-inspect
+generate_content_config: !include configs/sampling.yaml
