@@ -4,6 +4,23 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 
 ## [Unreleased] - 2026-09-30
 
+### Changed (Single-Agent Lean Monolith Migration)
+- **Git State Branching**:
+  - Created persistent git branch `supervisor` (commit `d51b186`) preserving the full 2-agent architecture, supervisor subagent, and handoff contracts for archival and rollback.
+- **Architectural Simplification (`my_submission/`)**:
+  - Dropped `supervisor` subagent (`my_submission/sub_agents/supervisor.yaml` and `my_submission/prompts/supervisor.md`).
+  - Promoted `submit_patch` directly to `main` agent in `my_submission/agent.yaml`.
+  - Consolidated full task ownership into a single autonomous agent, eliminating diffusion of responsibility and delegation starvation.
+- **Modus Operandi & Mouse-Reading Elimination (`my_submission/prompts/main.md`)**:
+  - **Surgical Line Offsets**: Strictly banned calling `read_file` from line 1 of large files (>100 lines); mandated specifying `start_line` and `end_line` centered around hits (e.g. `start_line = max(1, target - 25)`, `end_line = target + 25`) to prevent burning tool calls reading license headers and boilerplate imports.
+  - **Batched Test Matrices (`repro-check`)**: Mandated running multi-hypothesis and multi-module checks in a single script assertion matrix (e.g. testing candidate 1 and candidate 2 in 1 call) rather than sequential 1-assertion calls.
+  - **Bare-Symbol Search Queries (`search_similar_code`)**: Constrained queries to bare identifiers (`split_lines`, `AnsiDecoder`) without Python syntax (`def `, `class `, `()`) or conversational English.
+  - **Action Bias & Mutation Ceiling**: Enforced maximum 3 investigative calls before formulating a hypothesis; mandated calling `edit_file` within the first 6 tool calls.
+  - **Post-Verification Immediate Submission**: Post-edit `repro-check` $\to$ `diff-inspect` $\to$ immediate `submit_patch()` without redundant test loops.
+- **Diagnostics & Preflight (`scripts/preflight_check.py`)**:
+  - Updated preflight live diagnostic check to support lean monolith single-agent architectures, validating that the model directly recognizes its full toolbelt, skills, surgical offset discipline, and submission authority.
+  - Verified 6/6 preflight checks passing (100% watertight).
+
 ### Fixed & Hardened (Red-Team Audit Remediations)
 - **Prompt Generalization (`my_submission/prompts/main.md`)**:
   - Purged task-specific overfitting and contamination (`rich_4076`, `Text.from_ansi`, `splitlines()`).
