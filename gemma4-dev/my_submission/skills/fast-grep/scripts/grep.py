@@ -199,6 +199,13 @@ SKIP_DIRS: Set[str] = {
     "dist",
     "wheels",
     "snapshots",
+    "benchmarks",
+    "benchmark",
+    "results",
+    "docs",
+    "doc",
+    "htmlcov",
+    "site-packages",
 }
 
 SKIP_EXTENSIONS: Set[str] = {
@@ -214,6 +221,15 @@ SKIP_EXTENSIONS: Set[str] = {
     ".ico",
     ".pyc",
     ".whl",
+    ".json",
+    ".csv",
+    ".log",
+    ".xml",
+    ".txt",
+    ".yaml",
+    ".yml",
+    ".md",
+    ".rst",
 }
 
 STRING_TRANSFORM_VERBS: Set[str] = {

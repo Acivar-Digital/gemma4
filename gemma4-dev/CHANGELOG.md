@@ -2,6 +2,21 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
+## [Unreleased] - 2026-10-01 (Run B29 Post-Mortem & Anti-Runaway Hardening)
+
+### Fixed & Hardened (Token Runaway Elimination & Context Hygiene)
+- **Fast-Grep Context Protection (`my_submission/skills/fast-grep/`)**:
+  - Expanded `SKIP_DIRS` with `benchmarks`, `benchmark`, `results`, `docs`, `doc`, `htmlcov`, `site-packages` to prevent scanning noisy benchmark results and documentation trees.
+  - Expanded `SKIP_EXTENSIONS` with non-code and data formats: `.json`, `.csv`, `.log`, `.xml`, `.txt`, `.yaml`, `.yml`, `.md`, `.rst`.
+  - Prevents raw JSON dumps (such as 110 benchmark result files on numeric searches) from polluting agent context and confusing function-calling parsers.
+  - Mirrored byte-for-byte between `grep.py` and `scripts/grep.py`.
+- **Sampling Generation Ceiling (`my_submission/configs/sampling.yaml`)**:
+  - Capped `max_output_tokens` from 16,384 to 4,096 tokens as an aggressive circuit breaker.
+  - Retained `thinking_budget: 4096` and `temperature: 0.15` while preventing multi-minute 16K runaway loops on repetition attractors.
+- **Tool Calling Interface Defense (`my_submission/prompts/main.md`)**:
+  - Hardened Section 1 with a strict negative constraint forbidding inline JSON tool representations (`{"name": "...", "args": ...}`) or pseudo-code function calls in conversational text.
+  - Clarified that tool calls must only be executed through the environment's native structured tool-calling interface, and that textual JSON leaks will be treated as wasted turns without execution.
+
 ## [Unreleased] - 2026-10-01 (Model- & Test-Agnostic Sanitization Pass)
 
 ### Removed & Sanitized (Zero Task Leakage / Anti-Overfitting Gate)
