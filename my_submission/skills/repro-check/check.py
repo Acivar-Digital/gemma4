@@ -293,7 +293,11 @@ def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
     if (actual == "" and expected in ("\n", "\r\n")) or (actual in ("\n", "\r\n") and expected == ""):
         return (
             "💡 HINT: Degenerate boundary mismatch (empty string vs newline). "
-            "Ensure string splitting/joining does not collapse single-newline inputs."
+            "Ensure string splitting/joining does not collapse single-newline inputs. "
+            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
+            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
+            "NEVER add 'if line == \"\": continue' to drop empty strings! "
+            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
         )
 
     # Trailing newline / whitespace mismatch (difference is at or near the end, e.g. missing trailing \n, \r\n, or extra trailing whitespace)
@@ -304,7 +308,21 @@ def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
             "If your code needs to preserve all lines and trailing newlines, use: re.split(r'(?<=\\n)', text). "
             "CRITICAL: Because re.split(r'(?<=\\n)', text) retains the trailing delimiter on each chunk "
             "(e.g. ['foo\\n', '']), you MUST strip the newline from each chunk (e.g. chunk.rstrip('\\n')) "
-            "before passing to consumers or re-joining lines!"
+            "before passing to consumers or re-joining lines! "
+            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
+            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
+            "NEVER add 'if line == \"\": continue' to drop empty strings! "
+            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
+        )
+
+    # Newline count mismatch (empty line suppression or newline preservation issue)
+    if ("\n" in actual or "\n" in expected) and actual.count("\n") != expected.count("\n"):
+        return (
+            "💡 HINT: Line break count mismatch detected! "
+            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
+            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
+            "NEVER add 'if line == \"\": continue' to drop empty strings! "
+            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
         )
 
     return None
