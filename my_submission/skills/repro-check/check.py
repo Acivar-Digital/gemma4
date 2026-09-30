@@ -8,6 +8,7 @@ Eats ANY input format:
 - Guarantees zero workspace git pollution (executes inside isolated /tmp cwd)
 - Prioritizes /workspace and /workspace/src in PYTHONPATH
 - Distinguishes between Assertion Failures, Workspace Exceptions, and Probes
+- Active probe budget limiter: circuit breaker after 2 exploratory probes
 - Always exits 0 and never crashes.
 """
 
@@ -20,6 +21,8 @@ import sys
 import tempfile
 import textwrap
 from typing import List, Optional, Set, Tuple
+
+PROBE_COUNT_FILE = pathlib.Path("/tmp/.swegemma_repro_probe_count")
 
 
 def get_workspace_dir() -> pathlib.Path:
@@ -189,6 +192,34 @@ def execute_script(
             return 1, "", f"Failed to execute process: {e}"
 
 
+def get_probe_count() -> int:
+    """Retrieve the current exploratory probe count."""
+    try:
+        if PROBE_COUNT_FILE.exists():
+            return int(PROBE_COUNT_FILE.read_text(encoding="utf-8").strip())
+    except Exception:
+        pass
+    return 0
+
+
+def increment_probe_count() -> int:
+    """Increment and persist the exploratory probe count."""
+    count = get_probe_count() + 1
+    try:
+        PROBE_COUNT_FILE.write_text(str(count), encoding="utf-8")
+    except Exception:
+        pass
+    return count
+
+
+def reset_probe_count() -> None:
+    """Reset the exploratory probe count to 0."""
+    try:
+        PROBE_COUNT_FILE.write_text("0", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def main() -> int:
     try:
         raw_args = sys.argv[1:]
@@ -211,18 +242,30 @@ def main() -> int:
         # -------------------------------------------------------------
         if exit_code == 0:
             if has_checks:
+                reset_probe_count()
                 print("[repro-check] ✅ PASSED: All assertions and checks passed with 0 errors.")
+                if stdout:
+                    print(stdout)
+                return 0
             else:
+                count = increment_probe_count()
                 print("[repro-check] 📋 PROBE EXECUTION (Exit code 0):")
-            if stdout:
-                print(stdout)
-            return 0
+                if stdout:
+                    print(stdout)
+                if count >= 2:
+                    print(
+                        "[repro-check] ⚠️ PROBE BUDGET REACHED (2/2 probes used): "
+                        "You have executed 2 exploratory probes without reproducing a defect or failing an assertion. "
+                        "Stop probing! Formulate your defect hypothesis, locate candidate source lines, and call edit_file immediately."
+                    )
+                return 0
 
         # Non-zero exit code: Analyze failure
         combined_err = f"{stderr}\n{stdout}".strip()
 
         # Case A: Defect confirmed via AssertionError
         if "AssertionError" in combined_err:
+            reset_probe_count()
             print("[repro-check] 🎯 DEFECT CONFIRMED (Assertion Failed):")
             lines = [l for l in combined_err.splitlines() if l.strip()][-10:]
             for l in lines:
@@ -232,6 +275,7 @@ def main() -> int:
         # Case B: Defect confirmed via Workspace Runtime Exception (e.g. AttributeError, KeyError in repo code)
         ws_str = str(ws)
         if ws_str in combined_err:
+            reset_probe_count()
             print("[repro-check] 💥 DEFECT REPRODUCED (Workspace Runtime Exception):")
             lines = [l for l in combined_err.splitlines() if l.strip()][-12:]
             for l in lines:
