@@ -9,6 +9,8 @@ Features:
   and why calling submit_patch will fail.
 - High-visibility scratch file warnings: detects untracked temporary/repro files
   (e.g., repro.py, test_*.py, tmp*.py) and warns about 'git add -N .' patch pollution.
+- Multi-file contamination warnings: alerts when total_files_modified > 1 to prevent
+  accidental patch contamination across multiple files.
 - File-by-file line diff statistics: additions (+), deletions (-), and file status.
 - Risk detection for forbidden harness files (pytest.ini, conftest.py) and test suite files.
 - 100% Pydantic v2 structured outputs (DiffInspectResult, FileDiffStat, DiffWarning).
@@ -46,7 +48,7 @@ class DiffWarning(BaseModel):
 
     category: str = Field(
         ...,
-        description="Warning category (e.g. DANGER_UNTRACKED_SCRATCH, FORBIDDEN_HARNESS_FILE, TEST_FILE_MODIFIED, EMPTY_DIFF)",
+        description="Warning category (e.g. DANGER_UNTRACKED_SCRATCH, FORBIDDEN_HARNESS_FILE, TEST_FILE_MODIFIED, EMPTY_DIFF, MULTI_FILE_CONTAMINATION)",
     )
     path: str = Field(
         default="",
@@ -553,7 +555,31 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
         diff_preview = diff_out
 
     # 4. Clean Diff Explanation & Patch Submission Feasibility
-    is_clean = (len(file_stats) == 0 and (not diff_out or diff_out.strip() == ""))
+    total_files_modified = len(file_stats)
+    is_clean = (total_files_modified == 0 and (not diff_out or diff_out.strip() == ""))
+
+    # Multi-file patch contamination check
+    if total_files_modified > 1:
+        modified_names = [f.path for f in file_stats]
+        list_of_files = ", ".join(modified_names)
+        warnings.append(
+            DiffWarning(
+                category="MULTI_FILE_CONTAMINATION",
+                path=list_of_files,
+                message=(
+                    f"⚠️ CAUTION: Multiple files modified ({total_files_modified} files: {list_of_files}). "
+                    f"Over 90% of SWE-bench tasks only require modifying 1 file!"
+                ),
+                risk_explanation=(
+                    "Modifying secondary files often breaks unrelated components or indicates an unverified patch. "
+                    "Revert secondary edits if the root cause belongs in a single module."
+                ),
+                recommended_action=(
+                    "Run blast-radius on the primary modified file. "
+                    "If tests fail, revert your secondary file edits using edit_file."
+                ),
+            )
+        )
 
     if is_clean:
         clean_msg = "Working tree is clean. 0 files modified relative to git baseline HEAD. Calling submit_patch now will result in an empty patch failure."
@@ -575,7 +601,7 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
     elif dangerous_untracked_files:
         can_submit_patch = False
         summary_explanation = (
-            f"Diff contains {len(file_stats)} modified file(s) (+{total_additions}, -{total_deletions}), "
+            f"Diff contains {total_files_modified} modified file(s) (+{total_additions}, -{total_deletions}), "
             f"BUT {len(dangerous_untracked_files)} dangerous scratch file(s) exist in /workspace!"
         )
         submit_patch_advice = (
@@ -586,28 +612,11 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
     else:
         can_submit_patch = True
         summary_explanation = (
-            f"Diff contains {len(file_stats)} modified file(s): "
+            f"Diff contains {total_files_modified} modified file(s): "
             f"+{total_additions} additions, -{total_deletions} deletions relative to {base_ref or 'HEAD'}."
         )
-        if len(file_stats) > 1:
-            modified_names = [f.path for f in file_stats]
-            warnings.append(
-                DiffWarning(
-                    category="MULTI_FILE_CONTAMINATION",
-                    path=", ".join(modified_names),
-                    message=(
-                        f"⚠️ CAUTION: Multiple files modified ({len(file_stats)} files: {', '.join(modified_names)}). "
-                        f"Over 90% of SWE-bench tasks only require modifying 1 file!"
-                    ),
-                    risk_explanation=(
-                        f"Modifying secondary files often breaks unrelated components or indicates an unverified patch. "
-                        f"Revert secondary edits if the root cause belongs in a single module."
-                    ),
-                    recommended_action="Run blast-radius on the primary modified file. If tests fail, revert your secondary file edits using edit_file.",
-                )
-            )
         submit_patch_advice = (
-            f"READY: Working tree has {len(file_stats)} modified file(s) (+{total_additions}, -{total_deletions}) "
+            f"READY: Working tree has {total_files_modified} modified file(s) (+{total_additions}, -{total_deletions}) "
             f"with zero dangerous scratch files. Ready for submit_patch()."
         )
 
@@ -615,7 +624,7 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
         workspace=str(ws),
         base_ref=base_ref or "HEAD",
         is_clean=is_clean,
-        total_files_modified=len(file_stats),
+        total_files_modified=total_files_modified,
         total_additions=total_additions,
         total_deletions=total_deletions,
         file_stats=file_stats,

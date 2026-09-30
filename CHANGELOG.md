@@ -2,6 +2,23 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
+## [Unreleased] - 2026-10-01
+
+### Fixed & Hardened (Run B26 Post-Mortem: Anti-Chaining, Lookbehind Delimiter Semantics & Continuation Defense)
+- **Prompt Anti-Chaining & Single-Tool Protocol (`my_submission/prompts/main.md`)**:
+  - Enforced strict `EXACTLY ONE TOOL CALL PER TURN` rule, explicitly forbidding batching, chaining, or concatenating multiple tool JSONs in a single response. Eliminates the 3x 16,384-token runaway loops observed in Run B26.
+  - Updated Turn 1 search discipline: call either `search_similar_code` OR `fast-grep` on Turn 1 (never both at once).
+  - Added lookbehind delimiter semantics in Section 6: clarified that `re.split(r"(?<=\n)", text)` retains the trailing delimiter on each chunk (`['foo\n', '']`), mandating `chunk.rstrip("\r\n")` to prevent doubled newlines (`\n\n`) when joined.
+  - Added Continuation Nudge Defense in Section 8: strictly forbids calling `submit_patch()` upon receiving a harness continuation nudge unless `blast-radius` has verified 0 regressions on disk.
+- **Lookbehind Delimiter Stripping Hints (`my_submission/skills/repro-check/`)**:
+  - Enhanced string diff remediation hints in `check.py` and `scripts/check.py` to explicitly remind agents that `re.split(r"(?<=\n)", text)` chunks must be stripped via `chunk.rstrip('\n')` before line joining.
+  - Mirrored byte-for-byte between `check.py` and `scripts/check.py`.
+- **Lookbehind Delimiter Stripping Hints (`my_submission/skills/blast-radius/`)**:
+  - Enhanced boundary failure remediation in `test_blast.py` and `scripts/test_blast.py` to instruct stripping trailing delimiters when handling lookbehind splits.
+  - Mirrored byte-for-byte between `test_blast.py` and `scripts/test_blast.py`.
+- **Synchronization & Validation (`my_submission/skills/diff-inspect/`)**:
+  - Verified `diff.py` and `scripts/diff.py` byte-for-byte parity and clean Pydantic v2 JSON serialization under multi-file diffs.
+
 ## [Unreleased] - 2026-09-30
 
 ### Fixed & Hardened (Run B25 Post-Mortem & Multi-File / read_file Hardening)
