@@ -39,7 +39,8 @@ run_skill_script(
 3. **Context-Window Safe**:
    - Capped at 120 lines total output so it never overflows the 32K context window.
    - Concludes with concise count summary: `[Showing X symbols across Y files]`.
-4. **Resilient & Dependency-Free**:
-   - Zero external dependencies (`ast`, `sys`, `os`, `pathlib` standard library only).
-   - Gracefully skips syntax errors or unparseable files without crashing.
-   - Returns exit code 0.
+4. **Resilient & Diagnostic**:
+   - 100% Pydantic v2 schemas (`RepoMapResult`, `ModuleSummary`, `MapDiagnostic`, `SymbolItem`, `RepoLayoutItem`).
+   - Missing path diagnostics: Explains why path does not exist, provides closest fuzzy suggestions, and renders top-level repo layout.
+   - AST syntax diagnostics: Catches `SyntaxError`/`IndentationError`, extracts exact line, column, code snippet with caret pointer, and repair guidance.
+   - Always returns exit code 0.
