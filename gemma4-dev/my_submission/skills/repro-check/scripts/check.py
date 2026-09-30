@@ -292,38 +292,18 @@ def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
     # Degenerate boundary mismatch (empty string vs newline)
     if (actual == "" and expected in ("\n", "\r\n")) or (actual in ("\n", "\r\n") and expected == ""):
         return (
-            "💡 HINT: Degenerate boundary mismatch (empty string vs newline). "
-            "Ensure string splitting/joining does not collapse single-newline inputs. "
-            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
-            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
-            "NEVER add 'if line == \"\": continue' to drop empty strings! "
-            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
+            "💡 HINT: Boundary value mismatch detected. Verify edge-case handling for empty or boundary inputs."
         )
 
-    # Trailing newline / whitespace mismatch (difference is at or near the end, e.g. missing trailing \n, \r\n, or extra trailing whitespace)
+    # Suffix / trailing mismatch (difference is at or near the end, e.g. missing trailing \n, \r\n, or extra trailing whitespace)
     if actual.rstrip() == expected.rstrip():
         return (
-            "💡 HINT: Trailing newline mismatch detected! In Python, str.splitlines() "
-            "and str.splitlines(True) drop the trailing empty token after a terminal newline. "
-            "If your code needs to preserve all lines and trailing newlines, use: re.split(r'(?<=\\n)', text). "
-            "CRITICAL: Because re.split(r'(?<=\\n)', text) retains the trailing delimiter on each chunk "
-            "(e.g. ['foo\\n', '']), you MUST strip the newline from each chunk (e.g. chunk.rstrip('\\n')) "
-            "before passing to consumers or re-joining lines! "
-            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
-            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
-            "NEVER add 'if line == \"\": continue' to drop empty strings! "
-            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
+            "💡 HINT: Trailing character or newline mismatch. Actual string differs in suffix from expected."
         )
 
-    # Newline count mismatch (empty line suppression or newline preservation issue)
+    # Line count mismatch (empty line suppression or newline preservation issue)
     if ("\n" in actual or "\n" in expected) and actual.count("\n") != expected.count("\n"):
-        return (
-            "💡 HINT: Line break count mismatch detected! "
-            "CRITICAL ANTI-SUPPRESSION RULE: When splitting strings with re.split(r'(?<=\\n)', text), "
-            'empty strings ("") at line boundaries or terminal positions are necessary representations of empty lines. '
-            "NEVER add 'if line == \"\": continue' to drop empty strings! "
-            "Dropping empty lines destroys newline preservation and causes tests asserting trailing newlines to fail!"
-        )
+        return f"💡 HINT: Line count mismatch detected. Expected {expected.count('\n')} newlines, got {actual.count('\n')}. Check for dropped empty lines or delimiter parsing differences."
 
     return None
 
@@ -1179,7 +1159,7 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         failing_lineno = last_tb.tb_lineno if last_tb else 1
         failing_file = failing_frame.f_code.co_filename if failing_frame else str(script_path)
 
-        line_text = linecache.getline(failing_file, failing_lineno).strip()
+        code_line = linecache.getline(failing_file, failing_lineno).strip()
 
         locals_dict = {}
         if failing_frame:
@@ -1190,13 +1170,13 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         actual_val = None
         expected_val = None
         op_str = "=="
-        explanation = f"Assertion failed: {str(exc) or line_text or 'AssertionError'}"
+        explanation = f"Assertion failed: {str(exc) or code_line or 'AssertionError'}"
         first_diff_idx = None
         diff_str = None
 
-        if line_text:
+        if code_line:
             try:
-                tree = ast.parse(line_text)
+                tree = ast.parse(code_line)
                 if tree.body and isinstance(tree.body[0], ast.Assert):
                     assert_node = tree.body[0]
                     if isinstance(assert_node.test, ast.Compare) and len(assert_node.test.ops) == 1:
@@ -1224,7 +1204,7 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         )
 
         assertion_diag = AssertionDiagnostic(
-            assertion_code=line_text or f"assert {str(exc)}",
+            assertion_code=code_line or f"assert {str(exc)}",
             op=op_str,
             actual_type=act_type,
             actual_repr=act_repr,
