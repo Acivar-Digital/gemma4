@@ -4,6 +4,46 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 
 ## [Unreleased] - 2026-09-30
 
+### Added & Hardened (Deterministic Explanatory Diagnostics Overhaul across all 6 Skills)
+- **`repro-check` (`my_submission/skills/repro-check/`)**:
+  - Implemented AST assertion introspection via `__repro_assert__` and bytecode frame examination.
+  - Extracts `actual` and `expected` values with raw escape codes (`\n`, `\r\n`, spaces) and lengths.
+  - Computes character-level `ndiff` and unified diffs showing exact mismatch locations.
+  - Generates plain-English diagnostic explanations (e.g., `MISMATCH: Actual string ('hello', 5 chars) is missing trailing '\n' present in Expected string ('hello\n', 6 chars)`).
+  - Introspects and dumps all local variables in the failing scope with lengths and types.
+  - 100% Pydantic v2 schemas (`AssertionDiagnostic`, `VariableInfo`, `DiagnosticReport`, `ReproCheckOutput`).
+- **`blast-radius` (`my_submission/skills/blast-radius/`)**:
+  - Full pytest failure block parsing with `-vv --tb=short`, eliminating 1-line truncation.
+  - Extracts exact failing assertions, comparisons, line numbers, and captured stdout/stderr.
+  - Deterministic regression root cause diagnosis (e.g. unexpected extra trailing newlines/whitespace, truncated strings, exception types).
+  - Modified repo file & AST symbol correlation: directly links failing tests to modified repository files.
+  - Groups common failures caused by shared underlying regressions across multiple tests.
+  - 100% Pydantic v2 schemas (`TestFailureDetail`, `FailureDiagnosis`, `BlastRadiusResult`).
+- **`fast-grep` (`my_submission/skills/fast-grep/`)**:
+  - Deterministic zero-match diagnostics reporting total searchable files across `/workspace`.
+  - Automatic case-insensitive fallback search: immediately reports matches when case is ignored.
+  - AST identifier fuzzy candidate suggestions: recommends top 5 closest symbols via sequence similarity matching.
+  - Plain-English regex syntax diagnostics: catches `re.error`, explains syntax issues, and suggests safe escaped patterns.
+  - 100% Pydantic v2 schemas (`FastGrepResult`, `MatchExplanation`, `FuzzySuggestion`, `RegexErrorDiagnostic`).
+- **`diff-inspect` (`my_submission/skills/diff-inspect/`)**:
+  - Deterministic empty-diff explanation: warns when working tree is clean relative to baseline HEAD.
+  - Untracked scratch file scanner: detects dangerous temporary scripts in `/workspace` (`repro.py`, `scratch*.py`, `tmp*.py`) that would pollute the official git patch, blocking submission and advising cleanup.
+  - File-by-file line additions/deletions stats and forbidden harness file warnings (`pytest.ini`, `conftest.py`).
+  - 100% Pydantic v2 schemas (`DiffWarning`, `FileDiffStat`, `DiffInspectResult`).
+- **`repo-map` (`my_submission/skills/repo-map/`)**:
+  - Missing path diagnosis: explains why path is missing and recommends closest fuzzy directories and files.
+  - Top-level repository layout overview rendered when paths are missing.
+  - AST `SyntaxError` and `IndentationError` diagnostics with line, column, and visual caret pointers.
+  - 100% Pydantic v2 schemas (`MapDiagnostic`, `SymbolItem`, `ModuleSummary`, `RepoMapResult`).
+- **`code-graph` (`my_submission/skills/code-graph/`)**:
+  - Missing symbol explanation across graph topology and live AST scanning.
+  - Fuzzy symbol ranking: suggests top 5 closest symbol names with similarity scores.
+  - Specialized inspection hints for internal/private symbols (`_`) and dotted imports (`.`).
+  - Caller/callee reachability diagnostics reporting inbound callers and outbound callees.
+  - 100% Pydantic v2 schemas (`CodeGraphResult`, `ReferenceDetail`, `SymbolSuggestion`, `CallerCalleeConnection`).
+- **Sampling Budget (`my_submission/configs/sampling.yaml`)**:
+  - Set `max_output_tokens: 16384` and `thinking_budget: 4096` to eliminate mid-thought tool truncation on thinking models.
+
 ### Fixed & Hardened (Run B20 Post-Mortem & Model Migration)
 - **Model Migration (`scripts/`)**:
   - Swapped default evaluation model from `stealth/space-bunny-alpha` to `thinkingmachines/inkling-small:free` across `scripts/run_eval.py`, `scripts/preflight_check.py`, and `scripts/test_agents_diagnostic.py`.

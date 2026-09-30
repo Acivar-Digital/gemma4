@@ -43,8 +43,19 @@ run_skill_script(
 )
 ```
 
+### Inspect as structured JSON (--json)
+```python
+run_skill_script(
+    skill_name="diff-inspect",
+    file_path="diff.py",
+    args=["--json"]
+)
+```
+
 ## Guarantees
-- **Strictly read-only**: Executes only read-only `git` commands (`git status --short`, `git diff`).
+- **Strictly read-only**: Executes only read-only `git` commands (`git status --porcelain`, `git diff`).
 - **Context-capped**: Capped at 100 lines of diff output with clear omission notices.
 - **Deterministic**: Resolves workspace cleanly across Docker containers and test runners without race conditions.
-- **Zero external dependencies**: Standard Python library only.
+- **Scratch file alert**: Detects untracked temporary scripts (`repro.py`, `test_*.py`, `tmp*.py`) and warns before `submit_patch` runs `git add -N .`.
+- **Empty diff diagnostic**: Deterministically explains why working tree has 0 modifications relative to HEAD.
+- **100% Pydantic v2**: Structured output schemas (`DiffInspectResult`, `FileDiffStat`, `DiffWarning`).
