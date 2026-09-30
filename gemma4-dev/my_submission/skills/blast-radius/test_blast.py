@@ -29,6 +29,8 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+sys.dont_write_bytecode = True
+
 from pydantic import BaseModel, ConfigDict, Field
 
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -87,6 +89,7 @@ class BlastRadiusResult(BaseModel):
     exit_code: int = Field(default=0, description="Pytest exit code")
     passed: bool = Field(default=True, description="Whether all tests passed")
     summary: str = Field(default="", description="Execution summary line")
+    multi_file_warning: Optional[str] = Field(default=None, description="Warning if multiple modified files detected in workspace")
     total_passed: int = Field(default=0, description="Number of passed tests")
     total_failed: int = Field(default=0, description="Number of failed tests")
     total_errors: int = Field(default=0, description="Number of error tests")
@@ -241,8 +244,10 @@ def resolve_target(target_str: str, ws: pathlib.Path) -> pathlib.Path:
     return cand
 
 
-def get_modified_files(ws: pathlib.Path) -> List[pathlib.Path]:
+def _get_modified_files(ws: Optional[pathlib.Path] = None) -> List[pathlib.Path]:
     """Find files modified in working tree using git status."""
+    if ws is None:
+        ws = get_workspace_dir()
     try:
         res = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -264,12 +269,29 @@ def get_modified_files(ws: pathlib.Path) -> List[pathlib.Path]:
                 rel_path = parts[1]
                 if " -> " in rel_path:
                     rel_path = rel_path.split(" -> ")[1].strip()
+                rel_path = rel_path.strip('"')
                 p = ws / rel_path
                 if p.suffix == ".py" and p.exists():
                     modified.append(p)
         return modified
     except Exception:
         return []
+
+
+get_modified_files = _get_modified_files
+
+
+def format_multi_file_warning(modified_files: List[Any], target_file: str) -> str:
+    """Format the multi-file diff detection warning."""
+    mod_list = [
+        m.as_posix() if isinstance(m, pathlib.Path) else str(m)
+        for m in modified_files
+    ]
+    return (
+        f"⚠️ MULTI-FILE DIFF DETECTED: {len(mod_list)} files modified ({mod_list}). "
+        f"Running tests on {target_file}. "
+        f"If regressions occur, revert secondary files first before debugging further!"
+    )
 
 
 def extract_repo_symbols(file_path: pathlib.Path) -> Dict[str, Any]:
@@ -500,9 +522,38 @@ def run_pytest(tests: List[str], ws: pathlib.Path, timeout_secs: int = 25) -> Tu
 
 def explain_mismatch(actual: Optional[str], expected: Optional[str], error_type: str, error_msg: str, statement: str) -> str:
     """Deterministically explain why an assertion or check failed."""
+    # Check boundary assertion defect in statement or error_msg
+    boundary_patterns = (
+        "assert '' == '\\n'",
+        'assert "" == "\\n"',
+        "assert '' == \"\\n\"",
+        'assert "" == \'\\n\'',
+        "assert '\\n' == ''",
+        'assert "\\n" == ""',
+        "assert '\\n' == \"\"",
+        'assert "\\n" == \'\'',
+    )
+    if any(p in statement for p in boundary_patterns) or any(p in error_msg for p in boundary_patterns):
+        return (
+            "BOUNDARY DEFECT: The function returned an empty string '' when a newline '\\n' was expected. "
+            "Check if string tokenization or stripping collapsed empty lines."
+        )
+
     if actual is not None and expected is not None:
         act_raw = actual.strip("'\"")
         exp_raw = expected.strip("'\"")
+
+        # 0. Degenerate boundary mismatch (empty string vs newline, e.g. assert '' == '\n' or vice-versa)
+        is_empty_act = actual in ("''", '""', "") or act_raw == ""
+        is_nl_exp = expected in ("'\\n'", '"\\n"', "\\n", "\n") or exp_raw in ("\\n", "\n")
+        is_nl_act = actual in ("'\\n'", '"\\n"', "\\n", "\n") or act_raw in ("\\n", "\n")
+        is_empty_exp = expected in ("''", '""', "") or exp_raw == ""
+
+        if (is_empty_act and is_nl_exp) or (is_nl_act and is_empty_exp):
+            return (
+                "BOUNDARY DEFECT: The function returned an empty string '' when a newline '\\n' was expected. "
+                "Check if string tokenization or stripping collapsed empty lines."
+            )
 
         # 1. Newline mismatch
         act_has_nl = actual.endswith(("\\n'", '\\n"', "\\n")) or "\\n" in actual
@@ -725,6 +776,9 @@ def generate_remediation_hint(
             break
 
     target_ref = clean_remediation_target(correlated_modifications[0]) if correlated_modifications else "modified files"
+
+    if "BOUNDARY DEFECT" in explanation or "splitlines" in explanation:
+        return f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; consider re.split(r'(?<=\\n)', text)."
 
     if "extra newline" in explanation:
         return f"Check {target_ref}: strip unexpected trailing newline or verify whether newlines should be appended."
@@ -990,14 +1044,19 @@ def parse_pytest_output(
 
         if len(items) == 1:
             it = items[0]
-            if it.expected and it.actual:
+            if "BOUNDARY DEFECT" in expl:
+                summ = f"REGRESSION ROOT CAUSE: In `{it.test_id}`, {expl}"
+            elif it.expected and it.actual:
                 summ = f"REGRESSION ROOT CAUSE: In `{it.test_id}`, assertion failed: expected {it.expected} but got {it.actual}. {expl}"
             else:
                 summ = f"REGRESSION ROOT CAUSE: In `{it.test_id}`, {expl}"
         else:
             t_names = [it.test_name for it in items]
             corr_summary = f" Shared regression in `{grp_tgt}`." if grp_tgt != "repo" else ""
-            summ = f"REGRESSION ROOT CAUSE: Across {len(items)} tests ({', '.join(t_names[:3])}), assertion failed: {expl}{corr_summary}"
+            if "BOUNDARY DEFECT" in expl:
+                summ = f"REGRESSION ROOT CAUSE: Across {len(items)} tests ({', '.join(t_names[:3])}), {expl}{corr_summary}"
+            else:
+                summ = f"REGRESSION ROOT CAUSE: Across {len(items)} tests ({', '.join(t_names[:3])}), assertion failed: {expl}{corr_summary}"
 
         diagnoses.append(FailureDiagnosis(
             summary=summ,
@@ -1013,14 +1072,26 @@ def parse_pytest_output(
         try:
             t_strs.append(t.relative_to(ws).as_posix())
         except ValueError:
-            t_strs.append(t.as_posix())
+            t_strs.append(t.as_posix() if hasattr(t, "as_posix") else str(t))
 
     m_strs = []
     for m in modified_files:
         try:
             m_strs.append(m.relative_to(ws).as_posix())
         except ValueError:
-            m_strs.append(m.as_posix())
+            m_strs.append(m.as_posix() if hasattr(m, "as_posix") else str(m))
+
+    target_file = t_strs[0] if len(t_strs) == 1 else (", ".join(t_strs) if t_strs else (m_strs[0] if m_strs else "target"))
+    multi_file_warning: Optional[str] = None
+    if len(m_strs) > 1:
+        multi_file_warning = (
+            f"⚠️ MULTI-FILE DIFF DETECTED: {len(m_strs)} files modified ({m_strs}). "
+            f"Running tests on {target_file}. "
+            f"If regressions occur, revert secondary files first before debugging further!"
+        )
+
+    base_summary = summary_line or ("All tests passed." if exit_code == 0 else f"{len(failures)} test(s) failed.")
+    final_summary = f"{multi_file_warning} | {base_summary}" if multi_file_warning else base_summary
 
     return BlastRadiusResult(
         targets=t_strs,
@@ -1029,7 +1100,8 @@ def parse_pytest_output(
         test_files=test_files,
         exit_code=exit_code,
         passed=(exit_code == 0),
-        summary=summary_line or ("All tests passed." if exit_code == 0 else f"{len(failures)} test(s) failed."),
+        summary=final_summary,
+        multi_file_warning=multi_file_warning,
         total_passed=total_passed,
         total_failed=total_failed or (len(failures) if exit_code != 0 else 0),
         total_errors=total_errors,
@@ -1043,6 +1115,15 @@ def format_failure_report(result: BlastRadiusResult, max_lines: int = 35) -> str
     out_lines: List[str] = []
     out_lines.append(f"[blast-radius] 💥 REGRESSION DETECTED IN BLAST RADIUS (Exit code: {result.exit_code}):")
     out_lines.append("=" * 80)
+
+    if len(result.modified_files) > 1:
+        target_name = result.targets[0] if result.targets else "target"
+        out_lines.append(
+            f"⚠️ MULTI-FILE DIFF DETECTED: {len(result.modified_files)} files modified ({result.modified_files}). "
+            f"Running tests on {target_name}. "
+            f"If regressions occur, revert secondary files first before debugging further!"
+        )
+        out_lines.append("-" * 80)
 
     for diag in result.diagnoses[:3]:
         out_lines.append(diag.summary)
@@ -1114,7 +1195,7 @@ def main() -> int:
                 if arg_clean:
                     targets.append(resolve_target(arg_clean, ws))
         else:
-            targets = get_modified_files(ws)
+            targets = _get_modified_files(ws)
 
         if not targets:
             print("[blast-radius] ⚠️ No modified files detected and no target specified.")
@@ -1142,6 +1223,15 @@ def main() -> int:
 
         target_names = ", ".join(format_target_name(t) for t in targets)
         if not json_mode:
+            all_repo_modified = _get_modified_files(ws)
+            if len(all_repo_modified) > 1:
+                all_mod_names = [format_target_name(m) for m in all_repo_modified]
+                warn_msg = (
+                    f"⚠️ MULTI-FILE DIFF DETECTED: {len(all_repo_modified)} files modified ({all_mod_names}). "
+                    f"Running tests on {target_names}. "
+                    f"If regressions occur, revert secondary files first before debugging further!"
+                )
+                print(f"[blast-radius] {warn_msg}")
             print(f"[blast-radius] TARGET(S): {target_names}")
             if all_consumers:
                 consumer_preview = ", ".join(all_consumers[:5])
@@ -1151,7 +1241,21 @@ def main() -> int:
                 print("[blast-radius] DISTANCE-1 CONSUMERS: (none detected)")
 
         if not all_test_files:
+            target_str = format_target_name(targets[0]) if targets else "target"
+            mod_names = [format_target_name(t) for t in targets]
+            empty_summary = "No matching test files found."
+            multi_file_warn = None
+            if len(mod_names) > 1:
+                multi_file_warn = (
+                    f"⚠️ MULTI-FILE DIFF DETECTED: {len(mod_names)} files modified ({mod_names}). "
+                    f"Running tests on {target_str}. "
+                    f"If regressions occur, revert secondary files first before debugging further!"
+                )
+                empty_summary = f"{multi_file_warn} | {empty_summary}"
+
             if not json_mode:
+                if multi_file_warn:
+                    print(f"[blast-radius] {multi_file_warn}")
                 print(f"[blast-radius] ⚠️ No matching test files found for {target_names}.")
             else:
                 empty_res = BlastRadiusResult(
@@ -1160,7 +1264,8 @@ def main() -> int:
                     distance1_consumers=all_consumers,
                     test_files=[],
                     passed=True,
-                    summary="No matching test files found.",
+                    summary=empty_summary,
+                    multi_file_warning=multi_file_warn,
                 )
                 print(empty_res.model_dump_json(indent=2))
             return 0
@@ -1170,7 +1275,7 @@ def main() -> int:
             print(f"[blast-radius] RUNNING TESTS ({len(all_test_files)} file(s)): {test_display}")
 
         exit_code, raw_output = run_pytest(all_test_files, ws)
-        modified_in_repo = get_modified_files(ws) or targets
+        modified_in_repo = _get_modified_files(ws) or targets
 
         result = parse_pytest_output(
             raw_output=raw_output,

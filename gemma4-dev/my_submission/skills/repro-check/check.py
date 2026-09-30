@@ -33,9 +33,11 @@ import re
 import subprocess
 import sys
 import tempfile
+
+sys.dont_write_bytecode = True
 import textwrap
 import types
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -100,6 +102,7 @@ class AssertionDiagnostic(BaseModel):
     first_diff_index: Optional[int] = Field(default=None, description="First index where values differ")
     message: Optional[str] = Field(default=None, description="Assertion failure message")
     explanation: str = Field(..., description="Plain-English explanation of why assertion failed")
+    remediation_hint: Optional[str] = Field(default=None, description="Actionable remediation hint for common defects")
 
 
 class ExceptionDiagnostic(BaseModel):
@@ -276,6 +279,35 @@ def extract_call_stack(exc: BaseException) -> List[StackFrameInfo]:
             tb = tb.tb_next
 
     return frames
+
+
+def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
+    """Generate targeted remediation hint for common string and boundary defects."""
+    if not isinstance(actual, str) or not isinstance(expected, str):
+        return None
+
+    if actual == expected:
+        return None
+
+    # Degenerate boundary mismatch (empty string vs newline)
+    if (actual == "" and expected in ("\n", "\r\n")) or (actual in ("\n", "\r\n") and expected == ""):
+        return (
+            "💡 HINT: Degenerate boundary mismatch (empty string vs newline). "
+            "Ensure string splitting/joining does not collapse single-newline inputs."
+        )
+
+    # Trailing newline / whitespace mismatch (difference is at or near the end, e.g. missing trailing \n, \r\n, or extra trailing whitespace)
+    if actual.rstrip() == expected.rstrip():
+        return (
+            '💡 HINT: Trailing newline mismatch detected. In Python, str.splitlines() '
+            'and str.splitlines(True) drop the trailing empty token after a terminal newline! '
+            'If your code needs to preserve all lines and trailing newlines, use re.split(r"(?<=\\n)", text).'
+        )
+
+    return None
+
+
+compute_assertion_remediation_hint = get_string_remediation_hint
 
 
 def explain_string_diff(actual: str, expected: str) -> Tuple[str, Optional[int]]:
@@ -1085,6 +1117,7 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         explanation, diff_str, first_diff_idx = explain_assertion_failure(
             exc.actual, exc.op, exc.expected, exc.msg
         )
+        hint = get_string_remediation_hint(exc.actual, exc.expected)
 
         assertion_diag = AssertionDiagnostic(
             assertion_code=exc.code_str,
@@ -1099,6 +1132,7 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
             first_diff_index=first_diff_idx,
             message=exc.msg if exc.msg else None,
             explanation=explanation,
+            remediation_hint=hint,
         )
 
         report = DiagnosticReport(
@@ -1162,6 +1196,12 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         exp_type = type(expected_val).__name__ if expected_val is not None else "unknown"
         exp_repr = format_value_repr(expected_val) if expected_val is not None else "unknown"
 
+        hint = (
+            get_string_remediation_hint(actual_val, expected_val)
+            if actual_val is not None and expected_val is not None
+            else None
+        )
+
         assertion_diag = AssertionDiagnostic(
             assertion_code=line_text or f"assert {str(exc)}",
             op=op_str,
@@ -1175,6 +1215,7 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
             first_diff_index=first_diff_idx,
             message=str(exc) if str(exc) else None,
             explanation=explanation,
+            remediation_hint=hint,
         )
 
         report = DiagnosticReport(
@@ -1358,6 +1399,78 @@ def execute_script(
             return 1, "", f"Failed to execute process: {e}", err_report
 
 
+def _format_assertion_failure(
+    diag_or_actual: Union[AssertionDiagnostic, Any],
+    locals_or_expected: Any = None,
+) -> Union[List[str], str]:
+    """Format assertion failure details and diagnostic remediation hints.
+
+    When called with (AssertionDiagnostic, Optional[Dict[str, VariableInfo]]):
+        Returns List[str] formatted lines with assertion details and remediation hints.
+    When called with (str, str):
+        Returns str remediation hint for trailing newlines or boundary mismatches.
+    """
+    if isinstance(diag_or_actual, str) and isinstance(locals_or_expected, str):
+        hint = get_string_remediation_hint(diag_or_actual, locals_or_expected)
+        return hint or ""
+
+    if not isinstance(diag_or_actual, AssertionDiagnostic):
+        return []
+
+    diag = diag_or_actual
+    locals_vars = locals_or_expected if isinstance(locals_or_expected, dict) else None
+
+    lines: List[str] = [
+        "[repro-check] 🎯 DEFECT CONFIRMED (Assertion Failed):"
+    ]
+    if diag.assertion_code:
+        lines.append(f"  Failing Statement: {diag.assertion_code}")
+    if diag.first_diff_index is not None:
+        lines.append(f"  Difference at index: {diag.first_diff_index}")
+
+    lines.append("")
+    lines.append("  🔍 DIAGNOSTIC SUMMARY:")
+    lines.append(f"    {diag.explanation}")
+
+    hint = diag.remediation_hint
+    if not hint and diag.actual_repr and diag.expected_repr:
+        try:
+            act_val = ast.literal_eval(diag.actual_repr)
+            exp_val = ast.literal_eval(diag.expected_repr)
+            hint = get_string_remediation_hint(act_val, exp_val)
+        except Exception:
+            pass
+
+    if hint:
+        lines.append("")
+        if not hint.startswith("💡"):
+            lines.append(f"  💡 HINT: {hint}")
+        else:
+            lines.append(f"  {hint}")
+
+    lines.append("")
+    lines.append("  📊 VALUE COMPARISON:")
+    act_len_str = f", len={diag.actual_length}" if diag.actual_length is not None else ""
+    exp_len_str = f", len={diag.expected_length}" if diag.expected_length is not None else ""
+    lines.append(f"    Actual   ({diag.actual_type}{act_len_str}): {diag.actual_repr}")
+    lines.append(f"    Expected ({diag.expected_type}{exp_len_str}): {diag.expected_repr}")
+
+    if diag.char_diff:
+        lines.append("")
+        lines.append("  🔀 CHARACTER DIFF:")
+        for dl in diag.char_diff.splitlines():
+            lines.append(f"    {dl}")
+
+    if locals_vars:
+        lines.append("")
+        lines.append("  📦 LOCAL VARIABLES IN FAILING FRAME:")
+        for vname, vinfo in locals_vars.items():
+            vlen_str = f", len={vinfo.length}" if vinfo.length is not None else ""
+            lines.append(f"    {vname} ({vinfo.type_name}{vlen_str}): {vinfo.value_repr}")
+
+    return lines
+
+
 def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib.Path) -> str:
     """Render structured report into deterministic human and LLM-friendly diagnostic output."""
     lines: List[str] = []
@@ -1385,38 +1498,11 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
         return "\n".join(lines)
 
     if report.status == "assertion_error":
+        if report.assertion_diagnostic:
+            formatted_lines = _format_assertion_failure(report.assertion_diagnostic, report.local_variables)
+            return "\n".join(formatted_lines)
         lines.append("[repro-check] 🎯 DEFECT CONFIRMED (Assertion Failed):")
-        diag = report.assertion_diagnostic
-        if diag:
-            if diag.assertion_code:
-                lines.append(f"  Failing Statement: {diag.assertion_code}")
-            if diag.first_diff_index is not None:
-                lines.append(f"  Difference at index: {diag.first_diff_index}")
-
-            lines.append("")
-            lines.append("  🔍 DIAGNOSTIC SUMMARY:")
-            lines.append(f"    {diag.explanation}")
-
-            lines.append("")
-            lines.append("  📊 VALUE COMPARISON:")
-            act_len_str = f", len={diag.actual_length}" if diag.actual_length is not None else ""
-            exp_len_str = f", len={diag.expected_length}" if diag.expected_length is not None else ""
-            lines.append(f"    Actual   ({diag.actual_type}{act_len_str}): {diag.actual_repr}")
-            lines.append(f"    Expected ({diag.expected_type}{exp_len_str}): {diag.expected_repr}")
-
-            if diag.char_diff:
-                lines.append("")
-                lines.append("  🔀 CHARACTER DIFF:")
-                for dl in diag.char_diff.splitlines():
-                    lines.append(f"    {dl}")
-
-        if report.local_variables:
-            lines.append("")
-            lines.append("  📦 LOCAL VARIABLES IN FAILING FRAME:")
-            for vname, vinfo in report.local_variables.items():
-                vlen_str = f", len={vinfo.length}" if vinfo.length is not None else ""
-                lines.append(f"    {vname} ({vinfo.type_name}{vlen_str}): {vinfo.value_repr}")
-
+        lines.append(f"  {report.summary}")
         return "\n".join(lines)
 
     if report.status == "runtime_exception":

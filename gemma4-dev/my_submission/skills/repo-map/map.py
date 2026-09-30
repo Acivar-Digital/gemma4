@@ -31,6 +31,8 @@ import pathlib
 import sys
 from typing import List, Optional, Tuple
 
+sys.dont_write_bytecode = True
+
 from pydantic import BaseModel, ConfigDict, Field
 
 

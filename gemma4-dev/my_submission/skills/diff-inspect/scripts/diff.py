@@ -30,6 +30,8 @@ import subprocess
 import sys
 from typing import Any, List, Optional, Tuple
 
+sys.dont_write_bytecode = True
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -587,6 +589,23 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
             f"Diff contains {len(file_stats)} modified file(s): "
             f"+{total_additions} additions, -{total_deletions} deletions relative to {base_ref or 'HEAD'}."
         )
+        if len(file_stats) > 1:
+            modified_names = [f.path for f in file_stats]
+            warnings.append(
+                DiffWarning(
+                    category="MULTI_FILE_CONTAMINATION",
+                    path=", ".join(modified_names),
+                    message=(
+                        f"⚠️ CAUTION: Multiple files modified ({len(file_stats)} files: {', '.join(modified_names)}). "
+                        f"Over 90% of SWE-bench tasks only require modifying 1 file!"
+                    ),
+                    risk_explanation=(
+                        f"Modifying secondary files often breaks unrelated components or indicates an unverified patch. "
+                        f"Revert secondary edits if the root cause belongs in a single module."
+                    ),
+                    recommended_action="Run blast-radius on the primary modified file. If tests fail, revert your secondary file edits using edit_file.",
+                )
+            )
         submit_patch_advice = (
             f"READY: Working tree has {len(file_stats)} modified file(s) (+{total_additions}, -{total_deletions}) "
             f"with zero dangerous scratch files. Ready for submit_patch()."
