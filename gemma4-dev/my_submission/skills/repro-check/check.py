@@ -299,9 +299,12 @@ def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
     # Trailing newline / whitespace mismatch (difference is at or near the end, e.g. missing trailing \n, \r\n, or extra trailing whitespace)
     if actual.rstrip() == expected.rstrip():
         return (
-            '💡 HINT: Trailing newline mismatch detected. In Python, str.splitlines() '
-            'and str.splitlines(True) drop the trailing empty token after a terminal newline! '
-            'If your code needs to preserve all lines and trailing newlines, use re.split(r"(?<=\\n)", text).'
+            "💡 HINT: Trailing newline mismatch detected! In Python, str.splitlines() "
+            "and str.splitlines(True) drop the trailing empty token after a terminal newline. "
+            "If your code needs to preserve all lines and trailing newlines, use: re.split(r'(?<=\\n)', text). "
+            "CRITICAL: Because re.split(r'(?<=\\n)', text) retains the trailing delimiter on each chunk "
+            "(e.g. ['foo\\n', '']), you MUST strip the newline from each chunk (e.g. chunk.rstrip('\\n')) "
+            "before passing to consumers or re-joining lines!"
         )
 
     return None
@@ -1469,6 +1472,9 @@ def _format_assertion_failure(
             lines.append(f"    {vname} ({vinfo.type_name}{vlen_str}): {vinfo.value_repr}")
 
     return lines
+
+
+format_assertion_diagnostic = _format_assertion_failure
 
 
 def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib.Path) -> str:

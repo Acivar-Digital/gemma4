@@ -778,7 +778,7 @@ def generate_remediation_hint(
     target_ref = clean_remediation_target(correlated_modifications[0]) if correlated_modifications else "modified files"
 
     if "BOUNDARY DEFECT" in explanation or "splitlines" in explanation:
-        return f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; consider re.split(r'(?<=\\n)', text)."
+        return f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; if using re.split(r'(?<=\\n)', text), remember that each chunk retains its trailing delimiter—use chunk.rstrip('\\n') before processing or re-joining."
 
     if "extra newline" in explanation:
         return f"Check {target_ref}: strip unexpected trailing newline or verify whether newlines should be appended."
