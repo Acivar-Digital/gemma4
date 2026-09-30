@@ -32,6 +32,8 @@ import subprocess
 import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+sys.dont_write_bytecode = True
+
 from pydantic import BaseModel, ConfigDict, Field
 
 # Directories to skip when scanning repositories

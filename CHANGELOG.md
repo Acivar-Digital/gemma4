@@ -4,6 +4,24 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 
 ## [Unreleased] - 2026-09-30
 
+### Fixed & Hardened (Run B25 Post-Mortem & Multi-File / read_file Hardening)
+- **Prompt Negative Priming Removal & Single-File Barrier (`my_submission/prompts/main.md`)**:
+  - Removed negative example `Calling start_line=700, end_line=30...` that caused the LLM to burn 18 tool calls (36% of budget) repeating `start_line > end_line` errors.
+  - Instructed omitting `end_line` (tool automatically reads 150 lines safely from `start_line`) or calculating `start_line + 40`.
+  - Added Single-File Edit Barrier: strictly forbid modifying a second file until `blast-radius` passes on the first; mandate immediate rollback on regression.
+  - Added Mandatory `blast-radius` gate before calling `diff-inspect` or `submit_patch`.
+  - Added Boundary Testing & Python string splitting guidance: documented that `splitlines(True)` drops trailing empty tokens, recommending `re.split(r"(?<=\n)", text)`.
+- **Multi-File Contamination Warning (`my_submission/skills/diff-inspect/`)**:
+  - Added `MULTI_FILE_CONTAMINATION` warning when `total_files_modified > 1`, advising on reverting secondary edits.
+  - Mirrored identically between `diff.py` and `scripts/diff.py`.
+- **Trailing Newline & Boundary Remediation Hints (`my_submission/skills/repro-check/`)**:
+  - Added deterministic remediation hints when strings differ by trailing newlines or empty boundaries (`""` vs `"\n"`), advising on `re.split(r"(?<=\n)", text)` vs `splitlines(True)`.
+  - Mirrored identically between `check.py` and `scripts/check.py`.
+- **Multi-File Diff Detection & Boundary Triage (`my_submission/skills/blast-radius/`)**:
+  - Added workspace-wide multi-file diff detection and cautionary banner.
+  - Added boundary assertion failure diagnostics explaining collapsed empty lines or stripped trailing newlines.
+  - Mirrored identically between `test_blast.py` and `scripts/test_blast.py`.
+
 ### Added & Hardened (Deterministic Explanatory Diagnostics Overhaul across all 6 Skills)
 - **`repro-check` (`my_submission/skills/repro-check/`)**:
   - Implemented AST assertion introspection via `__repro_assert__` and bytecode frame examination.
