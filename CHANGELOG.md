@@ -2,7 +2,23 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01 (Run B28 Post-Mortem: Pre-Fix Test Conflict Resolution & Anti-Suppression)
+## [Unreleased] - 2026-10-01 (Model- & Test-Agnostic Sanitization Pass)
+
+### Removed & Sanitized (Zero Task Leakage / Anti-Overfitting Gate)
+- **Prompt Sanitization (`my_submission/prompts/main.md`)**:
+  - Completely purged task-specific string splitting and delimiter logic (`re.split`, `rstrip("\r\n")`, `.splitlines()`, `if line == "": continue`).
+  - Replaced Section 6 with universal **Boundary & Edge-Case Engineering Principles**: reasoning about degenerate inputs (empty values, null, 0, single elements, boundary delimiters), respecting container and sequence contracts, and prohibiting ad-hoc element suppression filters.
+  - Retained the general SWE-bench distinction between True Regressions (unhandled exceptions, distance-1 consumer failures) and Pre-Fix Test Conflicts (baseline tests asserting pre-fix behavior) without citing specific variable names or string snippets.
+- **Diagnostic Tool Neutralization (`my_submission/skills/repro-check/`)**:
+  - Removed all hardcoded string splitting and newline heuristics from `check.py`.
+  - Replaced with neutral, task-agnostic structural diff diagnostics (boundary mismatch, line count differences, suffix/whitespace differences).
+  - Maintained byte-for-byte synchronization with `scripts/check.py`.
+- **Advisory Generalization (`my_submission/skills/blast-radius/`)**:
+  - Purged specific examples (`such as if line == "": continue`, `preserving trailing newlines/tokens`) from `PREFIX_CONFLICT_ADVISORY` in `test_blast.py`.
+  - Generalized advisory to advise that unpatched baseline unit tests in Container A may assert pre-fix behavior, cautioning against ad-hoc suppressions if consumer tests pass and the change directly aligns with the issue requirements.
+  - Maintained byte-for-byte synchronization with `scripts/test_blast.py`.
+
+## [Unreleased] - 2026-10-01 (Run B28 Post-Mortem)
 
 ### Fixed & Hardened (First-Principles Pre-Fix Test Conflict Handling)
 - **True Regressions vs Pre-Fix Test Conflicts (`my_submission/prompts/main.md`)**:

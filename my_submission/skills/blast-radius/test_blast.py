@@ -37,10 +37,10 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 SKIP_DIRS = {"build", "dist", ".git", "__pycache__", "venv", ".venv", "node_modules", "wheels", ".pytest_cache"}
 
 PREFIX_CONFLICT_ADVISORY = (
-    '💡 PRE-FIX TEST CONFLICT ADVISORY: The failing test is in the direct unit test for the modified component. '
-    'If the issue report specifically asked to preserve or produce this output (e.g. preserving trailing newlines/tokens), '
-    'the baseline test may be asserting the OLD buggy behavior. In SWE-bench, the evaluation harness updates tests in Container B. '
-    'DO NOT add suppression hacks (such as \'if line == "": continue\') or revert if distance-1 consumer tests pass and this difference matches the issue!'
+    "💡 PRE-FIX TEST CONFLICT ADVISORY: The failing test is in the direct unit test for the modified component. "
+    "If the issue report specifically requested altering this behavior or output, "
+    "the baseline test in Container A may still be asserting the pre-fix buggy behavior. In SWE-bench, the evaluation harness updates tests in Container B. "
+    "DO NOT add ad-hoc suppression filters or revert if distance-1 consumer tests pass and this difference directly implements the issue requirements!"
 )
 
 
