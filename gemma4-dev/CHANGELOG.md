@@ -4,6 +4,28 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 
 ## [Unreleased] - 2026-09-30
 
+### Fixed & Hardened (Run B20 Post-Mortem & Model Migration)
+- **Model Migration (`scripts/`)**:
+  - Swapped default evaluation model from `stealth/space-bunny-alpha` to `thinkingmachines/inkling-small:free` across `scripts/run_eval.py`, `scripts/preflight_check.py`, and `scripts/test_agents_diagnostic.py`.
+  - Verified 0 remaining references to `space-bunny-alpha` and confirmed clean live connection to LiteRouter.
+- **Probe Budget Limiter & Circuit Breaker (`my_submission/skills/repro-check/`)**:
+  - Added active probe execution tracking via `/tmp/.swegemma_repro_probe_count`.
+  - Implemented circuit breaker: triggers warning after 2 exploratory probes without assertion failure or defect reproduction, forcing the model to cease open-ended probing and formulate an edit.
+  - Automatic counter reset to 0 upon defect confirmation (`AssertionError` / runtime exception) or successful verification (`✅ PASSED`).
+  - Mirrored identically between `my_submission/skills/repro-check/scripts/check.py` and `my_submission/skills/repro-check/check.py`, and updated `SKILL.md`.
+- **Terse Issue Search & String/Buffer Verb Expansion (`my_submission/skills/fast-grep/`)**:
+  - Enhanced `score_match` with dedicated boosts for string/buffer transformation methods (`splitlines`, `split`, `rstrip`, `strip`, `lstrip`, `replace`, `join`, `partition`, `decode`, `encode`, `from_ansi`).
+  - Added buffer receiver detection (`terminal_text`, `buffer`, `text`, `line`) boosting method call-sites (+40) and receivers (+30).
+  - Added visual call-site tags (`[CALL-SITE: string/buffer transform]`) and scope headers in AST search results.
+  - Added heuristic expansion of terse keywords (e.g., `newlines`, `whitespace`) into core Python string operations to avoid comment/docstring spam.
+  - Verified on `snapshots/rich_4076.tgz`: `splitlines` search ranks `rich/ansi.py:135` as TOP 1.
+  - Mirrored identically between `my_submission/skills/fast-grep/scripts/grep.py` and `my_submission/skills/fast-grep/grep.py`, and updated `SKILL.md`.
+- **Prompt Operational Gates & Bounds Safety (`my_submission/prompts/main.md`)**:
+  - **Pre-Submission Gate**: Strictly forbade calling `submit_patch()` if `files_changed == 0` or patch size is 0 bytes; mandated applying best surgical edit via `edit_file` before submitting under low-budget emergencies (`tool_calls_remaining <= 5` or `tool_calls_used >= 45`).
+  - **Strict 2-Probe Cap**: Enforced maximum 2 exploratory probes before transitioning to code analysis and editing.
+  - **Terse Issue Search Mandate**: Mandated decomposing short issue statements (<20 words) into core Python string/buffer operations and searching test suites.
+  - **Bounds Safety & Offset Clamping**: Strictly forbade line number guessing past EOF, mandated `start_line < end_line`, and instructed relying directly on `fast-grep` function snippets over redundant `read_file` calls.
+
 ### Changed (Single-Agent Lean Monolith Migration)
 - **Omnivorous Tools Overhaul (`my_submission/skills/`)**:
   - **`fast-grep`**:

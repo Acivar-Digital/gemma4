@@ -200,3 +200,23 @@ bd prime                # Refresh Beads context
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md for details and anti-patterns.
 <!-- END BEADS CODEX SETUP -->
+
+## OpenCode Ensemble Multi-Agent Roster
+
+This repository uses `@hueyexe/opencode-ensemble` for parallel subagent execution with isolated Git worktrees and real-time dashboard tracking on port 4747.
+
+Models are **decoupled from agent definitions** and configured dynamically via `.opencode/ensemble.json` or runtime `team_spawn` flags.
+
+### Current Active Mapping (Configurable in `ensemble.json`):
+
+| Role | Agent Mode | Worktree | Current Model | Gateway | Responsibilities |
+| :--- | :--- | :---: | :--- | :--- | :--- |
+| **Lead / Conductor** | root session | `false` | `lr-zn-rs/muse-spark-1.3-contributor-free` | LiteRouter (:7766) | Architecture, task breakdown, code review, merge, verification gates |
+| **Scout** | `explore` | `false` | `lr-or/thinkingmachines/inkling-small:free` | LiteRouter (:7766) | Codebase mapping, risk discovery, file ownership plan |
+| **Builder** | `build` | `true` | `agy-gemini/gemini-3.8-flash-high` | Antigravity (:8045) | High-speed, high-precision code implementation |
+| **QA** | `build` | `true` | `agy-gemini/gemini-pro-agent` | Antigravity (:8045) | Combinatorial testing, test fixtures, regression verification |
+| **Reviewer** | `explore` | `false` | `agy-claude/claude-opus-4-6-thinking` | Antigravity (:8045) | Diff review, security & edge-case audit before merge |
+
+*Note: You can switch models anytime by updating `.opencode/ensemble.json` or passing `model: "<new_model>"` in `team_spawn` without modifying agent files.*
+
+

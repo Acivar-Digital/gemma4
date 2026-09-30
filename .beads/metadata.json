@@ -3,7 +3,6 @@
   "backend": "dolt",
   "dolt_mode": "server",
   "dolt_server_host": "vps-node",
-  "dolt_server_port": 3306,
   "dolt_server_user": "root",
   "dolt_database": "projects",
   "project_id": "30a17d4d-cf21-445f-9d88-c104ce0be0ab"
