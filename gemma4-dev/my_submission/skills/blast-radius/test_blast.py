@@ -36,6 +36,13 @@ from pydantic import BaseModel, ConfigDict, Field
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 SKIP_DIRS = {"build", "dist", ".git", "__pycache__", "venv", ".venv", "node_modules", "wheels", ".pytest_cache"}
 
+PREFIX_CONFLICT_ADVISORY = (
+    '💡 PRE-FIX TEST CONFLICT ADVISORY: The failing test is in the direct unit test for the modified component. '
+    'If the issue report specifically asked to preserve or produce this output (e.g. preserving trailing newlines/tokens), '
+    'the baseline test may be asserting the OLD buggy behavior. In SWE-bench, the evaluation harness updates tests in Container B. '
+    'DO NOT add suppression hacks (such as \'if line == "": continue\') or revert if distance-1 consumer tests pass and this difference matches the issue!'
+)
+
 
 def strip_ansi(text: str) -> str:
     """Strip ANSI terminal escape codes from text."""
@@ -63,6 +70,10 @@ class TestFailureDetail(BaseModel):
     correlated_modifications: List[str] = Field(default_factory=list, description="Modified repo files or symbols linked to this test")
     explanation: str = Field(default="", description="Deterministic root cause explanation of the failure")
     remediation_hint: str = Field(default="", description="Actionable hint on how to fix or revert the issue")
+    prefix_conflict_advisory: Optional[str] = Field(
+        default=None,
+        description="Pre-fix baseline test conflict advisory when direct unit test fails on assertion mismatch",
+    )
 
 
 class FailureDiagnosis(BaseModel):
@@ -75,6 +86,10 @@ class FailureDiagnosis(BaseModel):
     suspected_modified_files: List[str] = Field(default_factory=list, description="Modified repo files likely causing this regression")
     common_mismatch: Optional[str] = Field(default=None, description="Shared mismatch description or difference")
     remediation_hint: str = Field(default="", description="Actionable hint on how to remediate the regression")
+    prefix_conflict_advisory: Optional[str] = Field(
+        default=None,
+        description="Pre-fix baseline test conflict advisory when direct unit test fails on assertion mismatch",
+    )
 
 
 class BlastRadiusResult(BaseModel):
@@ -95,6 +110,10 @@ class BlastRadiusResult(BaseModel):
     total_errors: int = Field(default=0, description="Number of error tests")
     failures: List[TestFailureDetail] = Field(default_factory=list, description="Detailed failure breakdowns")
     diagnoses: List[FailureDiagnosis] = Field(default_factory=list, description="Diagnoses and root-cause explanations")
+    prefix_conflict_advisory: Optional[str] = Field(
+        default=None,
+        description="Pre-fix baseline test conflict advisory if detected across failures",
+    )
 
 
 def clean_test_id(raw_id: str, ws: pathlib.Path) -> str:
@@ -759,6 +778,99 @@ def clean_remediation_target(corr: str) -> str:
     return corr
 
 
+def is_direct_unit_test(
+    test_ref: str | pathlib.Path,
+    modified_files: List[pathlib.Path],
+    targets: List[pathlib.Path],
+) -> bool:
+    """Check if test_ref directly tests one of the modified repo components."""
+    if not test_ref:
+        return False
+    raw_str = str(test_ref).strip()
+    if "::" in raw_str:
+        raw_str = raw_str.split("::", 1)[0]
+    p = pathlib.Path(raw_str)
+    t_stem = p.stem.lower()
+    t_name = p.name.lower()
+    t_posix = p.as_posix().lower()
+
+    all_mods = list(targets or []) + list(modified_files or [])
+    for mod_p in all_mods:
+        if not mod_p:
+            continue
+        m_p = pathlib.Path(mod_p)
+        m_stem = m_p.stem.lower()
+        if not m_stem or m_stem in ("__init__", "conftest", "test", "tests"):
+            continue
+        m_clean = m_stem.lstrip("_")
+
+        # Direct matching heuristics (e.g. tests/test_ansi.py testing rich/ansi.py)
+        if t_stem in (f"test_{m_stem}", f"{m_stem}_test", m_stem, f"test_{m_clean}", f"{m_clean}_test", m_clean):
+            return True
+        if t_name in (f"test_{m_stem}.py", f"{m_stem}_test.py", f"{m_stem}.py", f"test_{m_clean}.py", f"{m_clean}_test.py"):
+            return True
+        if t_stem.startswith(f"test_{m_stem}") or t_stem.endswith(f"_{m_stem}"):
+            return True
+        if m_clean and (t_stem.startswith(f"test_{m_clean}") or t_stem.endswith(f"_{m_clean}")):
+            return True
+        if f"/test_{m_stem}.py" in t_posix or f"/{m_stem}_test.py" in t_posix:
+            return True
+        if m_clean and (f"/test_{m_clean}.py" in t_posix or f"/{m_clean}_test.py" in t_posix):
+            return True
+
+    return False
+
+
+def is_assertion_mismatch(
+    error_type: str,
+    actual: Optional[str] = None,
+    expected: Optional[str] = None,
+    diff: Optional[str] = None,
+    explanation: str = "",
+    statement: str = "",
+    error_msg: str = "",
+) -> bool:
+    """Check if the failure is an assertion mismatch (e.g. sequence length, string diff, equality)."""
+    non_assert_errors = {
+        "AttributeError",
+        "TypeError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "KeyError",
+        "IndexError",
+        "NameError",
+        "SyntaxError",
+        "IndentationError",
+        "ZeroDivisionError",
+        "FileNotFoundError",
+        "PermissionError",
+        "TimeoutError",
+        "RuntimeError",
+        "RecursionError",
+        "UnboundLocalError",
+        "NotImplementedError",
+    }
+    if error_type in non_assert_errors:
+        return False
+
+    is_assert_type = (error_type == "AssertionError") or statement.strip().startswith("assert") or ("assert " in statement)
+    if not is_assert_type:
+        return False
+
+    if actual is not None and expected is not None:
+        return True
+    if diff is not None and diff.strip():
+        return True
+    if any(k in statement for k in ("==", "!=", " in ", "len(", ">", "<")):
+        return True
+    expl_lower = explanation.lower()
+    if any(k in expl_lower for k in ("mismatch", "expected", "got", "differed", "extra", "missing", "boundary defect", "returned", "differs")):
+        return True
+    if any(k in error_msg.lower() for k in ("assert", "differing", "contains", "equal", "==", "!=")):
+        return True
+    return True
+
+
 def generate_remediation_hint(
     error_type: str,
     explanation: str,
@@ -767,6 +879,7 @@ def generate_remediation_hint(
     expected: Optional[str],
     actual: Optional[str],
     locations: List[Tuple[str, int, str]],
+    prefix_conflict_advisory: Optional[str] = None,
 ) -> str:
     """Generate an actionable remediation hint based on diagnosis and correlation."""
     frame_mod = None
@@ -778,34 +891,33 @@ def generate_remediation_hint(
     target_ref = clean_remediation_target(correlated_modifications[0]) if correlated_modifications else "modified files"
 
     if "BOUNDARY DEFECT" in explanation or "splitlines" in explanation:
-        return f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; if using re.split(r'(?<=\\n)', text), remember that each chunk retains its trailing delimiter—use chunk.rstrip('\\n') before processing or re-joining."
-
-    if "extra newline" in explanation:
-        return f"Check {target_ref}: strip unexpected trailing newline or verify whether newlines should be appended."
-
-    if "missing an expected trailing newline" in explanation:
-        return f"Check {target_ref}: ensure expected trailing newline is appended."
-
-    if error_type == "AttributeError":
+        base_hint = f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; if using re.split(r'(?<=\\n)', text), remember that each chunk retains its trailing delimiter—use chunk.rstrip('\\n') before processing or re-joining."
+    elif "extra newline" in explanation:
+        base_hint = f"Check {target_ref}: strip unexpected trailing newline or verify whether newlines should be appended."
+    elif "missing an expected trailing newline" in explanation:
+        base_hint = f"Check {target_ref}: ensure expected trailing newline is appended."
+    elif error_type == "AttributeError":
         if frame_mod:
-            return f"Check '{frame_mod[2]}' in '{frame_mod[0]}:{frame_mod[1]}': verify object is not None and attribute exists before access."
-        return f"Check {target_ref}: verify object initialization and attribute definitions."
-
-    if error_type == "TypeError":
+            base_hint = f"Check '{frame_mod[2]}' in '{frame_mod[0]}:{frame_mod[1]}': verify object is not None and attribute exists before access."
+        else:
+            base_hint = f"Check {target_ref}: verify object initialization and attribute definitions."
+    elif error_type == "TypeError":
         if frame_mod:
-            return f"Check signature at '{frame_mod[0]}:{frame_mod[1]}' in '{frame_mod[2]}': adjust parameter count/types to match callers."
-        return f"Check {target_ref}: ensure function/method signatures align with existing test callers."
+            base_hint = f"Check signature at '{frame_mod[0]}:{frame_mod[1]}' in '{frame_mod[2]}': adjust parameter count/types to match callers."
+        else:
+            base_hint = f"Check {target_ref}: ensure function/method signatures align with existing test callers."
+    elif error_type in ("ImportError", "ModuleNotFoundError"):
+        base_hint = f"Check {target_ref}: verify imported symbol exists, is exported, and not misspelled/renamed."
+    elif error_type == "KeyError":
+        base_hint = f"Check {target_ref}: ensure modified code populates the required dictionary key."
+    elif expected and actual:
+        base_hint = f"Review {target_ref}: expected {expected} but produced {actual}."
+    else:
+        base_hint = f"Review recent modifications in {target_ref} affecting `{failing_statement or 'this test'}`."
 
-    if error_type in ("ImportError", "ModuleNotFoundError"):
-        return f"Check {target_ref}: verify imported symbol exists, is exported, and not misspelled/renamed."
-
-    if error_type == "KeyError":
-        return f"Check {target_ref}: ensure modified code populates the required dictionary key."
-
-    if expected and actual:
-        return f"Review {target_ref}: expected {expected} but produced {actual}."
-
-    return f"Review recent modifications in {target_ref} affecting `{failing_statement or 'this test'}`."
+    if prefix_conflict_advisory:
+        return f"{base_hint}\n  {prefix_conflict_advisory}"
+    return base_hint
 
 
 def parse_pytest_output(
@@ -989,7 +1101,27 @@ def parse_pytest_output(
 
         corrs = correlate_test_with_modified(test_fpath, func_name, locations, statement, modified_files, ws)
         expl = explain_mismatch(actual_val, expected_val, error_type, error_msg, statement)
-        hint = generate_remediation_hint(error_type, expl, corrs, statement, expected_val, actual_val, locations)
+
+        # Check for pre-fix test conflict advisory
+        candidate_test_refs = [test_file_str, test_id_cand]
+        for loc_f, _, _ in locations:
+            if "test" in loc_f.lower():
+                candidate_test_refs.append(loc_f)
+
+        is_direct = any(is_direct_unit_test(t_ref, modified_files, targets) for t_ref in candidate_test_refs if t_ref)
+        is_mismatch = is_assertion_mismatch(error_type, actual_val, expected_val, diff_str, expl, statement, error_msg)
+        prefix_advisory: Optional[str] = PREFIX_CONFLICT_ADVISORY if (is_direct and is_mismatch) else None
+
+        hint = generate_remediation_hint(
+            error_type,
+            expl,
+            corrs,
+            statement,
+            expected_val,
+            actual_val,
+            locations,
+            prefix_conflict_advisory=prefix_advisory,
+        )
 
         loc_str = f"{clean_test_id(test_file_str, ws)}:{line_no}: in {func_name}" if line_no else f"{clean_test_id(test_file_str, ws)}: in {func_name}"
 
@@ -1010,6 +1142,7 @@ def parse_pytest_output(
             correlated_modifications=corrs,
             explanation=expl,
             remediation_hint=hint,
+            prefix_conflict_advisory=prefix_advisory,
         ))
 
     # Fallback if pytest returned failure but no structured blocks were parsed
@@ -1058,12 +1191,18 @@ def parse_pytest_output(
             else:
                 summ = f"REGRESSION ROOT CAUSE: Across {len(items)} tests ({', '.join(t_names[:3])}), assertion failed: {expl}{corr_summary}"
 
+        # Collect prefix conflict advisory across items in this group
+        group_prefix_advisory = next((it.prefix_conflict_advisory for it in items if it.prefix_conflict_advisory), None)
+        item_with_advisory = next((it for it in items if it.prefix_conflict_advisory), None)
+        diag_hint = item_with_advisory.remediation_hint if item_with_advisory else items[0].remediation_hint
+
         diagnoses.append(FailureDiagnosis(
             summary=summ,
             failing_tests=t_ids,
             suspected_modified_files=all_corrs,
             common_mismatch=expl,
-            remediation_hint=items[0].remediation_hint,
+            remediation_hint=diag_hint,
+            prefix_conflict_advisory=group_prefix_advisory,
         ))
 
     # String format targets and modified files
@@ -1092,6 +1231,7 @@ def parse_pytest_output(
 
     base_summary = summary_line or ("All tests passed." if exit_code == 0 else f"{len(failures)} test(s) failed.")
     final_summary = f"{multi_file_warning} | {base_summary}" if multi_file_warning else base_summary
+    overall_prefix_advisory = next((d.prefix_conflict_advisory for d in diagnoses if d.prefix_conflict_advisory), None)
 
     return BlastRadiusResult(
         targets=t_strs,
@@ -1107,10 +1247,11 @@ def parse_pytest_output(
         total_errors=total_errors,
         failures=failures,
         diagnoses=diagnoses,
+        prefix_conflict_advisory=overall_prefix_advisory,
     )
 
 
-def format_failure_report(result: BlastRadiusResult, max_lines: int = 35) -> str:
+def format_failure_report(result: BlastRadiusResult, max_lines: int = 40) -> str:
     """Format a clean, deterministic, context-capped triage report."""
     out_lines: List[str] = []
     out_lines.append(f"[blast-radius] 💥 REGRESSION DETECTED IN BLAST RADIUS (Exit code: {result.exit_code}):")
@@ -1161,6 +1302,8 @@ def format_failure_report(result: BlastRadiusResult, max_lines: int = 35) -> str
 
         if diag.remediation_hint:
             out_lines.append(f"  • Remediation hint: {diag.remediation_hint}")
+        if diag.prefix_conflict_advisory and diag.prefix_conflict_advisory not in (diag.remediation_hint or ""):
+            out_lines.append(f"  {diag.prefix_conflict_advisory}")
         out_lines.append("-" * 80)
 
     if len(result.diagnoses) > 3:
@@ -1292,7 +1435,7 @@ def main() -> int:
         elif exit_code == 0:
             print(f"[blast-radius] ✅ PASSED: {result.summary}")
         else:
-            print(format_failure_report(result, max_lines=35))
+            print(format_failure_report(result, max_lines=40))
 
         return 0
     except Exception as e:

@@ -2,7 +2,21 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01
+## [Unreleased] - 2026-10-01 (Run B28 Post-Mortem: Pre-Fix Test Conflict Resolution & Anti-Suppression)
+
+### Fixed & Hardened (First-Principles Pre-Fix Test Conflict Handling)
+- **True Regressions vs Pre-Fix Test Conflicts (`my_submission/prompts/main.md`)**:
+  - Distinguished between True Regressions (unhandled exceptions, crashes, distance-1 consumer failures) and Pre-Fix Test Assertion Conflicts (where unpatched baseline unit tests assert old, pre-fix buggy behavior that the issue explicitly asked to change).
+  - Enforced Anti-Suppression Rule: strictly forbids adding suppression hacks (such as `if line == "": continue`) or reverting when distance-1 consumer tests pass and the unit test difference matches the intended bug fix.
+  - Updated Section 8 `blast-radius` submission gate to unblock patch submission when the only mismatch is a pre-fix unit test expecting the old omitted/stripped behavior.
+- **Pre-Fix Test Conflict Advisory in Regression Triage (`my_submission/skills/blast-radius/`)**:
+  - Enhanced `test_blast.py` to identify when an assertion failure occurs on the direct unit test of the modified file and emit `💡 PRE-FIX TEST CONFLICT ADVISORY` to prevent the agent from destroying its fix.
+  - Mirrored byte-for-byte between `test_blast.py` and `scripts/test_blast.py`.
+- **Empty Line Anti-Suppression Guidance (`my_submission/skills/repro-check/`)**:
+  - Enhanced `check.py` to explicitly warn against adding `if line == "": continue` during lookbehind regex splitting (`re.split(r"(?<=\n)", text)`), reminding that empty string chunks are necessary representations of empty lines.
+  - Mirrored byte-for-byte between `check.py` and `scripts/check.py`.
+
+## [Unreleased] - 2026-10-01 (Run B26 Post-Mortem)
 
 ### Fixed & Hardened (Run B26 Post-Mortem: Anti-Chaining, Lookbehind Delimiter Semantics & Continuation Defense)
 - **Prompt Anti-Chaining & Single-Tool Protocol (`my_submission/prompts/main.md`)**:
