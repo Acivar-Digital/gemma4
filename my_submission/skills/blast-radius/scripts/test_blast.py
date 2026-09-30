@@ -890,12 +890,8 @@ def generate_remediation_hint(
 
     target_ref = clean_remediation_target(correlated_modifications[0]) if correlated_modifications else "modified files"
 
-    if "BOUNDARY DEFECT" in explanation or "splitlines" in explanation:
-        base_hint = f"Check {target_ref}: string splitting or stripping collapsed empty lines. In Python, splitlines() drops trailing empty tokens; if using re.split(r'(?<=\\n)', text), remember that each chunk retains its trailing delimiter—use chunk.rstrip('\\n') before processing or re-joining."
-    elif "extra newline" in explanation:
-        base_hint = f"Check {target_ref}: strip unexpected trailing newline or verify whether newlines should be appended."
-    elif "missing an expected trailing newline" in explanation:
-        base_hint = f"Check {target_ref}: ensure expected trailing newline is appended."
+    if "BOUNDARY DEFECT" in explanation:
+        base_hint = f"Check {target_ref}: boundary condition or empty input mismatch. Verify edge-case handling in data transformation."
     elif error_type == "AttributeError":
         if frame_mod:
             base_hint = f"Check '{frame_mod[2]}' in '{frame_mod[0]}:{frame_mod[1]}': verify object is not None and attribute exists before access."
