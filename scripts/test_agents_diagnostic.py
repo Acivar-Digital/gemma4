@@ -50,7 +50,7 @@ async def main():
     models = setup_gemma_model_registry(
         api_base="http://literouter.lan:7766/v1",
         api_key="lr-or-oa-ch-no",
-        served_model="thinkingmachines/inkling-small:free",
+        served_model="stealth/space-bunny-alpha",
     )
     mgr = SubprocessManager(system_site_packages=True)
     sb_id = mgr.start()
@@ -67,14 +67,14 @@ async def main():
         model_registry=models,
     )
 
-    supervisor_tool = [t for t in main_agent.tools if hasattr(t, "agent")][0]
-    supervisor_agent = supervisor_tool.agent
-
     # 1. Test Main
     await test_agent(main_agent, "Main Developer Agent")
 
-    # 2. Test Supervisor
-    await test_agent(supervisor_agent, "Supervisor Quality Gatekeeper")
+    # 2. Test Subagents (if present)
+    subagent_tools = [t for t in main_agent.tools if hasattr(t, "agent")]
+    for sat in subagent_tools:
+        sub_name = getattr(sat.agent, "name", "Subagent")
+        await test_agent(sat.agent, sub_name)
 
     mgr.stop(sb_id)
 

@@ -29,8 +29,8 @@ class EvalRunConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model: str = Field(
-        default_factory=lambda: os.getenv("SWEGEMMA_MODEL", "thinkingmachines/inkling-small:free"),
-        description="Model identifier on LiteRouter (default: thinkingmachines/inkling-small:free)",
+        default_factory=lambda: os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
+        description="Model identifier on LiteRouter (default: stealth/space-bunny-alpha)",
     )
     api_base: str = Field(
         default_factory=lambda: os.getenv("SWEGEMMA_API_BASE", "http://literouter.lan:7766/v1"),
@@ -285,8 +285,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default=os.getenv("SWEGEMMA_MODEL", "thinkingmachines/inkling-small:free"),
-        help="Model identifier on LiteRouter (default: thinkingmachines/inkling-small:free)",
+        default=os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
+        help="Model identifier on LiteRouter (default: stealth/space-bunny-alpha)",
     )
     parser.add_argument(
         "--api-base",

@@ -4,6 +4,12 @@ All notable changes to the SWE-Gemma Autonomous Developer Agent submission archi
 
 ## [Unreleased] - 2026-10-01 (Run B29 Post-Mortem & Anti-Runaway Hardening)
 
+### Model Swap (Frontier Model Restoration)
+- **Swapped Evaluation Model Back to Frontier `stealth/space-bunny-alpha`**:
+  - Replaced `thinkingmachines/inkling-small:free` with `stealth/space-bunny-alpha` across `scripts/run_eval.py`, `scripts/preflight_check.py`, and `scripts/test_agents_diagnostic.py`.
+  - Swapped out the reasoning/thinking model in favor of the frontier model with superior native function calling, instruction following, and tool-use precision.
+  - Updated `scripts/test_agents_diagnostic.py` to gracefully handle lean monolith architectures without subagents.
+
 ### Fixed & Hardened (Token Runaway Elimination & Context Hygiene)
 - **Fast-Grep Context Protection (`my_submission/skills/fast-grep/`)**:
   - Expanded `SKIP_DIRS` with `benchmarks`, `benchmark`, `results`, `docs`, `doc`, `htmlcov`, `site-packages` to prevent scanning noisy benchmark results and documentation trees.
