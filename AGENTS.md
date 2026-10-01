@@ -16,21 +16,21 @@ Source of truth: `HARNESS_README.md` (671 lines). Read it before any design work
 - `tasks.jsonl` — 129 tasks (fastapi 67, rich 48, requests 13, httpx 1)
 - `sample_submission/` — baseline: `agent.yaml`, `eval_config.yaml`, `configs/sampling.yaml` (0.2/16384/4096), `prompts/system.md` + `analyzer.md`, `sub_agents/code_analyzer.yaml`, dummy LoRAs (213K each)
 - `graphs/` (127 .json), `embeddings/` (.npz), `snapshots/`, `wheels/`, `docker/`, `sandbox/`
-- `gemma-4-developer-agent/` — empty. `my_submission/` — does NOT exist (do not create without approval).
+- `gemma-4-developer-agent/` — empty.
+- `my_submission/` — Active Track 1 baseline submission (declarative ADK agent with 5 pre-installed skills: `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`). Scored 56/129 (43.4%) in run_B39.
+- `submission.zip` — Packaged and verified 221 KB competition submission archive.
 
-## Locked v1 Decisions (bd remember `gemma4-agent-v1-decisions-*`)
-1. Budgets: harness defaults (50 calls/30min standard eval), not 4-min rumor
-2. Main = hybrid: keeps `read_file`, delegates graph tools to searcher
-3. Delegation via `agent_tool skip_summarization:true`
-4. Searcher returns strict schema (file, lines, root cause, minimal change, confidence), no raw dumps
-5. Verify: `/tmp` repro + targeted single-file pytest, `submit_patch` last
-6. Keep sample `sampling.yaml`
-7. Mirror `sample_submission` filenames
-8. No LoRA adapters v1
-9. Local test: `--max-tool-calls 50 --max-time-minutes 30` on 1–2 fastapi tasks
+## Canonical Architecture Source of Truth
+Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) for the final, locked architectural truth on:
+- SFT Dataset: Multi-turn tool calling trajectories (never single-turn markdown diffs).
+- Sequence Length: `max_seq_length=16384` with gradient checkpointing (never 4096).
+- LoRA Specs: Rank 8 on `q_proj`, `v_proj`, `o_proj` only (freeze MLPs).
+- Prompt Governor: Dynamic 4-probe scratchpad, anti-thrashing circuit breaker, 2-strike edit oscillation rule.
+- Subprocess Shield: 3.0s socket timeout, 1GB memory runaway guard, process-group SIGKILL cleanup.
 
-## Current Scope
-User cancelled YAML drafting (`projects-ey0` closed). Key task is LLM context only. Do NOT create `my_submission/` or draft YAML without explicit approval.
+## Current Operational Scope (Dual-Track Master Plan)
+- **Track 1 (Immediate Lock-In):** Submit verified `submission.zip` to Kaggle leaderboard upon daily quota reset tonight at 00:00:00 UTC.
+- **Track 2 (LoRA Upgrade):** Train Rank-8 LoRA with Unsloth on single L4 GPU on Oct 3 when 30h GPU quota refreshes; mount as `adapter: main_lora` only if Resolution Rate >= 43.4%.
 
 ## Workflow
 - `bd` for all tracking. Non-interactive shell flags (`cp -f`, `mv -f`, `rm -f`, `rm -rf`).
