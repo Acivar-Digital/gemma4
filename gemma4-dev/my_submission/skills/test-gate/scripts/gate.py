@@ -5,25 +5,28 @@ Consolidates blast-radius (distance-1 neighbor regression test runner) and diff-
 (safe git diff viewer) into a single authoritative gatekeeper skill.
 
 Modes:
-  1. Default or --blast:
+  1. Default or blast / --blast / -b:
      - Identifies modified Python files in git working tree.
      - Locates distance-1 neighbor tests (maps source files to test files).
-     - Executes pytest on neighbor tests with timeout (e.g. 60s per test file).
+     - Executes pytest on neighbor tests with timeout (default 60s per test file).
      - Reports clear summary: tests run, tests passed, tests failed, and failing traceback snippet.
-  2. --diff:
+  2. diff / --diff / -d:
      - Runs safe read-only git diff against HEAD.
      - Verifies NO test files in /workspace were modified. If modified, emits:
        🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE
-       explaining that Container B discards test modifications and instructs: git checkout -- <file>.
+       explaining that Container B automatically reverts (discards) test-file modifications during evaluation.
+       Instructs exact command: git checkout -- <file>.
      - Summarizes lines added, lines removed, files touched.
-  3. --status:
+     - Diff truncation safety: truncates massive diffs (>500 lines or >50KB) with file-by-file summary.
+  3. status / --status / -s:
      - Full patch readiness: modified files, test file safety check, syntax check on touched files,
        and recommendation on whether it is safe to run submit_patch.
+     - Emits [✓ READY TO SUBMIT] when patch is 100% clean and ready.
   4. Actionable Diagnostics:
      - If no files modified, tells the LLM cleanly what files exist to test.
-     - If tests fail, prints the exact failing test names and instructions.
+     - If tests fail, prints the exact failing test names, line numbers, statements, and guidance.
      - If non-existent flags or arguments passed, explains available options with copy-pasteable examples.
-  5. --json:
+  5. --json / -j:
      - Returns 100% Pydantic v2 structured schemas.
 
 Always exits with code 0.
@@ -74,6 +77,9 @@ SCRATCH_FILE_PATTERNS = [
     r"^check.*\.py$",
     r"^verify.*\.py$",
 ]
+
+MAX_DIFF_LINES = 500
+MAX_DIFF_BYTES = 50 * 1024  # 50 KB
 
 
 def strip_ansi(text: str) -> str:
@@ -158,7 +164,13 @@ class TestGateResult(BaseModel):
     can_submit_patch: bool = Field(default=False, description="True if patch is ready and safe for submit_patch")
     summary: str = Field(default="", description="Concise human-readable summary")
     recommendation: str = Field(default="", description="Explicit actionable recommendation")
-    diff_preview: str = Field(default="", description="Unified diff preview (capped at 100 lines)")
+    diff_preview: str = Field(default="", description="Unified diff preview (capped at 500 lines / 50KB)")
+
+
+FailureDetail.model_rebuild()
+SyntaxErrorDetail.model_rebuild()
+FileChangeStat.model_rebuild()
+TestGateResult.model_rebuild()
 
 
 # ==============================================================================
@@ -214,6 +226,12 @@ def get_workspace_dir(explicit_ws: Optional[str] = None) -> pathlib.Path:
         return ws_fixed.resolve()
 
     return cur
+
+
+def is_git_repo(ws: pathlib.Path) -> bool:
+    """Check if directory is inside a valid git working tree."""
+    code, _ = run_git_cmd(["rev-parse", "--is-inside-work-tree"], cwd=ws, timeout_secs=5)
+    return code == 0
 
 
 def is_test_file(path_str: str) -> bool:
@@ -290,6 +308,9 @@ def run_git_cmd(args: List[str], cwd: pathlib.Path, timeout_secs: int = 15) -> T
 
 def get_git_status_and_files(ws: pathlib.Path) -> Tuple[List[str], List[str], Dict[str, str]]:
     """Query git status to return (modified_files, untracked_files, status_map)."""
+    if not is_git_repo(ws):
+        return [], [], {}
+
     code, out = run_git_cmd(
         ["status", "--porcelain", "-uall", "--", ".", ":(exclude)*.adk_exec*", ":(exclude)**/.adk_exec*"],
         cwd=ws,
@@ -371,6 +392,17 @@ def verify_python_syntax(file_path: pathlib.Path) -> Optional[SyntaxErrorDetail]
             snippet="> 1 | (unreadable file)",
         )
 
+    # Detect binary files containing null bytes
+    if b"\x00" in raw_bytes[:4096]:
+        return SyntaxErrorDetail(
+            file_path=str(file_path),
+            line_number=1,
+            column=1,
+            error_type="BinaryFileError",
+            message="File contains binary or null bytes; cannot parse as Python source.",
+            snippet="> 1 | (binary file)",
+        )
+
     try:
         source_text = raw_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -393,6 +425,15 @@ def verify_python_syntax(file_path: pathlib.Path) -> Optional[SyntaxErrorDetail]
             error_type=error_type,
             message=msg,
             snippet=snippet,
+        )
+    except Exception as e:
+        return SyntaxErrorDetail(
+            file_path=str(file_path),
+            line_number=1,
+            column=1,
+            error_type=type(e).__name__,
+            message=str(e),
+            snippet="> 1 | (parse error)",
         )
 
     return None
@@ -621,7 +662,7 @@ def find_pytest_command(ws: pathlib.Path) -> List[str]:
 
 
 def run_pytest_suite(test_files: List[str], ws: pathlib.Path, timeout_secs: int = 60) -> Tuple[int, str]:
-    """Run pytest on the given test files with workspace in PYTHONPATH."""
+    """Run pytest on the given test files with workspace in PYTHONPATH and timeout protection."""
     cmd_base = find_pytest_command(ws)
     cmd = cmd_base + ["-vv", "--tb=short", "--disable-warnings"] + test_files
 
@@ -647,12 +688,17 @@ def run_pytest_suite(test_files: List[str], ws: pathlib.Path, timeout_secs: int 
         )
         return res.returncode, (res.stdout + "\n" + res.stderr).strip()
     except subprocess.TimeoutExpired:
-        return 1, f"[test-gate] Pytest timed out after {timeout_secs}s on: {', '.join(test_files)}"
+        return 124, f"[test-gate] Pytest timed out after {timeout_secs}s on: {', '.join(test_files)}"
     except Exception as e:
         return 1, f"[test-gate] Pytest error: {e}"
 
 
-def parse_pytest_results(raw_output: str, ws: pathlib.Path) -> Tuple[int, int, int, List[FailureDetail]]:
+def parse_pytest_results(
+    raw_output: str,
+    ws: pathlib.Path,
+    test_files: Optional[List[str]] = None,
+    timeout_secs: Optional[int] = None,
+) -> Tuple[int, int, int, List[FailureDetail]]:
     """Parse pytest summary and detailed failures from output."""
     clean_out = strip_ansi(raw_output)
     lines = clean_out.splitlines()
@@ -674,6 +720,30 @@ def parse_pytest_results(raw_output: str, ws: pathlib.Path) -> Tuple[int, int, i
             if em:
                 total_errors = int(em.group(1))
             break
+
+    # Check for timeout condition
+    if "timed out after" in clean_out.lower():
+        total_failed = max(1, total_failed)
+        return (
+            total_passed,
+            total_failed,
+            total_errors,
+            [
+                FailureDetail(
+                    test_id=f"timeout::{test_files[0] if test_files else 'neighbor_tests'}",
+                    test_file=test_files[0] if test_files else "",
+                    test_name="pytest_timeout",
+                    line_number=None,
+                    error_type="TimeoutExpired",
+                    error_message=clean_out.strip().splitlines()[-1] if clean_out.strip() else "Pytest timed out",
+                    failing_statement=f"Execution timed out after {timeout_secs or 60}s",
+                    expected="Tests to complete within timeout limit",
+                    actual=f"Timed out after {timeout_secs or 60}s",
+                    traceback_snippet=clean_out.strip()[:600],
+                    remediation_hint=f"Pytest execution timed out after {timeout_secs or 60}s. Check for infinite loops, deadlocks, or slow fixtures. Increase timeout with -t <secs> or --timeout <secs>.",
+                )
+            ],
+        )
 
     # Parse failure blocks
     header_re = re.compile(r"^_{3,}\s+(.*?)\s+_{3,}$")
@@ -768,6 +838,21 @@ def parse_pytest_results(raw_output: str, ws: pathlib.Path) -> Tuple[int, int, i
             )
         )
 
+    # Fallback if pytest failed without standard block headers (e.g. collection error)
+    if total_failed == 0 and total_errors > 0 and not failures:
+        err_lines = [l for l in lines if l.startswith("E   ") or "error" in l.lower()]
+        failures.append(
+            FailureDetail(
+                test_id=test_files[0] if test_files else "pytest_suite",
+                test_file=test_files[0] if test_files else "",
+                test_name="pytest_error",
+                error_type="PytestError",
+                error_message=err_lines[0].strip() if err_lines else "Pytest error occurred during suite execution",
+                traceback_snippet="\n".join(err_lines[:8]) if err_lines else clean_out[:400],
+                remediation_hint="Inspect pytest error output and fix syntax or import errors.",
+            )
+        )
+
     return total_passed, total_failed, total_errors, failures
 
 
@@ -775,9 +860,29 @@ def parse_pytest_results(raw_output: str, ws: pathlib.Path) -> Tuple[int, int, i
 # Mode Handlers: blast, diff, status
 # ==============================================================================
 
-def execute_blast(ws: pathlib.Path, target_args: List[str]) -> TestGateResult:
+def execute_blast(
+    ws: pathlib.Path,
+    target_args: List[str],
+    timeout_per_file: int = 60,
+) -> TestGateResult:
     """Execute Mode 1: Distance-1 Neighbor Regression Test Runner."""
+    if not is_git_repo(ws) and not target_args:
+        return TestGateResult(
+            mode="blast",
+            workspace=str(ws),
+            success=False,
+            status="NOT_A_GIT_REPOSITORY",
+            summary=f"Workspace '{ws}' is not a git repository.",
+            recommendation="Initialize git or specify a valid repository path with --workspace <dir>.",
+        )
+
     modified_files, untracked, _ = get_git_status_and_files(ws)
+
+    # Check for forbidden test files in /workspace
+    forbidden_modified: List[str] = [f for f in modified_files if is_forbidden_harness_file(f)]
+    for u in untracked:
+        if is_test_file(u):
+            forbidden_modified.append(u)
 
     # Determine targets: explicit target args or git modified files
     targets: List[pathlib.Path] = []
@@ -835,6 +940,7 @@ def execute_blast(ws: pathlib.Path, target_args: List[str]) -> TestGateResult:
             tests_failed=0,
             tests_errors=0,
             failures=[],
+            forbidden_test_files=forbidden_modified,
             summary="No modified files detected in working tree.",
             recommendation=msg,
         )
@@ -865,21 +971,28 @@ def execute_blast(ws: pathlib.Path, target_args: List[str]) -> TestGateResult:
             tests_failed=0,
             tests_errors=0,
             failures=[],
+            forbidden_test_files=forbidden_modified,
             summary=summary,
             recommendation=rec,
         )
 
-    timeout = max(60, len(test_files) * 60)
+    timeout = max(timeout_per_file, len(test_files) * timeout_per_file)
     exit_code, raw_output = run_pytest_suite(test_files, ws, timeout_secs=timeout)
-    passed_cnt, failed_cnt, err_cnt, failures = parse_pytest_results(raw_output, ws)
+    passed_cnt, failed_cnt, err_cnt, failures = parse_pytest_results(
+        raw_output,
+        ws,
+        test_files=test_files,
+        timeout_secs=timeout,
+    )
 
     total_run = passed_cnt + failed_cnt + err_cnt
     if total_run == 0 and exit_code != 0:
         failed_cnt = max(1, len(failures) or 1)
         total_run = failed_cnt
 
-    success = (exit_code == 0 and failed_cnt == 0 and err_cnt == 0)
-    status_str = "PASSED" if success else "FAILED"
+    has_forbidden = len(forbidden_modified) > 0
+    success = (exit_code == 0 and failed_cnt == 0 and err_cnt == 0 and not has_forbidden)
+    status_str = "PASSED" if success else ("BLOCKED_FORBIDDEN_TEST_FILE" if has_forbidden else "FAILED")
 
     if success:
         summary = f"PASSED: {passed_cnt} test(s) passed across neighbor test suite ({', '.join(test_files)})."
@@ -891,7 +1004,7 @@ def execute_blast(ws: pathlib.Path, target_args: List[str]) -> TestGateResult:
         rec = (
             f"Exact failing tests:\n"
             + "\n".join(f"  ✗ {t}" for t in failing_names)
-            + "\nAction: Inspect traceback snippet(s) above, fix logic in modified files, and re-run python3 gate.py."
+            + "\nGuidance: Fix the logic causing test failures in your modified files before calling submit_patch(). Inspect the failing statements and expected vs actual values above, then re-run python3 gate.py."
         )
 
     return TestGateResult(
@@ -907,13 +1020,24 @@ def execute_blast(ws: pathlib.Path, target_args: List[str]) -> TestGateResult:
         tests_failed=failed_cnt,
         tests_errors=err_cnt,
         failures=failures,
+        forbidden_test_files=forbidden_modified,
         summary=summary,
         recommendation=rec,
     )
 
 
 def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> TestGateResult:
-    """Execute Mode 2: Safe Git Diff Viewer & Safety Assertion Gate."""
+    """Execute Mode 2: Safe Git Diff Viewer & Safety Assertion Gate with Diff Truncation."""
+    if not is_git_repo(ws):
+        return TestGateResult(
+            mode="diff",
+            workspace=str(ws),
+            success=False,
+            status="NOT_A_GIT_REPOSITORY",
+            summary=f"Workspace '{ws}' is not a git repository.",
+            recommendation="Initialize git or specify a valid repository path with --workspace <dir>.",
+        )
+
     modified_files, untracked, status_map = get_git_status_and_files(ws)
 
     # 1. Parse git diff --numstat HEAD
@@ -977,7 +1101,7 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
         if is_test_file(u):
             forbidden_modified.append(u)
 
-    # 2. Get unified diff preview capped at 100 lines
+    # 2. Get unified diff preview capped at MAX_DIFF_LINES / MAX_DIFF_BYTES
     diff_cmd = ["diff", "HEAD", "--", ".", ":(exclude)*.adk_exec*", ":(exclude)**/.adk_exec*"]
     if extra_args:
         diff_cmd = ["diff", "HEAD"] + extra_args + ["--", ".", ":(exclude)*.adk_exec*", ":(exclude)**/.adk_exec*"]
@@ -986,11 +1110,36 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
         code, diff_out = run_git_cmd(["diff"], cwd=ws, timeout_secs=15)
 
     diff_lines = diff_out.splitlines() if diff_out else []
-    preview = "\n".join(diff_lines[:100])
-    if len(diff_lines) > 100:
-        preview += f"\n... [diff truncated: {len(diff_lines) - 100} lines omitted; max 100 lines displayed] ..."
+    total_diff_lines = len(diff_lines)
+    truncated_lines: List[str] = []
+    accumulated_bytes = 0
+    is_truncated = False
+
+    for idx, line in enumerate(diff_lines):
+        line_bytes = len(line.encode("utf-8", errors="replace")) + 1
+        if idx >= MAX_DIFF_LINES or (accumulated_bytes + line_bytes > MAX_DIFF_BYTES and idx >= 20):
+            is_truncated = True
+            break
+        truncated_lines.append(line)
+        accumulated_bytes += line_bytes
 
     total_files = len(file_stats)
+
+    if is_truncated:
+        omitted_lines = total_diff_lines - len(truncated_lines)
+        preview = "\n".join(truncated_lines)
+        preview += (
+            f"\n\n... [DIFF TRUNCATED: {omitted_lines} lines omitted to prevent LLM context blowout; "
+            f"capped at {len(truncated_lines)} lines / {accumulated_bytes // 1024}KB] ...\n\n"
+            f"File-by-file summary of changes:\n"
+        )
+        for stat in file_stats:
+            tag = " [FORBIDDEN TEST]" if stat.is_forbidden else ""
+            preview += f"  • {stat.path}: +{stat.additions}, -{stat.deletions} [{stat.status}]{tag}\n"
+        preview += f"Total changes: {total_files} file(s) touched (+{total_adds} additions, -{total_dels} deletions)"
+    else:
+        preview = "\n".join(diff_lines)
+
     is_clean = (total_files == 0 and not diff_out)
 
     # Safety Assertions
@@ -1002,7 +1151,7 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
         success = False
         summary = (
             f"🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE ({', '.join(forbidden_modified)})\n"
-            f"Container B discards or overwrites test-file modifications during SWE-bench evaluation.\n"
+            f"Container B automatically reverts (discards) test-file modifications during evaluation.\n"
             f"Your patch must resolve the defect exclusively in the source codebase, never by altering existing test files."
         )
         rec = (
@@ -1048,6 +1197,16 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
 
 def execute_status(ws: pathlib.Path) -> TestGateResult:
     """Execute Mode 3: Full Patch Readiness & Pre-Submission Gate."""
+    if not is_git_repo(ws):
+        return TestGateResult(
+            mode="status",
+            workspace=str(ws),
+            success=False,
+            status="NOT_A_GIT_REPOSITORY",
+            summary=f"Workspace '{ws}' is not a git repository.",
+            recommendation="Initialize git or specify a valid repository path with --workspace <dir>.",
+        )
+
     diff_res = execute_diff(ws)
 
     # Collect Python files touched for syntax verification
@@ -1073,7 +1232,7 @@ def execute_status(ws: pathlib.Path) -> TestGateResult:
         status_str = "BLOCKED_FORBIDDEN_TEST_FILE"
         summary = (
             f"🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE: {', '.join(diff_res.forbidden_test_files)}\n"
-            f"Container B discards or overwrites test-file modifications during SWE-bench evaluation."
+            f"Container B automatically reverts (discards) test-file modifications during evaluation."
         )
         rec = (
             "Revert forbidden test modifications before submitting:\n"
@@ -1103,7 +1262,7 @@ def execute_status(ws: pathlib.Path) -> TestGateResult:
             if diff_res.total_files_modified > 1
             else ""
         )
-        rec = f"Patch is verified and ready for submit_patch().{multi_file_note}"
+        rec = f"Patch is verified and [✓ READY TO SUBMIT]. Safe to run submit_patch().{multi_file_note}"
 
     return TestGateResult(
         mode="status",
@@ -1144,13 +1303,28 @@ def format_report(res: TestGateResult) -> str:
         lines.append(f"Results: {res.tests_run} run | {res.tests_passed} passed | {res.tests_failed} failed | {res.tests_errors} errors")
         lines.append("-" * 75)
 
+        if res.forbidden_test_files:
+            lines.append("\n" + "=" * 75)
+            lines.append("🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE")
+            for f in res.forbidden_test_files:
+                lines.append(f"  • {f}")
+            lines.append("Container B automatically reverts (discards) test-file modifications during evaluation.")
+            lines.append("Your patch must resolve the defect exclusively in the source codebase, never by altering existing test files.")
+            lines.append("To revert forbidden test file modifications, run:")
+            for f in res.forbidden_test_files:
+                lines.append(f"  git checkout -- {f}")
+            lines.append("=" * 75 + "\n")
+
         if res.failures:
             lines.append("💥 TEST FAILURES DETECTED:")
             for f in res.failures[:5]:
                 lines.append(f"  • {f.test_id} [{f.error_type}]")
+                if f.line_number:
+                    lines.append(f"    Line: {f.line_number}")
                 if f.failing_statement:
-                    loc = f" (line {f.line_number})" if f.line_number else ""
-                    lines.append(f"    Statement: {f.failing_statement}{loc}")
+                    lines.append(f"    Statement: {f.failing_statement}")
+                if f.error_message:
+                    lines.append(f"    Failure: {f.error_message}")
                 if f.expected and f.actual:
                     lines.append(f"    Expected:  {f.expected}")
                     lines.append(f"    Actual:    {f.actual}")
@@ -1159,7 +1333,7 @@ def format_report(res: TestGateResult) -> str:
                     for tb_line in f.traceback_snippet.splitlines()[:4]:
                         lines.append(f"      {tb_line}")
                 if f.remediation_hint:
-                    lines.append(f"    Hint: {f.remediation_hint}")
+                    lines.append(f"    Guidance: {f.remediation_hint}")
                 lines.append("")
             if len(res.failures) > 5:
                 lines.append(f"  ... (+{len(res.failures) - 5} additional failure(s) omitted)")
@@ -1177,9 +1351,11 @@ def format_report(res: TestGateResult) -> str:
             lines.append("🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE")
             for f in res.forbidden_test_files:
                 lines.append(f"  • {f}")
-            lines.append("Container B discards or overwrites test-file modifications during SWE-bench evaluation.")
+            lines.append("Container B automatically reverts (discards) test-file modifications during evaluation.")
             lines.append("Your patch must resolve the defect exclusively in the source codebase, never by altering existing test files.")
-            lines.append("Revert with: git checkout -- <file>")
+            lines.append("To revert forbidden test file modifications, run:")
+            for f in res.forbidden_test_files:
+                lines.append(f"  git checkout -- {f}")
             lines.append("=" * 75 + "\n")
 
         if res.dangerous_scratch_files:
@@ -1208,7 +1384,11 @@ def format_report(res: TestGateResult) -> str:
             lines.append("🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE")
             for f in res.forbidden_test_files:
                 lines.append(f"  • {f}")
-            lines.append("Container B discards test modifications. Revert with: git checkout -- <file>")
+            lines.append("Container B automatically reverts (discards) test-file modifications during evaluation.")
+            lines.append("Your patch must resolve the defect exclusively in the source codebase, never by altering existing test files.")
+            lines.append("To revert forbidden test file modifications, run:")
+            for f in res.forbidden_test_files:
+                lines.append(f"  git checkout -- {f}")
             lines.append("=" * 75 + "\n")
 
         if res.syntax_errors:
@@ -1230,10 +1410,12 @@ def format_report(res: TestGateResult) -> str:
 
         lines.append("\nPatch Submission Readiness:")
         if res.can_submit_patch:
-            lines.append("  [✓ READY] Safe to run submit_patch().")
+            lines.append("  [✓ READY TO SUBMIT] Safe to run submit_patch().")
         else:
             lines.append("  [✗ BLOCKED] DO NOT run submit_patch(). Address issues above.")
 
+        if res.summary:
+            lines.append(f"\nSummary: {res.summary}")
         lines.append(f"\nRecommendation: {res.recommendation}")
 
     return "\n".join(lines)
@@ -1245,74 +1427,167 @@ def print_usage_guide(invalid_arg: Optional[str] = None):
         print(f"[test-gate] ⚠️ Unknown argument or flag: '{invalid_arg}'\n")
     print("test-gate: Authoritative regression runner, diff inspector, and patch readiness gate.\n")
     print("Available Modes & Options:")
-    print("  --blast [file]    Run distance-1 neighbor tests on modified or target files (default)")
-    print("  --diff            Safe read-only git diff with test-file mutation assertion")
-    print("  --status          Full patch readiness: syntax checks, safety, submit recommendation")
-    print("  --json            Output structured JSON (Pydantic v2)")
-    print("  --help, -h        Show this help message\n")
+    print("  --blast [file], -b, blast    Run distance-1 neighbor tests on modified or target files (default)")
+    print("  --diff, -d, diff             Safe read-only git diff with test-file mutation assertion")
+    print("  --status, -s, status         Full patch readiness: syntax checks, safety, submit recommendation")
+    print("  --json, -j                   Output structured JSON (Pydantic v2)")
+    print("  --timeout <sec>, -t <sec>    Pytest execution timeout per test file (default: 60s)")
+    print("  --workspace <dir>, -w <dir>  Explicit workspace root directory")
+    print("  --help, -h                   Show this help message\n")
     print("Copy-Pasteable Examples:")
-    print("  python3 gate.py                      # Auto-detect modified files & run neighbor tests")
+    print("  python3 gate.py                      # Smart default: check status or run neighbor tests if files modified")
+    print("  python3 gate.py diff                 # Positional diff inspection")
+    print("  python3 gate.py blast                # Positional blast regression")
+    print("  python3 gate.py status               # Positional patch readiness")
     print("  python3 gate.py fastapi/routing.py   # Run distance-1 neighbor tests for target file")
     print("  python3 gate.py --diff               # Inspect diff and assert no test files were touched")
     print("  python3 gate.py --status             # Verify syntax, safety, and patch submission readiness")
     print("  python3 gate.py --status --json      # Structured patch readiness assessment for agents")
+    print("  python3 gate.py -t 30 --blast        # Run blast regression with 30s timeout per test file")
 
 
 # ==============================================================================
-# CLI Entrypoint
+# CLI Argument Parser & Entrypoint
 # ==============================================================================
+
+def parse_cli_args(argv: List[str]) -> Tuple[str, List[str], bool, Optional[str], int, Optional[str]]:
+    """Parse CLI arguments with high forgiveness and positional routing.
+
+    Returns:
+        (mode, target_args, json_mode, ws_override, timeout_per_file, unknown_flag)
+    """
+    mode: Optional[str] = None
+    target_args: List[str] = []
+    json_mode: bool = False
+    ws_override: Optional[str] = None
+    timeout_per_file: int = 60
+    unknown_flag: Optional[str] = None
+
+    # Check for help first
+    if any(a.lower() in ("-h", "--help", "help", "-help") for a in argv):
+        return ("help", [], False, None, 60, None)
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        arg_lower = arg.lower()
+
+        # JSON mode
+        if arg in ("--json", "-j"):
+            json_mode = True
+            i += 1
+            continue
+
+        # Timeout options
+        if arg in ("--timeout", "-t"):
+            if i + 1 < len(argv):
+                try:
+                    timeout_per_file = max(1, int(argv[i + 1]))
+                except ValueError:
+                    pass
+                i += 2
+                continue
+            else:
+                i += 1
+                continue
+        if arg.startswith(("--timeout=", "-t=")):
+            val = arg.split("=", 1)[1]
+            try:
+                timeout_per_file = max(1, int(val))
+            except ValueError:
+                pass
+            i += 1
+            continue
+
+        # Workspace options
+        if arg in ("--workspace", "-w"):
+            if i + 1 < len(argv):
+                ws_override = argv[i + 1]
+                i += 2
+                continue
+            else:
+                i += 1
+                continue
+        if arg.startswith(("--workspace=", "-w=")):
+            ws_override = arg.split("=", 1)[1]
+            i += 1
+            continue
+
+        # Mode flags
+        if arg in ("--diff", "-d"):
+            mode = "diff"
+            i += 1
+            continue
+        if arg in ("--status", "-s"):
+            mode = "status"
+            i += 1
+            continue
+        if arg in ("--blast", "-b"):
+            mode = "blast"
+            i += 1
+            continue
+
+        # Check for unknown flags (starting with -)
+        if arg.startswith("-"):
+            unknown_flag = arg
+            i += 1
+            continue
+
+        # Positional routing
+        if arg_lower in ("diff", "inspect"):
+            mode = "diff"
+            i += 1
+            continue
+        if arg_lower in ("status", "ready", "check"):
+            mode = "status"
+            i += 1
+            continue
+        if arg_lower in ("blast", "test", "tests"):
+            mode = "blast"
+            i += 1
+            continue
+
+        # Ignored loose / filler words
+        if arg_lower in ("run", "show", "on", "for", "against"):
+            i += 1
+            continue
+
+        # Any other positional argument is treated as a target file or git arg
+        target_args.append(arg)
+        i += 1
+
+    return (mode or "auto", target_args, json_mode, ws_override, timeout_per_file, unknown_flag)
+
 
 def main() -> int:
     """CLI entrypoint. Always exits 0."""
     try:
-        args = sys.argv[1:]
+        raw_args = sys.argv[1:]
+        mode, target_args, json_mode, ws_override, timeout_per_file, unknown_flag = parse_cli_args(raw_args)
 
-        # Handle help
-        if any(a in ("-h", "--help", "help") for a in args):
+        if mode == "help":
             print_usage_guide()
             return 0
 
-        json_mode = "--json" in args
-        clean_args = [a for a in args if a != "--json"]
-
-        # Extract optional --workspace / -w
-        ws_override = None
-        filtered_args = []
-        i = 0
-        while i < len(clean_args):
-            if clean_args[i] in ("--workspace", "-w") and i + 1 < len(clean_args):
-                ws_override = clean_args[i + 1]
-                i += 2
-            else:
-                filtered_args.append(clean_args[i])
-                i += 1
-
-        # Parse mode flags
-        mode = "blast"
-        if "--diff" in filtered_args:
-            mode = "diff"
-            remaining = [a for a in filtered_args if a != "--diff"]
-        elif "--status" in filtered_args:
-            mode = "status"
-            remaining = [a for a in filtered_args if a != "--status"]
-        elif "--blast" in filtered_args:
-            mode = "blast"
-            remaining = [a for a in filtered_args if a != "--blast"]
-        else:
-            mode = "blast"
-            remaining = filtered_args
-
-        # Check for unknown flags (starting with -)
-        unknown_flags = [a for a in remaining if a.startswith("-")]
-        if unknown_flags:
-            print_usage_guide(unknown_flags[0])
+        if unknown_flag:
+            print_usage_guide(unknown_flag)
             return 0
 
-        target_args = remaining
         ws = get_workspace_dir(ws_override)
 
+        # Smart default resolution for "auto"
+        if mode == "auto":
+            if target_args:
+                mode = "blast"
+            else:
+                modified_files, _, _ = get_git_status_and_files(ws)
+                if modified_files:
+                    mode = "blast"
+                else:
+                    mode = "status"
+
         if mode == "blast":
-            res = execute_blast(ws, target_args)
+            res = execute_blast(ws, target_args, timeout_per_file=timeout_per_file)
         elif mode == "diff":
             res = execute_diff(ws, target_args)
         elif mode == "status":

@@ -1,75 +1,69 @@
 ---
 name: fast-grep
-description: Fast codebase regex and keyword search across /workspace with probability ranking, string/buffer verb boosting, call-site highlighting, target-centered sliding window, and clean code blocks for edit_file.
+description: Fast codebase regex and keyword search across /workspace with probability ranking, definition prioritization, AST function flashing, sliding context window, and clean code blocks for edit_file.
 ---
 
 # fast-grep Skill
 
-Fast, omnivorous codebase search tool for locating strings, regex patterns, function calls, and error messages across `/workspace`.
+Fast, omnivorous codebase search engine for locating symbols, regex patterns, function calls, and error messages across `/workspace`.
 
 ## Features
-- **Relevance & Probability Ranking**: Automatically scores matches so core package definitions and implementations appear at the top, and markdown/docs/changelogs are demoted.
-- **Definition-First Priority Ranking**: Definitions of functions, methods, and classes (`def`, `async def`, `class`, and decorators `@`) receive top-tier priority score bumps (+120 to +195 score bump), ensuring root definition targets rank prominently at the very top of search results rather than being drowned out by call sites or comments (preventing wrong-function/wrong-file edits like in `rich_4076`).
-- **Exact & Substring Symbol Bonuses**: Matches in definition signatures receive dedicated bonuses (+75 for exact function/class name match, +50 for substring match), guaranteeing direct targets rank #1.
-- **Definition & Call-Site Highlighting**: Highlights definition targets with `>>> ... <-- [DEFINITION TARGET]` and `[🎯 DEFINITION TARGET]` headers, and call-sites with `>>> ... <-- [CALL-SITE]` and `[⚡ STRING/BUFFER CALL-SITE]` headers. Top match previews display `[DEF]` tags for instant identification.
-- **First-Class Tutorial Code (`docs_src/*.py`)**: Executable tutorial code in `docs_src/*.py` (e.g. FastAPI tutorials) is explicitly exempt from the `-40` documentation demotion penalty, ensuring tutorial definitions and call-sites are treated as first-class Python source files.
-- **Auto-Tokenized Multi-Word Queries**: Automatically splits multi-word phrases (e.g. `"preserve newlines"`) into individual tokens for high-recall union/OR search rather than failing with 0 matches on a rigid literal string. Tokens trigger terse keyword expansions automatically.
-- **String & Buffer Verb Boosting**: Automatically detects and boosts scores for core Python string and buffer transformation verbs (`splitlines`, `split`, `rstrip`, `strip`, `lstrip`, `replace`, `join`, `partition`, `decode`, `encode`, `from_ansi`).
-- **Call-Site & Enclosing Scope Highlighting**: Identifies active call-sites transforming text/buffer variables and marks them with `>>> ... <-- [CALL-SITE]` and `[⚡ STRING/BUFFER CALL-SITE & TRANSFORM SCOPE]` headers.
-- **Terse Issue Search Heuristics**: Automatically expands terse problem keywords (e.g., `newlines`, `newline`, `whitespace`, `indent`) to candidate string transformation operations to avoid flooding results with docstrings/comments.
-- **Top 2 AST Function Flashing**: Automatically parses Python AST to extract and flash the **top 2 enclosing functions** (with exact line numbers) directly in the tool output.
-- **Target-Centered Sliding Window**: Centers a context window directly around the target matching line ($[\text{match\_line} - 15, \text{match\_line} + 25]$) so buggy logic in the middle of long functions is never hidden.
-- **Clean Code Block for `edit_file`**: Provides an unadorned `[CLEAN CODE FOR edit_file (EXACT INDENTATION)]` code block for the primary match with exact Python indentation, eliminating line-number prefix copy errors.
-- **Concise Match Index**: Displays a clean summary of all other ranked matches for quick reference.
-- **Context-Safe**: Restricts scope flashing to 2 functions to conserve context tokens.
+- **Relevance & Definition-First Ranking**: Scores matches so function and class definitions (`def`, `async def`, `class`, `@decorator`) appear at the top (+120 to +195 score bump) rather than being drowned out by call sites or comments.
+- **Symbol Bonuses**: Exact symbol name matches receive +75 bonus and substring matches receive +50 bonus.
+- **Forgiving & Omnivorous CLI**: Accepts positional arguments `python3 grep.py pattern [path]`, flags `-p`/`--pattern`, `-d`/`--dir`, `-i`/`--ignore-case`, `-w`/`--window`, `-m`/`--max-matches`, and `--json`.
+- **Regex-to-Literal Fallback**: When an invalid regex is provided (e.g. unescaped parentheses `def foo(`, unbalanced brackets, or bad escapes), falls back to literal substring search without crashing.
+- **Crash & Infinite Loop Immunity**: Limits file scanning to 500KB and 5000 lines per file, detects and skips binary files via null-byte inspection, guards against symlink cycles, and caps total matches to prevent context flooding.
+- **Actionable Zero-Match Diagnostics**: When 0 matches are found:
+  - Detects if case mismatch occurred and suggests case-insensitive search (`-i`).
+  - Detects if path filter was too narrow and reveals occurrences in other repository files.
+  - Generates fuzzy symbol candidate suggestions from AST identifiers.
+  - Breaks compound queries into tokenized sub-terms.
+  - Outputs concrete copy-pasteable commands for the next turn.
+- **Top 2 AST Scope Flashing**: Extracts and displays top 2 enclosing functions or classes with complete decorators and line numbers.
+- **Target-Centered Sliding Window**: Centers context window around target line (default 15 lines before to 25 lines after, configurable via `-w`).
+- **Clean Code Block for `edit_file`**: Provides unadorned code block with exact Python indentation for the top match.
 - **Never crashes**: Always exits cleanly with code 0.
-
-## Searching Terse Issues (String/Buffer Verbs)
-
-When encountering terse issue descriptions like *"preserve newlines"*, *"strip trailing space"*, or *"corrupted multibyte decoding"*, `fast-grep` auto-tokenizes multi-word queries and activates heuristic expansions. You can also search string transformation operations directly:
-- **Line/Splitting operations**: `splitlines`, `split`, `partition`
-- **Whitespace/Trimming operations**: `rstrip`, `strip`, `lstrip`
-- **Replacement/Joining operations**: `replace`, `join`
-- **Encoding/Decoding operations**: `decode`, `encode`, `from_ansi`
-
-`fast-grep` will rank transformation call-sites on buffer variables (`terminal_text.splitlines()`, `text.rstrip()`) at the very top and highlight the exact execution lines.
 
 ## How to Run
 
 ### Via ADK `run_skill_script`
 ```python
-# Multi-word phrase (auto-tokenized into union search terms):
+# Search symbol across repository:
 run_skill_script(
     skill_name="fast-grep",
     file_path="grep.py",
-    args=["--query", "preserve newlines"]
+    args=["APIRouter"]
 )
 
-# Single or multi-term searches (searched across codebase as union/OR):
+# Search within specific directory:
 run_skill_script(
     skill_name="fast-grep",
     file_path="grep.py",
-    args=["splitlines", "rstrip", "strip"]
+    args=["splitlines", "rich/"]
 )
-```
 
-### Searching a specific subfolder
-```python
+# Case-insensitive search:
 run_skill_script(
     skill_name="fast-grep",
     file_path="grep.py",
-    args=["--query", "preserve newlines", "rich"]
+    args=["-i", "apirouter"]
 )
 ```
 
 ### Via CLI
 ```bash
-# Multi-word query (auto-tokenized):
-python3 grep.py --query "preserve newlines" .
+# Positional query:
+python3 grep.py "APIRouter" .
 
-# Positional multi-word query:
-python3 grep.py "preserve newlines" .
+# Positional pattern with target path:
+python3 grep.py "splitlines" rich/
+
+# Case-insensitive search:
+python3 grep.py -i "apirouter"
+
+# Raw snippet search (auto literal fallback):
+python3 grep.py "def format("
 
 # Structured JSON output:
-python3 grep.py --json --query "preserve newlines" .
+python3 grep.py --json "APIRouter"
 ```

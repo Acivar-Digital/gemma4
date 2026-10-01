@@ -40,6 +40,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -156,7 +157,7 @@ class ReproCheckInput(BaseModel):
 
     code: str = Field(..., description="Reproduction script code")
     args: List[str] = Field(default_factory=list, description="Original CLI arguments")
-    timeout_secs: int = Field(default=35, description="Timeout in seconds")
+    timeout_secs: int = Field(default=15, description="Timeout in seconds")
     workspace_dir: Optional[str] = Field(default=None, description="Path to active workspace")
 
 
@@ -636,6 +637,20 @@ def generate_root_cause_hint(
             return (
                 f"ANSI escape sequences differ{idx_str}. "
                 "Check the exact style tags, color parameter numbers, or reset codes in the formatting pipeline."
+            )
+
+        # Check line ending / CRLF vs LF differences
+        if ("\r" in actual and "\r" not in expected) or ("\r" in expected and "\r" not in actual):
+            return (
+                "Line ending mismatch detected (CRLF '\\r\\n' vs LF '\\n' or carriage return '\\r'). "
+                "Normalize line endings using .replace('\\r\\n', '\\n') or str.splitlines()."
+            )
+
+        # Check tab vs space indentation
+        if ("\t" in actual or "\t" in expected) and actual.expandtabs() == expected.expandtabs():
+            return (
+                "Tab vs space indentation mismatch detected. "
+                "Verify tab expansion or replace tabs with spaces using .expandtabs() or 4 spaces."
             )
 
         # Check trailing whitespace or newline differences
@@ -1359,43 +1374,49 @@ def sanitize_assertion_code(raw: str) -> str:
     code = raw.strip()
 
     # Step 1: Strip markdown code blocks and outer redundant quotes iteratively
-    for _ in range(5):
+    for _ in range(10):
+        prev = code
         code = code.strip()
 
         # Check markdown fences: ```python ... ``` or ```py ... ``` or ``` ... ```
-        fence_match = re.match(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```$", code, re.DOTALL)
+        fence_match = re.match(r"^```[a-zA-Z0-9_\-\+]*\s*\n?(.*?)\n?```$", code, re.DOTALL)
         if fence_match:
             code = fence_match.group(1).strip()
             continue
 
         # Check escaped outer quotes: \"...\" or \'...\'
         if len(code) >= 4:
-            if code.startswith('\\"') and code.endswith('\\"'):
-                code = code[2:-2].strip()
-                continue
-            if code.startswith("\\'") and code.endswith("\\'"):
+            if (code.startswith('\\"') and code.endswith('\\"')) or (code.startswith("\\'") and code.endswith("\\'")):
                 code = code[2:-2].strip()
                 continue
 
         # Check triple quotes: """...""" or '''...'''
         if len(code) >= 6:
-            if code.startswith('"""') and code.endswith('"""'):
-                code = code[3:-3].strip()
-                continue
-            if code.startswith("'''") and code.endswith("'''"):
+            if (code.startswith('"""') and code.endswith('"""')) or (code.startswith("'''") and code.endswith("'''")):
                 code = code[3:-3].strip()
                 continue
 
         # Check single outer quotes: "..." or '...'
         if len(code) >= 2:
-            if code.startswith('"') and code.endswith('"'):
-                code = code[1:-1].strip()
-                continue
-            if code.startswith("'") and code.endswith("'"):
-                code = code[1:-1].strip()
-                continue
+            for q in ('"', "'"):
+                if code.startswith(q) and code.endswith(q):
+                    candidate = code[1:-1].strip()
+                    should_strip = False
+                    try:
+                        tree = ast.parse(code)
+                        # If parsed as a single string literal constant, outer quotes are a redundant wrapper
+                        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant):
+                            if isinstance(tree.body[0].value.value, str):
+                                should_strip = True
+                    except SyntaxError:
+                        should_strip = True
 
-        break
+                    if should_strip:
+                        code = candidate
+                        break
+
+        if code == prev:
+            break
 
     # Step 2: Normalize escaped quotes if passed literally due to double-escaping in JSON
     if '\\"' in code or "\\'" in code:
@@ -2012,7 +2033,7 @@ def run_harness(
 def execute_script(
     code: str,
     ws: pathlib.Path,
-    timeout_secs: int = 35,
+    timeout_secs: int = 15,
     expect_exception: Optional[str] = None,
 ) -> Tuple[int, str, str, DiagnosticReport]:
     """Execute transformed reproduction code inside an isolated /tmp process."""
@@ -2064,19 +2085,22 @@ def execute_script(
                 env["TEMP"] = "/tmp"
                 env["TMP"] = "/tmp"
 
+            proc = None
             try:
-                res = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
                     cwd=temp_dir_path,
                     env=env,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     text=True,
                     encoding="utf-8",
-                    timeout=timeout_secs,
+                    start_new_session=True,  # Distinct process group (setsid)
                 )
-                exit_code = res.returncode
-                stdout_out = res.stdout.strip()
-                stderr_out = res.stderr.strip()
+                stdout_out, stderr_out = proc.communicate(timeout=timeout_secs)
+                exit_code = proc.returncode
+                stdout_out = stdout_out.strip() if stdout_out else ""
+                stderr_out = stderr_out.strip() if stderr_out else ""
 
                 if report_file.exists():
                     try:
@@ -2109,13 +2133,28 @@ def execute_script(
                 return exit_code, stdout_out, stderr_out, fallback_report
 
             except subprocess.TimeoutExpired:
+                # Terminate entire process group cleanly via SIGKILL
+                if proc is not None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    try:
+                        proc.communicate(timeout=2)
+                    except Exception:
+                        pass
+
+                timeout_summary = f"⏱️ Execution timed out after {timeout_secs}s (possible infinite loop in repro script)"
                 timeout_report = DiagnosticReport(
                     status="timeout",
                     exit_code=124,
-                    summary=f"Execution timed out after {timeout_secs} seconds.",
+                    summary=timeout_summary,
                     raw_stderr=f"Timeout expired ({timeout_secs}s)",
                 )
-                return 124, "", f"Execution timed out after {timeout_secs} seconds.", timeout_report
+                return 124, "", timeout_summary, timeout_report
             except Exception as e:
                 err_report = DiagnosticReport(
                     status="error",
@@ -2340,6 +2379,10 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
                 lines.append(f"    {l}")
         return "\n".join(lines)
 
+    if report.status == "timeout":
+        lines.append(f"[repro-check] {report.summary}")
+        return "\n".join(lines)
+
     lines.append(f"[repro-check] ❌ EXECUTION FAILED (Exit code {report.exit_code}):")
     lines.append(f"  {report.summary}")
     if report.raw_stderr:
@@ -2358,15 +2401,18 @@ def print_help() -> None:
 
 Usage:
   python3 check.py [options] [<code>]
+  python3 check.py --code "assert 1 == 1" [options]
   python3 check.py --b64 <base64_code> [options]
   python3 check.py --file <script.py> [options]
   cat <script.py> | python3 check.py [options]
   run_skill_script('repro-check', 'check.py', args=['[options]', '<code>'])
 
 Options:
+  --code, -c <CODE>             Python code snippet to execute (alternative to positional argument).
   --expect-exception, -e <EXC>  Expect a specific exception type (e.g. ValueError, KeyError, AssertionError).
                                 If baseline code fails to raise it, defect_confirmed=True.
                                 When the fix causes the exception to be raised, status=PASSED.
+  --timeout, -t <SECS>          Execution timeout in seconds (default: 15s). Terminated cleanly via os.killpg.
   --b64, --base64 <B64>         Execute base64-encoded Python assertion code (avoids shell/JSON quote escaping).
   --file, -f <FILE>             Execute raw Python script from the specified file path.
   --stdin, -                    Execute raw Python script read from standard input.
@@ -2375,6 +2421,7 @@ Options:
 Positional Arguments:
   code                          Python reproduction code snippet to execute.
                                 If a single argument is an existing file, it is executed as a script.
+                                Multiple positional tokens are joined automatically with spaces.
 
 Guarantees:
   - Omnivorous: auto-asserts comparisons, auto-invokes uncalled test functions, strips fences and redundant outer quotes.
@@ -2421,6 +2468,8 @@ def main() -> int:
         # Parse general arguments
         expect_exception: Optional[str] = None
         file_path: Optional[pathlib.Path] = None
+        code_arg: Optional[str] = None
+        timeout_secs: int = 15
         use_stdin = False
         use_b64 = False
         b64_arg: Optional[str] = None
@@ -2434,6 +2483,24 @@ def main() -> int:
                 i += 2
             elif arg.startswith(("--expect-exception=", "-e=")):
                 expect_exception = arg.split("=", 1)[1]
+                i += 1
+            elif arg in ("--timeout", "-t") and i + 1 < len(raw_args):
+                try:
+                    timeout_secs = int(raw_args[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif arg.startswith(("--timeout=", "-t=")):
+                try:
+                    timeout_secs = int(arg.split("=", 1)[1])
+                except ValueError:
+                    pass
+                i += 1
+            elif arg in ("--code", "-c") and i + 1 < len(raw_args):
+                code_arg = raw_args[i + 1]
+                i += 2
+            elif arg.startswith(("--code=", "-c=")):
+                code_arg = arg.split("=", 1)[1]
                 i += 1
             elif arg in ("--file", "-f") and i + 1 < len(raw_args):
                 file_path = pathlib.Path(raw_args[i + 1])
@@ -2461,7 +2528,9 @@ def main() -> int:
 
         # Determine code source
         code = ""
-        if use_b64:
+        if code_arg is not None:
+            code = code_arg
+        elif use_b64:
             if not b64_arg and code_tokens:
                 b64_arg = " ".join(code_tokens).strip()
                 code_tokens = []
@@ -2532,8 +2601,11 @@ def main() -> int:
                 print(f"[repro-check] ✅ PASSED: {report.summary}")
                 return 0
 
-            caret_line = f"{' ' * (exc.offset - 1 if exc.offset else 0)}^"
             err_line = exc.text.strip() if exc.text else ""
+            if not err_line and exc.lineno and 1 <= exc.lineno <= len(code.splitlines()):
+                err_line = code.splitlines()[exc.lineno - 1].strip()
+            offset = exc.offset or 1
+            caret_line = f"{' ' * max(0, offset - 1)}^"
             summary = f"SYNTAX_ERROR: {exc.msg} at line {exc.lineno}"
             raw_err = f"  File \"<assertion>\", line {exc.lineno}\n    {err_line}\n    {caret_line}\nSyntaxError: {exc.msg}"
             report = DiagnosticReport(
@@ -2585,7 +2657,7 @@ def main() -> int:
             return 1
 
         exit_code, stdout, stderr, report = execute_script(
-            transformed_code, ws, expect_exception=expect_exception
+            transformed_code, ws, timeout_secs=timeout_secs, expect_exception=expect_exception
         )
 
         # Handle probe count updates
@@ -2623,6 +2695,11 @@ def main() -> int:
             success = False
         elif report.status == "syntax_error":
             category = "syntax_error"
+            defect_confirmed = False
+            success = False
+        elif report.status == "timeout":
+            reset_probe_count()
+            category = "timeout"
             defect_confirmed = False
             success = False
         else:

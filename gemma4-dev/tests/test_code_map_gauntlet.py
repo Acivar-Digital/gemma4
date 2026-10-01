@@ -4,12 +4,14 @@
 Verifies:
 1. Syntax & file identity between map.py and scripts/map.py.
 2. Positional argument auto-detection (symbol, file with .py, file without .py, directory).
-3. Omnivorous empty / dot / /workspace overview mode (exit 0, tailored commands).
-4. Informative diagnostics for missing symbol (fuzzy suggestions, top-level symbols, next steps, exit 0).
-5. Informative diagnostics for missing file (closest path suggestions, repo layout, exit 0).
+3. Omnivorous empty / dot / /workspace / -o / --overview mode (exit 0, tailored commands).
+4. Informative diagnostics for missing symbol (fuzzy suggestions with locations & copy-pasteable commands, top-level symbols, next steps, exit 0).
+5. Informative diagnostics for missing file (closest path suggestions with copy-pasteable commands, repo layout, exit 0).
 6. Class hierarchy and subclass detection.
 7. Loop and cycle safety (circular imports, circular caller/callee, symlink cycle, deep nesting).
-8. Pydantic JSON schema compliance.
+8. Directory mapping with line budget limit.
+9. Forgiving CLI flag parsing (-s, -f, -d, --dir, -o, --overview, -t, --tree, --callers, --callees, typos, unrecognized flags).
+10. Safe error handling (SyntaxError with caret snippet, invalid UTF-8 binary encoding).
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ def run_map(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None
 
 
 def test_syntax_and_sync():
-    print("[1/8] Testing syntax validation and file sync...")
+    print("[1/10] Testing syntax validation and file sync...")
     assert MAP_PATH.exists(), f"Missing {MAP_PATH}"
     assert SCRIPTS_MAP_PATH.exists(), f"Missing {SCRIPTS_MAP_PATH}"
 
@@ -60,8 +62,8 @@ def test_syntax_and_sync():
 
 
 def test_empty_and_overview():
-    print("[2/8] Testing empty call, '.', and workspace overview...")
-    for args in [(), (".",), ("/workspace",)]:
+    print("[2/10] Testing empty call, '.', and workspace overview...")
+    for args in [(), (".",), ("/workspace",), ("-o",), ("--overview",)]:
         res = run_map(*args)
         assert res.returncode == 0, f"Call with args={args} failed with returncode {res.returncode}: {res.stderr}"
         assert "CODE-MAP: WORKSPACE OVERVIEW & ACTIONABLE USAGE GUIDE" in res.stdout, f"Header missing in {args}"
@@ -80,7 +82,7 @@ def test_empty_and_overview():
 
 
 def test_positional_auto_detection():
-    print("[3/8] Testing forgiving positional argument auto-detection...")
+    print("[3/10] Testing forgiving positional argument auto-detection...")
     # Positional symbol
     res_sym = run_map("APIRouter")
     assert res_sym.returncode == 0
@@ -94,7 +96,7 @@ def test_positional_auto_detection():
 
     # Positional directory
     res_dir = run_map("docker")
-    assert res_file.returncode == 0
+    assert res_dir.returncode == 0
     assert "docker/telnetlib.py:" in res_dir.stdout or "symbols across" in res_dir.stdout
 
     # Positional file without .py
@@ -106,10 +108,11 @@ def test_positional_auto_detection():
 
 
 def test_unknown_symbol_diagnostics():
-    print("[4/8] Testing unknown symbol actionable diagnostics...")
+    print("[4/10] Testing unknown symbol actionable diagnostics...")
     res = run_map("--symbol", "NonExistentFoobarFunctionXYZ")
     assert res.returncode == 0
     assert "STATUS: NOT FOUND" in res.stdout
+    assert "WHY THIS QUERY FAILED:" in res.stdout
     assert "SUGGESTIONS:" in res.stdout
     assert "TOP-LEVEL PUBLIC SYMBOLS IN REPOSITORY:" in res.stdout
     assert "ACTIONABLE NEXT STEPS:" in res.stdout
@@ -126,10 +129,11 @@ def test_unknown_symbol_diagnostics():
 
 
 def test_unknown_file_diagnostics():
-    print("[5/8] Testing unknown file actionable diagnostics...")
+    print("[5/10] Testing unknown file actionable diagnostics...")
     res = run_map("--file", "nonexistent_module_foo_bar.py")
     assert res.returncode == 0
     assert "Path 'nonexistent_module_foo_bar.py' does not exist in /workspace." in res.stdout
+    assert "WHY THIS FAILED:" in res.stdout
     assert "💡 Suggested closest existing paths:" in res.stdout
     assert "📂 Top-level repository layout (/workspace):" in res.stdout
     assert "👉 Actionable next steps:" in res.stdout
@@ -146,7 +150,7 @@ def test_unknown_file_diagnostics():
 
 
 def test_class_hierarchy_and_subclasses():
-    print("[6/8] Testing class hierarchy and subclass tracking...")
+    print("[6/10] Testing class hierarchy and subclass tracking...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmppath = pathlib.Path(tmpdir)
         mod_code = """
@@ -177,7 +181,7 @@ class CustomService(BaseService):
 
 
 def test_loops_cycles_and_nesting():
-    print("[7/8] Testing circular imports, recursion, symlink cycles, and deep AST nesting...")
+    print("[7/10] Testing circular imports, recursion, symlink cycles, and deep AST nesting...")
     with tempfile.TemporaryDirectory() as tmpdir:
         tmppath = pathlib.Path(tmpdir)
 
@@ -214,10 +218,9 @@ def func_b():
         sub_dir.mkdir()
         (sub_dir / "leaf.py").write_text("def sub_leaf(): pass", encoding="utf-8")
         try:
-            # Create symlink pointing back to parent
             (sub_dir / "loop_link").symlink_to(tmppath, target_is_directory=True)
         except OSError:
-            pass  # Some filesystems or OS security policies forbid dir symlinks
+            pass
 
         # 4. .adk_exec directory that should be ignored
         adk_dir = tmppath / ".adk_exec_scratch"
@@ -244,12 +247,108 @@ def func_b():
 
 
 def test_directory_mapping():
-    print("[8/8] Testing directory mapping with line budget...")
+    print("[8/10] Testing directory mapping with line budget...")
     res = run_map("--file", "docker")
     assert res.returncode == 0
     assert "docker/telnetlib.py:" in res.stdout
     assert "symbols across" in res.stdout
     print("  ✓ Directory mapping handles multi-module budgets smoothly.")
+
+
+def test_flag_aliases_and_forgiving_cli():
+    print("[9/10] Testing flag aliases (-s, -f, -d, --dir, -t, --tree, --callers, --callees) and forgiving parser...")
+    # -s alias for symbol
+    res_s = run_map("-s", "APIRouter")
+    assert res_s.returncode == 0
+    assert "QUERY: APIRouter" in res_s.stdout
+
+    # -f alias for file
+    res_f = run_map("-f", "docker/telnetlib.py")
+    assert res_f.returncode == 0
+    assert "docker/telnetlib.py:" in res_f.stdout
+
+    # -d alias for directory
+    res_d = run_map("-d", "docker")
+    assert res_d.returncode == 0
+    assert "docker/telnetlib.py:" in res_d.stdout or "symbols across" in res_d.stdout
+
+    # --dir alias for directory
+    res_dir = run_map("--dir", "docker")
+    assert res_dir.returncode == 0
+    assert "docker/telnetlib.py:" in res_dir.stdout or "symbols across" in res_dir.stdout
+
+    # -t / --tree alias
+    res_tree = run_map("-t", "docker")
+    assert res_tree.returncode == 0
+    assert "docker/telnetlib.py:" in res_tree.stdout or "symbols across" in res_tree.stdout
+
+    # --callers with symbol value
+    res_callers = run_map("--callers", "APIRouter")
+    assert res_callers.returncode == 0
+    assert "FOCUS: CALLERS" in res_callers.stdout
+    assert "TARGET INBOUND CALLERS" in res_callers.stdout
+
+    # --callees with symbol value
+    res_callees = run_map("--callees", "APIRouter")
+    assert res_callees.returncode == 0
+    assert "FOCUS: CALLEES" in res_callees.stdout
+    assert "TARGET OUTBOUND CALLEES" in res_callees.stdout
+
+    # Symbol with trailing --callers flag
+    res_sym_callers = run_map("APIRouter", "--callers")
+    assert res_sym_callers.returncode == 0
+    assert "FOCUS: CALLERS" in res_sym_callers.stdout
+
+    # Typo tolerance: --symbl fuzzy matches --symbol
+    res_typo = run_map("--symbl", "APIRouter")
+    assert res_typo.returncode == 0
+    assert "QUERY: APIRouter" in res_typo.stdout
+
+    # Unrecognized options: never fail with exit code 2 or ArgumentError
+    res_unknown = run_map("--bogus-unrecognized-flag", "APIRouter")
+    assert res_unknown.returncode == 0
+    assert "QUERY: APIRouter" in res_unknown.stdout
+    assert "Unrecognized option '--bogus-unrecognized-flag' ignored." in res_unknown.stdout
+
+    # Solitary unknown flag falls back to overview cleanly
+    res_solo_unknown = run_map("--unrecognized-option-only")
+    assert res_solo_unknown.returncode == 0
+    assert "CODE-MAP: WORKSPACE OVERVIEW" in res_solo_unknown.stdout
+
+    # Flags passed without values handle gracefully without ArgumentError
+    res_no_val = run_map("--symbol")
+    assert res_no_val.returncode == 0
+    assert "CODE-MAP: WORKSPACE OVERVIEW" in res_no_val.stdout
+
+    res_no_val_file = run_map("--file")
+    assert res_no_val_file.returncode == 0
+    assert "CODE-MAP: WORKSPACE OVERVIEW" in res_no_val_file.stdout
+
+    print("  ✓ Forgiving CLI: all aliases, typo recovery, caller/callee filters, and missing values handled with exit 0.")
+
+
+def test_safe_error_handling():
+    print("[10/10] Testing safe error handling (SyntaxError snippets, invalid UTF-8 binary)...")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = pathlib.Path(tmpdir)
+
+        # 1. Invalid Python syntax with caret pointer
+        bad_syntax_code = "def broken_func(:\n    pass\n"
+        (tmppath / "broken.py").write_text(bad_syntax_code, encoding="utf-8")
+
+        res_syntax = run_map("--file", "broken.py", cwd=tmppath)
+        assert res_syntax.returncode == 0
+        assert "SyntaxError in broken.py" in res_syntax.stdout
+        assert "^" in res_syntax.stdout
+        assert "Guidance:" in res_syntax.stdout
+
+        # 2. Binary / invalid UTF-8 file
+        (tmppath / "binary.py").write_bytes(b"\x80\x81\xff\xfe\x00\x01\x02")
+        res_binary = run_map("--file", "binary.py", cwd=tmppath)
+        assert res_binary.returncode == 0
+        assert "binary.py" in res_binary.stdout
+
+    print("  ✓ Safe error handling: SyntaxError snippet & binary errors return clean notices without tracebacks.")
 
 
 def main():
@@ -265,9 +364,11 @@ def main():
     test_class_hierarchy_and_subclasses()
     test_loops_cycles_and_nesting()
     test_directory_mapping()
+    test_flag_aliases_and_forgiving_cli()
+    test_safe_error_handling()
 
     print("=" * 70)
-    print("ALL 8 GAUNTLET TESTS PASSED CLEANLY (EXIT CODE 0)!")
+    print("ALL 10 GAUNTLET TESTS PASSED CLEANLY (EXIT CODE 0)!")
     print("=" * 70)
 
 

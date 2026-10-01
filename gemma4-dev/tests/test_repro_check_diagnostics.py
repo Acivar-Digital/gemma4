@@ -24,7 +24,7 @@ CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "check.py"
 SCRIPTS_CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "scripts" / "check.py"
 
 
-def run_check(*args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+def run_check(*args: str, env: dict | None = None, stdin_data: str | None = None) -> subprocess.CompletedProcess:
     """Run check.py with given arguments and return CompletedProcess."""
     cmd = [sys.executable, str(CHECK_PY)] + list(args)
     environ = os.environ.copy()
@@ -37,12 +37,13 @@ def run_check(*args: str, env: dict | None = None) -> subprocess.CompletedProces
         capture_output=True,
         text=True,
         env=environ,
+        input=stdin_data,
         timeout=30,
     )
 
 
 def test_syntax_and_byte_identity() -> None:
-    print("[1/7] Testing syntax validation and byte-for-byte identity...")
+    print("[1/10] Testing syntax validation and byte-for-byte identity...")
     assert CHECK_PY.exists(), f"Missing {CHECK_PY}"
     assert SCRIPTS_CHECK_PY.exists(), f"Missing {SCRIPTS_CHECK_PY}"
 
@@ -63,7 +64,7 @@ def test_syntax_and_byte_identity() -> None:
 
 
 def test_string_assertion_with_ansi_escapes() -> None:
-    print("[2/7] Testing string assertion failure with ANSI escapes...")
+    print("[2/10] Testing string assertion failure with ANSI escapes...")
     code = "assert '\\x1b[31mError\\x1b[0m' == 'Error'"
     res = run_check(code)
     assert res.returncode == 1, f"Expected exit 1, got {res.returncode}. Output:\n{res.stdout}"
@@ -89,7 +90,7 @@ def test_string_assertion_with_ansi_escapes() -> None:
 
 
 def test_string_assertion_with_control_characters() -> None:
-    print("[3/7] Testing string assertion failure with control characters (CR vs LF)...")
+    print("[3/10] Testing string assertion failure with control characters (CR vs LF)...")
     code = "assert 'line1\\r\\nline2' == 'line1\\nline2'"
     res = run_check(code)
     assert res.returncode == 1, f"Expected exit 1, got {res.returncode}. Output:\n{res.stdout}"
@@ -105,7 +106,7 @@ def test_string_assertion_with_control_characters() -> None:
 
 
 def test_dict_assertion_mismatch() -> None:
-    print("[4/7] Testing dict/JSON mismatch diagnostics...")
+    print("[4/10] Testing dict/JSON mismatch diagnostics...")
     code = """
 actual_dict = {'status': 'ok', 'extra_field': 42}
 expected_dict = {'status': 'error', 'missing_field': 'required'}
@@ -129,7 +130,7 @@ assert actual_dict == expected_dict
 
 
 def test_sequence_assertion_mismatch() -> None:
-    print("[5/7] Testing sequence/list mismatch diagnostics...")
+    print("[5/10] Testing sequence/list mismatch diagnostics...")
     code = "assert [1, 20, 3] == [1, 2, 3, 4]"
     res = run_check(code)
     assert res.returncode == 1, f"Expected exit 1, got {res.returncode}. Output:\n{res.stdout}"
@@ -148,7 +149,7 @@ def test_sequence_assertion_mismatch() -> None:
 
 
 def test_valid_assertion_passes() -> None:
-    print("[6/7] Testing clean valid assertion execution...")
+    print("[6/10] Testing clean valid assertion execution...")
     code = "assert 2 + 2 == 4\nassert 'hello'.upper() == 'HELLO'"
     res = run_check(code)
     assert res.returncode == 0, f"Expected exit 0, got {res.returncode}. Stderr:\n{res.stderr}\nStdout:\n{res.stdout}"
@@ -157,7 +158,7 @@ def test_valid_assertion_passes() -> None:
 
 
 def test_hardened_features_regression() -> None:
-    print("[7/7] Testing regression on hardened features (--b64, quote stripping, syntax errors, /tmp isolation)...")
+    print("[7/10] Testing regression on hardened features (--b64, quote stripping, syntax errors, /tmp isolation)...")
 
     # 1. Base64 execution
     raw_snippet = "assert 7 * 6 == 42"
@@ -183,6 +184,96 @@ def test_hardened_features_regression() -> None:
     print("  ✓ Hardened features regression tests passed.")
 
 
+def test_infinite_loop_timeout() -> None:
+    print("[8/10] Testing infinite loop immunity and timeout termination (os.killpg)...")
+    import time
+    t0 = time.time()
+    res = run_check("-t", "2", "while True: pass")
+    duration = time.time() - t0
+    assert res.returncode == 1, f"Expected exit 1 on timeout, got {res.returncode}. Output:\n{res.stdout}\nStderr:\n{res.stderr}"
+    assert duration < 6, f"Timeout took too long ({duration:.2f}s), should terminate in ~2s!"
+    out = res.stdout
+    assert "⏱️ Execution timed out after 2s (possible infinite loop in repro script)" in out, f"Timeout message missing in:\n{out}"
+    print("  ✓ Infinite loop terminated cleanly via os.killpg after 2s.")
+
+
+def test_omnivorous_forgiving_cli_and_fences() -> None:
+    print("[9/10] Testing omnivorous CLI, markdown fences, quotes, and input styles...")
+
+    # 1. Markdown code fence with language tag
+    res_fence1 = run_check("```python\nassert 10 + 10 == 20\n```")
+    assert res_fence1.returncode == 0, f"Markdown fence failed: {res_fence1.stdout}\n{res_fence1.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_fence1.stdout
+
+    # 2. Markdown code fence without language tag
+    res_fence2 = run_check("```\nassert 15 + 15 == 30\n```")
+    assert res_fence2.returncode == 0, f"Generic fence failed: {res_fence2.stdout}\n{res_fence2.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_fence2.stdout
+
+    # 3. Triple double quotes wrapping code
+    res_triple = run_check('"""assert 25 + 25 == 50"""')
+    assert res_triple.returncode == 0, f"Triple quotes failed: {res_triple.stdout}\n{res_triple.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_triple.stdout
+
+    # 4. Triple single quotes wrapping code
+    res_triple_s = run_check("'''assert 35 + 35 == 70'''")
+    assert res_triple_s.returncode == 0, f"Triple single quotes failed: {res_triple_s.stdout}\n{res_triple_s.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_triple_s.stdout
+
+    # 5. Escaped quotes wrapping code
+    res_esc = run_check('\\"assert 45 + 45 == 90\\"')
+    assert res_esc.returncode == 0, f"Escaped quotes failed: {res_esc.stdout}\n{res_esc.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_esc.stdout
+
+    # 6. Multiple positional arguments joined cleanly
+    res_multi = run_check("assert", "1", "+", "2", "==", "3")
+    assert res_multi.returncode == 0, f"Multiple positional tokens failed: {res_multi.stdout}\n{res_multi.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_multi.stdout
+
+    # 7. Explicit --code / -c flag
+    res_code = run_check("--code", "assert 'apple'.upper() == 'APPLE'")
+    assert res_code.returncode == 0, f"--code flag failed: {res_code.stdout}\n{res_code.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_code.stdout
+
+    res_c = run_check("-c", "assert 'banana'.title() == 'Banana'")
+    assert res_c.returncode == 0, f"-c flag failed: {res_c.stdout}\n{res_c.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_c.stdout
+
+    # 8. File path directly as positional argument
+    temp_script = pathlib.Path("/tmp/test_repro_scratch.py")
+    temp_script.write_text("assert 100 // 10 == 10\n", encoding="utf-8")
+    try:
+        res_file_pos = run_check(str(temp_script))
+        assert res_file_pos.returncode == 0, f"File positional argument failed: {res_file_pos.stdout}\n{res_file_pos.stderr}"
+        assert "[repro-check] ✅ PASSED:" in res_file_pos.stdout
+
+        res_file_flag = run_check("--file", str(temp_script))
+        assert res_file_flag.returncode == 0, f"--file flag failed: {res_file_flag.stdout}\n{res_file_flag.stderr}"
+        assert "[repro-check] ✅ PASSED:" in res_file_flag.stdout
+    finally:
+        temp_script.unlink(missing_ok=True)
+
+    # 9. Stdin pipe
+    res_stdin = run_check(stdin_data="assert 'stdin'.upper() == 'STDIN'\n")
+    assert res_stdin.returncode == 0, f"Stdin pipe failed: {res_stdin.stdout}\n{res_stdin.stderr}"
+    assert "[repro-check] ✅ PASSED:" in res_stdin.stdout
+
+    print("  ✓ Omnivorous CLI, fences, quotes, flags, files, and stdin verified.")
+
+
+def test_ast_preparse_syntax_error_caret() -> None:
+    print("[10/10] Testing clean AST pre-parse error formatting and caret pointer...")
+    res = run_check("def broken_syntax(")
+    assert res.returncode == 1, f"Expected exit 1 on syntax error, got {res.returncode}"
+    out = res.stdout
+    assert "SYNTAX_ERROR" in out or "SyntaxError" in out, f"SYNTAX_ERROR missing in:\n{out}"
+    assert "^" in out, f"Caret pointer missing in:\n{out}"
+    assert "line 1" in out, f"Line number missing in:\n{out}"
+    assert "Traceback (most recent call last)" not in out, f"Raw traceback leaked in output:\n{out}"
+    assert "Traceback (most recent call last)" not in res.stderr, f"Raw traceback leaked in stderr:\n{res.stderr}"
+    print("  ✓ Clean syntax error with caret pointer and no traceback leak verified.")
+
+
 def main() -> int:
     print("======================================================================")
     print("REPRO-CHECK DEEP ASSERTION DIAGNOSTICS TEST SUITE")
@@ -195,8 +286,11 @@ def main() -> int:
         test_sequence_assertion_mismatch()
         test_valid_assertion_passes()
         test_hardened_features_regression()
+        test_infinite_loop_timeout()
+        test_omnivorous_forgiving_cli_and_fences()
+        test_ast_preparse_syntax_error_caret()
         print("======================================================================")
-        print("✅ ALL 7 TEST SUITES PASSED CLEANLY (exit code 0)")
+        print("✅ ALL 10 TEST SUITES PASSED CLEANLY (exit code 0)")
         print("======================================================================")
         return 0
     except AssertionError as exc:
