@@ -2,28 +2,28 @@
 """code-map: AST code structure and symbol call-graph tracer.
 
 Unified skill combining:
-1. Symbol call-graph and reference reachability tracer (--symbol <name>):
+1. Symbol call-graph and reference reachability tracer (--symbol <name>, -s, --callers, --callees):
    - Traces definitions, imports, calls, attribute accesses, callers, and callees across repo.
    - Detects class hierarchies: base classes and subclasses inheriting from the queried symbol.
    - Omnivorous: queries precomputed codebase graphs (NetworkX node-link JSON) when available,
      and falls back to / combines with live AST analysis.
    - Provides fuzzy matching suggestions and diagnostics when symbols are missing or private.
    - When a symbol is not found, displays available top-level symbols in the repo and copy-pasteable next steps.
-2. Compact AST file and directory skeleton generator (--file <path>):
+2. Compact AST file and directory skeleton generator (--file <path>, -f, -d, --dir, -t, --tree):
    - Extracts classes, base classes, functions, arguments, return type annotations, docstrings,
      and line ranges [start-end] for a target Python file or directory.
    - For directories, extracts skeletons across modules up to max_lines budget.
    - Diagnoses syntax errors with exact line, column, snippet, and caret pointer.
    - Output-capped to prevent context flooding in 32K token windows.
 3. Forgiving positional fallback:
-   - If argument is an existing directory or ends in .py, treated as --file.
-   - If argument matches an existing file with .py appended, treated as --file.
-   - If argument contains path separators (/ or \\), treated as --file.
-   - Otherwise, treated as --symbol.
-4. Omnivorous workspace overview on empty args or '.' / '/workspace':
+   - If argument is an existing directory or ends in .py, treated as file mode.
+   - If argument matches an existing file with .py appended, treated as file mode.
+   - If argument contains path separators (/ or \\), treated as file mode.
+   - Otherwise, treated as symbol mode.
+4. Omnivorous workspace overview on empty args, '.', '/workspace', or -o/--overview:
    - Explains the workspace structure, discovered packages, and key modules.
    - Provides tailored, copy-pasteable example invocations for the current repository.
-   - Never crashes or exits 1 on empty calls.
+   - Never crashes or exits 1 on empty calls or unrecognized flags.
 
 100% Pydantic v2 schemas for all structured outputs.
 """
@@ -41,6 +41,12 @@ import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 sys.dont_write_bytecode = True
+
+# Protect against deeply nested ASTs or deep recursions without stack overflow
+try:
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), 4000))
+except Exception:
+    pass
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -98,6 +104,12 @@ class SymbolSuggestion(BaseModel):
     kind: Optional[str] = Field(default=None, description="Inferred or known kind (function, class, method, node)")
     location: Optional[str] = Field(default=None, description="File path or defining location if known")
     reason: Optional[str] = Field(default=None, description="Why this candidate was suggested")
+    inspect_command: Optional[str] = Field(
+        default=None, description="Exact copy-pasteable command to inspect this candidate symbol"
+    )
+    file_command: Optional[str] = Field(
+        default=None, description="Exact copy-pasteable command to inspect containing file"
+    )
 
 
 class GraphStatus(BaseModel):
@@ -122,6 +134,7 @@ class CodeGraphResult(BaseModel):
     query: str = Field(description="Queried symbol or text pattern")
     found: bool = Field(description="Whether the symbol was identified in graph or AST")
     resolved_symbol: Optional[str] = Field(default=None, description="Resolved canonical or node identifier")
+    focus: Optional[str] = Field(default=None, description="Optional focus filter: 'callers' or 'callees'")
     explanation: str = Field(description="Deterministic explanation of search outcome")
     inspection_hint: Optional[str] = Field(default=None, description="Guidance for private/internal or imported symbols")
     graph_status: GraphStatus = Field(description="Graph loading diagnostics and fallback details")
@@ -152,7 +165,10 @@ class MapDiagnostic(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     level: str = Field(default="error", description="Severity level: 'error', 'warning', or 'info'")
-    category: str = Field(..., description="Category: 'missing_path', 'syntax_error', 'unparseable_file', 'empty_target'")
+    category: str = Field(
+        ...,
+        description="Category: 'missing_path', 'syntax_error', 'unparseable_file', 'empty_target', 'encoding_error', 'permission_denied', 'recursion_limit_exceeded'",
+    )
     message: str = Field(..., description="Primary explanatory message for the agent")
     target_path: Optional[str] = Field(default=None, description="Target file or directory path where issue occurred")
     line: Optional[int] = Field(default=None, description="1-based line number for AST syntax errors")
@@ -233,6 +249,31 @@ class WorkspaceOverviewResult(BaseModel):
 
 
 # ==============================================================================
+# Internal CLI Arguments Schema
+# ==============================================================================
+
+
+class ParsedArgs(BaseModel):
+    """Structured internal representation of forgiving CLI arguments."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    symbol: Optional[str] = None
+    file: Optional[str] = None
+    dir: Optional[str] = None
+    target: Optional[str] = None
+    overview: bool = False
+    tree: bool = False
+    callers: Optional[Any] = None
+    callees: Optional[Any] = None
+    focus: Optional[str] = None
+    json: bool = False
+    graph: Optional[str] = None
+    max_lines: int = 120
+    notices: List[str] = Field(default_factory=list)
+
+
+# ==============================================================================
 # Workspace & Target Resolution (Loop-Safe & Symlink-Safe)
 # ==============================================================================
 
@@ -267,23 +308,44 @@ def safe_walk(
     root_path: pathlib.Path,
     ws_root: pathlib.Path,
     max_depth: int = 15,
+    max_dirs: int = 1000,
 ) -> Any:
-    """Cycle-safe and symlink-safe generator over directory tree.
+    """Cycle-safe, symlink-safe, and depth-bounded generator over directory tree.
 
-    Prevents infinite loops from symlinks, directory junctions, and runaway depth.
+    Prevents infinite loops from circular symlinks, directory junctions, runaway depth,
+    and massive directory trees.
     """
     visited_inodes: Set[Tuple[int, int]] = set()
+    visited_realpaths: Set[str] = set()
+    dirs_count = 0
+
+    try:
+        real_root = os.path.realpath(str(root_path))
+        visited_realpaths.add(real_root)
+    except Exception:
+        pass
 
     for dirpath, dirnames, filenames in os.walk(str(root_path), followlinks=False):
+        dirs_count += 1
+        if dirs_count > max_dirs:
+            dirnames.clear()
+            return
+
         curr_p = pathlib.Path(dirpath)
         try:
+            real_dir = os.path.realpath(dirpath)
+            if real_dir in visited_realpaths and dirpath != str(root_path):
+                dirnames.clear()
+                continue
+            visited_realpaths.add(real_dir)
+
             stat_res = curr_p.stat()
             inode_key = (stat_res.st_dev, stat_res.st_ino)
             if inode_key in visited_inodes:
                 dirnames.clear()
                 continue
             visited_inodes.add(inode_key)
-        except OSError:
+        except (OSError, PermissionError):
             dirnames.clear()
             continue
 
@@ -295,11 +357,19 @@ def safe_walk(
         except ValueError:
             pass
 
-        # In-place directory filtering
-        dirnames[:] = [
-            d for d in dirnames
-            if not should_skip_dir(d)
-        ]
+        # In-place directory filtering: skip ignored dirs and symlink directories
+        filtered_dirs: List[str] = []
+        for d in dirnames:
+            if should_skip_dir(d):
+                continue
+            full_sub = os.path.join(dirpath, d)
+            try:
+                if os.path.islink(full_sub):
+                    continue
+            except (OSError, PermissionError):
+                continue
+            filtered_dirs.append(d)
+        dirnames[:] = filtered_dirs
 
         yield dirpath, dirnames, filenames
 
@@ -401,7 +471,7 @@ def find_closest_paths(clean_target: str, ws: pathlib.Path) -> List[str]:
     all_files: List[str] = []
 
     try:
-        for root, dirs, files in safe_walk(ws, ws, max_depth=8):
+        for root, dirs, files in safe_walk(ws, ws, max_depth=8, max_dirs=600):
             dirs[:] = sorted([d for d in dirs if not should_skip_dir(d)])
             rel_dir = os.path.relpath(root, ws)
             if rel_dir != ".":
@@ -462,7 +532,7 @@ def get_top_level_layout(ws: pathlib.Path) -> List[RepoLayoutItem]:
             py_count = 0
             subdirs = 0
             try:
-                for _, d_list, f_list in safe_walk(entry, ws, max_depth=5):
+                for _, d_list, f_list in safe_walk(entry, ws, max_depth=5, max_dirs=300):
                     d_list[:] = [d for d in d_list if not should_skip_dir(d)]
                     subdirs += len(d_list)
                     for f in f_list:
@@ -492,7 +562,7 @@ def collect_py_files(target_path: pathlib.Path, ws: pathlib.Path, max_files: int
         return []
 
     py_files: List[pathlib.Path] = []
-    for root, dirs, files in safe_walk(target_path, ws, max_depth=10):
+    for root, dirs, files in safe_walk(target_path, ws, max_depth=10, max_dirs=600):
         dirs[:] = sorted([d for d in dirs if not should_skip_dir(d)])
         for f in sorted(files):
             if f.endswith(".py") and not f.startswith("."):
@@ -735,20 +805,29 @@ def resolve_graph_node(query: str, indexes: Dict[str, Any]) -> Optional[str]:
 def compute_fuzzy_suggestions(
     query: str,
     candidates: List[Tuple[str, Optional[str], Optional[str]]],
-    top_n: int = 5,
-    cutoff: float = 0.35,
+    top_n: int = 6,
+    cutoff: float = 0.30,
 ) -> List[SymbolSuggestion]:
-    """Rank candidate symbols by fuzzy similarity (edit distance / Levenshtein) to query."""
+    """Rank candidate symbols by fuzzy similarity (difflib SequenceMatcher), generating exact copy-pasteable commands."""
     q_low = query.lower()
     scored: List[Tuple[float, str, Optional[str], Optional[str]]] = []
-    seen: Set[str] = set()
 
+    # Deduplicate candidate names, keeping richest kind/location
+    best_candidate_map: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     for cand_name, kind, loc in candidates:
         cand_clean = cand_name.strip()
-        if not cand_clean or cand_clean in seen or cand_clean == query:
+        if not cand_clean or cand_clean == query:
             continue
-        seen.add(cand_clean)
+        if cand_clean not in best_candidate_map:
+            best_candidate_map[cand_clean] = (kind, loc)
+        else:
+            old_kind, old_loc = best_candidate_map[cand_clean]
+            if not old_loc and loc:
+                best_candidate_map[cand_clean] = (kind or old_kind, loc)
+            elif old_kind in ("import", "module", "graph_node") and kind in ("class", "function", "method"):
+                best_candidate_map[cand_clean] = (kind, loc or old_loc)
 
+    for cand_clean, (kind, loc) in best_candidate_map.items():
         c_low = cand_clean.lower()
         leaf = cand_clean.split(".")[-1]
         l_low = leaf.lower()
@@ -772,13 +851,21 @@ def compute_fuzzy_suggestions(
 
     suggestions: List[SymbolSuggestion] = []
     for score, sym, kind, loc in scored[:top_n]:
+        inspect_cmd = f"python3 map.py --symbol {sym}"
+        file_cmd = None
+        if loc and ":" in loc:
+            f_path = loc.split(":")[0]
+            file_cmd = f"python3 map.py --file {f_path}"
+
         suggestions.append(
             SymbolSuggestion(
                 symbol=sym,
                 similarity=round(score, 3),
                 kind=kind or ("function" if "(" in sym else "symbol"),
                 location=loc,
-                reason=f"Closest fuzzy match (similarity: {score:.2f})",
+                reason=f"Fuzzy match (similarity: {score:.2f}) to '{query}'",
+                inspect_command=inspect_cmd,
+                file_command=file_cmd,
             )
         )
     return suggestions
@@ -792,10 +879,12 @@ def compute_fuzzy_suggestions(
 class AstReferenceCollector(ast.NodeVisitor):
     """Parses Python AST to extract definitions, base classes, subclasses, imports, calls, callers, callees."""
 
-    def __init__(self, rel_path: str, clean_symbol: str):
+    def __init__(self, rel_path: str, clean_symbol: str, max_ast_depth: int = 80):
         self.rel_path = rel_path
         self.clean_symbol = clean_symbol
         self.scope_stack: List[str] = []
+        self.current_depth: int = 0
+        self.max_ast_depth: int = max_ast_depth
 
         self.defs: List[ReferenceDetail] = []
         self.imports: List[ReferenceDetail] = []
@@ -804,6 +893,15 @@ class AstReferenceCollector(ast.NodeVisitor):
         self.ast_callers: Set[str] = set()
         self.ast_callees: Set[str] = set()
         self.catalog_symbols: List[Tuple[str, Optional[str], str]] = []
+
+    def generic_visit(self, node: ast.AST):
+        if self.current_depth >= self.max_ast_depth:
+            return
+        self.current_depth += 1
+        try:
+            super().generic_visit(node)
+        finally:
+            self.current_depth -= 1
 
     def visit_ClassDef(self, node: ast.ClassDef):
         loc = f"{self.rel_path}:{node.lineno}"
@@ -981,6 +1079,7 @@ def analyze_symbol(
     target_path: pathlib.Path,
     ws_root: pathlib.Path,
     explicit_graph_path: Optional[str] = None,
+    focus: Optional[str] = None,
 ) -> CodeGraphResult:
     """Analyze symbol references, graph reachability, definitions, and class hierarchy."""
     clean_symbol = symbol_name.strip()
@@ -1052,9 +1151,15 @@ def analyze_symbol(
             rel_path = full_path
 
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(full_path, "r", encoding="utf-8") as f:
                 source = f.read()
-        except OSError:
+        except UnicodeDecodeError:
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    source = f.read()
+            except Exception:
+                continue
+        except (PermissionError, OSError):
             continue
 
         if is_valid_ident:
@@ -1231,6 +1336,10 @@ def analyze_symbol(
         if defs:
             first_def = defs[0]
             next_steps.append(f"Inspect defining module: python3 map.py --file {first_def.file_path}")
+        if focus == "callers" and all_callers:
+            next_steps.append(f"Inspect top caller: python3 map.py --symbol {all_callers[0].split()[0]}")
+        elif focus == "callees" and all_callees:
+            next_steps.append(f"Inspect top callee: python3 map.py --symbol {all_callees[0].split()[0]}")
         next_steps.append(f"Search direct calls across repo: grep.py '{clean_symbol}'")
     else:
         if graph_loaded:
@@ -1247,23 +1356,29 @@ def analyze_symbol(
         candidates: List[Tuple[str, Optional[str], Optional[str]]] = []
         if graph_loaded:
             for nid in graph_indexes.get("node_ids", []):
-                candidates.append((nid, "graph_node", None))
+                mod_parts = nid.split(".")
+                inferred_loc = "/".join(mod_parts[:-1]) + ".py" if len(mod_parts) > 1 else None
+                candidates.append((nid, "graph_node", inferred_loc))
                 leaf = nid.split(".")[-1]
                 if leaf:
-                    candidates.append((leaf, "graph_node", None))
+                    candidates.append((leaf, "graph_node", inferred_loc))
 
         for sym, kind, loc in ast_symbol_catalog:
             candidates.append((sym, kind, loc))
 
-        suggestions = compute_fuzzy_suggestions(clean_symbol, candidates, top_n=6, cutoff=0.32)
+        suggestions = compute_fuzzy_suggestions(clean_symbol, candidates, top_n=6, cutoff=0.30)
         did_you_mean = [s.symbol for s in suggestions]
         caller_callee_summary = f"Symbol '{clean_symbol}' was not found in the codebase graph."
 
         # Collect available top-level public symbols from the workspace to guide the LLM
         top_repo_symbols = get_top_repo_symbols(ws_root, max_symbols=12)
 
-        if did_you_mean:
-            next_steps.append(f"Try closest suggested symbol: python3 map.py --symbol {did_you_mean[0]}")
+        if suggestions:
+            top_s = suggestions[0]
+            if top_s.inspect_command:
+                next_steps.append(f"Try closest suggested symbol: {top_s.inspect_command}")
+            if top_s.file_command:
+                next_steps.append(f"Inspect candidate file: {top_s.file_command}")
         next_steps.append(f"Search codebase text with fast-grep: grep.py '{clean_symbol}'")
         next_steps.append("View repository structure and modules: python3 map.py")
 
@@ -1272,6 +1387,7 @@ def analyze_symbol(
         query=symbol_name,
         found=found,
         resolved_symbol=resolved_symbol,
+        focus=focus,
         explanation=explanation,
         inspection_hint=inspection_hint,
         graph_status=graph_status,
@@ -1291,7 +1407,7 @@ def analyze_symbol(
 
 
 def format_symbol_report(result: CodeGraphResult) -> str:
-    """Format CodeGraphResult into concise text report."""
+    """Format CodeGraphResult into concise, informative text report with actionable LLM guidance."""
     lines: List[str] = [
         "=" * 80,
         "CODE-MAP: SYMBOL REFERENCE & REACHABILITY REPORT",
@@ -1300,11 +1416,38 @@ def format_symbol_report(result: CodeGraphResult) -> str:
         f"STATUS: {'FOUND' if result.found else 'NOT FOUND'}",
     ]
 
+    if result.focus:
+        lines.append(f"FOCUS: {result.focus.upper()}")
+
     if result.resolved_symbol:
         lines.append(f"RESOLVED SYMBOL: {result.resolved_symbol}")
 
     lines.append(f"EXPLANATION: {result.explanation}")
     lines.append("")
+
+    # If focus == 'callers' or 'callees', highlight them prominently at the top
+    if result.focus == "callers":
+        lines.append("=" * 40)
+        lines.append(f"TARGET INBOUND CALLERS FOR '{result.query}':")
+        lines.append("=" * 40)
+        if result.callers:
+            lines.append(f"  Total Inbound Callers: {len(result.callers)}")
+            for clr in result.callers[:30]:
+                lines.append(f"  👉 {clr}")
+        else:
+            lines.append("  (0 direct static callers recorded)")
+        lines.append("")
+    elif result.focus == "callees":
+        lines.append("=" * 40)
+        lines.append(f"TARGET OUTBOUND CALLEES FOR '{result.query}':")
+        lines.append("=" * 40)
+        if result.callees:
+            lines.append(f"  Total Outbound Callees: {len(result.callees)}")
+            for cle in result.callees[:30]:
+                lines.append(f"  👉 {cle}")
+        else:
+            lines.append("  (0 direct static callees recorded)")
+        lines.append("")
 
     lines.append("GRAPH TOPOLOGY:")
     if result.graph_status.graph_loaded:
@@ -1349,22 +1492,23 @@ def format_symbol_report(result: CodeGraphResult) -> str:
             lines.append("  (none)")
         lines.append("")
 
-        lines.append("CALL GRAPH REACHABILITY:")
-        lines.append(f"  {result.caller_callee_summary}")
-        if result.callers:
-            lines.append(f"  Inbound Callers ({len(result.callers)}, first 10):")
-            for clr in result.callers[:10]:
-                lines.append(f"    - {clr}")
-        else:
-            lines.append("  Inbound Callers: (0 direct static callers recorded)")
+        if not result.focus:
+            lines.append("CALL GRAPH REACHABILITY:")
+            lines.append(f"  {result.caller_callee_summary}")
+            if result.callers:
+                lines.append(f"  Inbound Callers ({len(result.callers)}, first 10):")
+                for clr in result.callers[:10]:
+                    lines.append(f"    - {clr}")
+            else:
+                lines.append("  Inbound Callers: (0 direct static callers recorded)")
 
-        if result.callees:
-            lines.append(f"  Outbound Callees ({len(result.callees)}, first 10):")
-            for cle in result.callees[:10]:
-                lines.append(f"    - {cle}")
-        else:
-            lines.append("  Outbound Callees: (0 direct static callees recorded)")
-        lines.append("")
+            if result.callees:
+                lines.append(f"  Outbound Callees ({len(result.callees)}, first 10):")
+                for cle in result.callees[:10]:
+                    lines.append(f"    - {cle}")
+            else:
+                lines.append("  Outbound Callees: (0 direct static callees recorded)")
+            lines.append("")
 
         if result.text_occurrences:
             lines.append("TEXT OCCURRENCES (first 15):")
@@ -1373,13 +1517,30 @@ def format_symbol_report(result: CodeGraphResult) -> str:
             lines.append("")
 
     else:
+        lines.append("WHY THIS QUERY FAILED:")
+        lines.append(f"  Symbol '{result.query}' was not identified in the codebase graph or repository AST.")
+        if result.query.startswith("_"):
+            lines.append(f"  • Note: Symbol starts with '_', indicating a private/internal function or attribute.")
+            lines.append("    Private symbols are often not registered as public graph nodes.")
+        elif "." in result.query:
+            lines.append(f"  • Note: Symbol contains dots. Dotted path queries depend on exact module import hierarchy.")
+        elif not result.query.isidentifier():
+            lines.append(f"  • Note: Query '{result.query}' is not a valid Python identifier.")
+        else:
+            lines.append("  • The symbol name may contain a typo, or the symbol is defined dynamically at runtime.")
+        lines.append("")
+
         lines.append("SUGGESTIONS:")
         if result.suggestions:
-            lines.append("  Did you mean one of these symbols:")
+            lines.append("  Did you mean one of these symbols?")
             for idx, s in enumerate(result.suggestions, 1):
-                loc_str = f", location: {s.location}" if s.location else ""
-                kind_str = f", kind: {s.kind}" if s.kind else ""
-                lines.append(f"    {idx}. {s.symbol} (similarity: {s.similarity:.2f}{kind_str}{loc_str})")
+                loc_str = f" [location: {s.location}]" if s.location else ""
+                kind_str = f" ({s.kind})" if s.kind else ""
+                lines.append(f"    {idx}. {s.symbol}{kind_str} (similarity: {s.similarity:.2f}){loc_str}")
+                if s.inspect_command:
+                    lines.append(f"       👉 {s.inspect_command}")
+                if s.file_command:
+                    lines.append(f"       👉 {s.file_command}")
         else:
             lines.append("  No close fuzzy matches found in codebase graph or repository AST.")
         lines.append("")
@@ -1387,7 +1548,8 @@ def format_symbol_report(result: CodeGraphResult) -> str:
         if result.available_top_symbols:
             lines.append("TOP-LEVEL PUBLIC SYMBOLS IN REPOSITORY:")
             for sym in result.available_top_symbols:
-                lines.append(f"  • {sym}")
+                clean_sym = sym.replace("class ", "").replace("def ", "").replace("()", "")
+                lines.append(f"  • {sym}  ->  python3 map.py --symbol {clean_sym}")
             lines.append("")
 
     if result.inspection_hint:
@@ -1519,22 +1681,40 @@ def parse_and_map_file(
     py_file: pathlib.Path,
     ws: pathlib.Path,
 ) -> Tuple[ModuleSummary, Optional[MapDiagnostic]]:
-    """Parse a single Python file, extract AST symbols, and diagnose syntax errors."""
+    """Parse a single Python file, extract AST symbols, and diagnose syntax/permission/encoding errors."""
     try:
         rel_display = py_file.relative_to(ws)
     except ValueError:
         rel_display = py_file
 
     try:
-        with open(py_file, "r", encoding="utf-8", errors="replace") as f:
+        with open(py_file, "r", encoding="utf-8") as f:
             content = f.read()
-    except Exception as e:
+    except UnicodeDecodeError as e:
+        diag = MapDiagnostic(
+            level="warning",
+            category="encoding_error",
+            message=f"File '{rel_display}' contains unparseable binary or invalid UTF-8 encoding: {e}",
+            target_path=str(rel_display),
+            guidance="Verify file encoding (UTF-8 required) or verify that this is a Python source file.",
+        )
+        return ModuleSummary(path=str(rel_display), syntax_error=diag), diag
+    except PermissionError as e:
+        diag = MapDiagnostic(
+            level="error",
+            category="permission_denied",
+            message=f"Permission denied reading file '{rel_display}': {e}",
+            target_path=str(rel_display),
+            guidance="Check file permissions or run with appropriate access privileges.",
+        )
+        return ModuleSummary(path=str(rel_display), syntax_error=diag), diag
+    except OSError as e:
         diag = MapDiagnostic(
             level="error",
             category="unparseable_file",
             message=f"Failed to read file '{rel_display}': {e}",
             target_path=str(rel_display),
-            guidance="Verify file permissions and file encoding.",
+            guidance="Verify file exists and filesystem is accessible.",
         )
         return ModuleSummary(path=str(rel_display), syntax_error=diag), diag
 
@@ -1574,6 +1754,15 @@ def parse_and_map_file(
             column=err_col,
             snippet=snippet,
             guidance=guidance,
+        )
+        return ModuleSummary(path=str(rel_display), syntax_error=diag), diag
+    except RecursionError:
+        diag = MapDiagnostic(
+            level="warning",
+            category="recursion_limit_exceeded",
+            message=f"AST nesting depth exceeds limit in '{rel_display}'.",
+            target_path=str(rel_display),
+            guidance="File contains deeply nested structures; outline skipped to prevent stack overflow.",
         )
         return ModuleSummary(path=str(rel_display), syntax_error=diag), diag
     except Exception as e:
@@ -1635,6 +1824,13 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
         lines: List[str] = [
             f"[code-map] {diag_msg}",
             "",
+            "WHY THIS FAILED:",
+            f"  Target path '{target_str}' does not exist in the active workspace.",
+            "  Common causes:",
+            "  1. Typo in directory or file name.",
+            "  2. Missing folder prefix (e.g. 'src/' or package directory).",
+            "  3. Missing or wrong file extension (.py).",
+            "",
         ]
         if str(ws) != "/workspace":
             lines.append(f"  (Active workspace root: {ws})")
@@ -1643,6 +1839,8 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             lines.append("💡 Suggested closest existing paths:")
             for s in suggestions:
                 lines.append(f"  • {s}")
+                clean_s = s.replace("📁 ", "").replace("📄 ", "").rstrip("/")
+                lines.append(f"     👉 python3 map.py --file {clean_s}")
             lines.append("")
         if layout_items:
             lines.append("📂 Top-level repository layout (/workspace):")
@@ -1652,8 +1850,9 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
 
         next_steps: List[str] = []
         if suggestions:
-            best = suggestions[0].replace("📁 ", "").replace("📄 ", "").rstrip("/")
-            next_steps.append(f"Inspect closest match: python3 map.py --file {best}")
+            for s in suggestions[:3]:
+                best = s.replace("📁 ", "").replace("📄 ", "").rstrip("/")
+                next_steps.append(f"Inspect closest match: python3 map.py --file {best}")
         next_steps.append("View repository overview and packages: python3 map.py")
 
         if next_steps:
@@ -1704,6 +1903,9 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
         )
         lines = [
             f"[code-map] {diag_msg}",
+            "",
+            "WHY THIS FAILED:",
+            f"  Target '{target_str}' exists but contains no Python source files (.py).",
             "",
         ]
         if items_in_dir:
@@ -1883,6 +2085,7 @@ def generate_workspace_overview(ws: pathlib.Path) -> WorkspaceOverviewResult:
         f"python3 map.py --file {example_mod}           # Compact AST outline of a key module",
         f"python3 map.py --file {example_pkg}                 # Map package directory structure",
         f"python3 map.py --symbol {example_sym}             # Trace call-graph, callers, callees, definitions",
+        f"python3 map.py --symbol {example_sym} --callers   # Focus specifically on inbound callers",
         f"python3 map.py {example_mod}                  # Positional shorthand (auto-detects file)",
         f"python3 map.py {example_sym}                  # Positional shorthand (auto-detects symbol)",
     ]
@@ -1940,62 +2143,281 @@ def generate_workspace_overview(ws: pathlib.Path) -> WorkspaceOverviewResult:
 
 
 # ==============================================================================
-# Forgiving CLI Argument Auto-Detection
+# Forgiving CLI Argument Parsing
 # ==============================================================================
 
 
+def parse_cli_args(argv: List[str]) -> Tuple[ParsedArgs, List[str]]:
+    """Forgivingly and omnivorously parse CLI arguments without ever crashing.
+
+    Handles:
+    - Aliases: -s, --symbol, -f, --file, -d, --dir, -o, --overview, -t, --tree, --callers, --callees
+    - Typo tolerance: maps flags like --symbl to --symbol via fuzzy matching
+    - Unrecognized flags: warns and routes to closest intent or overview
+    - Missing flag values: uses defaults gracefully without ArgumentError
+    - Seamless positional fallbacks: symbol vs file/dir auto-detection
+    """
+    notices: List[str] = []
+    args = ParsedArgs()
+
+    i = 0
+    positional: List[str] = []
+
+    KNOWN_FLAGS = {
+        "-s": "symbol",
+        "--symbol": "symbol",
+        "--sym": "symbol",
+        "--symbols": "symbol",
+        "--function": "symbol",
+        "--fn": "symbol",
+        "--class": "symbol",
+        "-f": "file",
+        "--file": "file",
+        "--path": "file",
+        "--filepath": "file",
+        "-d": "dir",
+        "--dir": "dir",
+        "--directory": "dir",
+        "--folder": "dir",
+        "-o": "overview",
+        "--overview": "overview",
+        "--summary": "overview",
+        "--workspace": "overview",
+        "-t": "tree",
+        "--tree": "tree",
+        "--callers": "callers",
+        "--caller": "callers",
+        "--inbound": "callers",
+        "--callees": "callees",
+        "--callee": "callees",
+        "--outbound": "callees",
+        "-j": "json",
+        "--json": "json",
+        "-g": "graph",
+        "--graph": "graph",
+        "-n": "max_lines",
+        "--max-lines": "max_lines",
+        "--limit": "max_lines",
+        "--lines": "max_lines",
+        "-h": "help",
+        "--help": "help",
+    }
+
+    while i < len(argv):
+        arg = argv[i]
+        val = None
+
+        if arg in ("-h", "--help"):
+            return ParsedArgs(overview=True), ["help"]
+
+        # Handle --flag=value syntax
+        if "=" in arg and arg.startswith("-"):
+            flag_part, val = arg.split("=", 1)
+        else:
+            flag_part = arg
+
+        canon = KNOWN_FLAGS.get(flag_part)
+
+        # Fuzzy match flag typo if starts with - or --
+        if not canon and flag_part.startswith("-"):
+            clean_flag = flag_part.lstrip("-")
+            all_clean = {k.lstrip("-"): v for k, v in KNOWN_FLAGS.items()}
+            close = difflib.get_close_matches(clean_flag, list(all_clean.keys()), n=1, cutoff=0.6)
+            if close:
+                canon = all_clean[close[0]]
+                notices.append(f"Interpreted flag '{flag_part}' as '--{close[0]}'.")
+            else:
+                notices.append(f"Unrecognized option '{flag_part}' ignored.")
+                i += 1
+                continue
+
+        if canon == "symbol":
+            if val is not None:
+                args.symbol = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.symbol = argv[i]
+            else:
+                notices.append("Option '--symbol' passed without a value.")
+        elif canon == "file":
+            if val is not None:
+                args.file = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.file = argv[i]
+            else:
+                notices.append("Option '--file' passed without a value.")
+        elif canon == "dir":
+            if val is not None:
+                args.dir = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.dir = argv[i]
+            else:
+                notices.append("Option '--dir' passed without a value.")
+        elif canon == "overview":
+            args.overview = True
+        elif canon == "tree":
+            args.tree = True
+        elif canon == "callers":
+            args.focus = "callers"
+            if val is not None:
+                args.callers = val
+                args.symbol = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.callers = argv[i]
+                args.symbol = argv[i]
+            else:
+                args.callers = True
+        elif canon == "callees":
+            args.focus = "callees"
+            if val is not None:
+                args.callees = val
+                args.symbol = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.callees = argv[i]
+                args.symbol = argv[i]
+            else:
+                args.callees = True
+        elif canon == "json":
+            args.json = True
+        elif canon == "graph":
+            if val is not None:
+                args.graph = val
+            elif i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                args.graph = argv[i]
+        elif canon == "max_lines":
+            lines_val = val
+            if lines_val is None and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                lines_val = argv[i]
+            if lines_val:
+                try:
+                    args.max_lines = int(lines_val)
+                except ValueError:
+                    notices.append(f"Invalid integer '{lines_val}' for line budget; using default.")
+        elif not arg.startswith("-"):
+            positional.append(arg)
+
+        i += 1
+
+    if positional:
+        args.target = positional[0]
+
+    args.notices = notices
+    return args, []
+
+
 def determine_mode_and_target(
-    symbol_arg: Optional[str],
-    file_arg: Optional[str],
-    target_arg: Optional[str],
+    args: ParsedArgs,
     ws: pathlib.Path,
-) -> Tuple[str, str]:
-    """Deterministically and forgivingly resolve analysis mode ('overview', 'file', 'symbol') and target."""
-    raw_symbol = (symbol_arg or "").strip()
-    raw_file = (file_arg or "").strip()
-    raw_target = (target_arg or "").strip()
+) -> Tuple[str, str, Optional[str]]:
+    """Deterministically and forgivingly resolve analysis mode ('overview', 'file', 'symbol'), target, and focus."""
+    # 1. Explicit overview flag
+    if args.overview:
+        return "overview", ".", None
 
-    # Explicit --symbol
-    if raw_symbol:
-        return "symbol", raw_symbol
+    # 2. Tree flag: directory tree / file outline
+    if args.tree:
+        tree_target = args.dir or args.file or args.target or "."
+        return "file", tree_target, None
 
-    # Explicit --file
-    if raw_file:
-        if raw_file in (".", "/", "/workspace"):
-            return "overview", "."
-        return "file", raw_file
+    # 3. Callers / Callees flag with explicit value or focus
+    if args.callers:
+        sym = args.callers if isinstance(args.callers, str) else (args.symbol or args.target or "")
+        if sym:
+            return "symbol", sym, "callers"
 
-    # Positional target argument
-    if raw_target:
-        if raw_target in (".", "/", "/workspace"):
-            return "overview", "."
+    if args.callees:
+        sym = args.callees if isinstance(args.callees, str) else (args.symbol or args.target or "")
+        if sym:
+            return "symbol", sym, "callees"
 
-        # Clearly a file extension
-        if raw_target.endswith(".py") or raw_target.endswith(".pyi"):
-            return "file", raw_target
+    # 4. Explicit --symbol
+    if args.symbol:
+        return "symbol", args.symbol, args.focus
 
-        # Contains directory separators: clearly intended as a path
-        if "/" in raw_target or "\\" in raw_target:
-            return "file", raw_target
+    # 5. Explicit --dir
+    if args.dir:
+        return "file", args.dir, None
 
-        # Check if matches an existing file or directory directly in workspace
-        cand_file = ws / raw_target
-        if cand_file.is_file():
-            return "file", raw_target
+    # 6. Explicit --file
+    if args.file:
+        if args.file in (".", "/", "/workspace"):
+            return "overview", ".", None
+        return "file", args.file, None
 
-        cand_dir = ws / raw_target
-        if cand_dir.is_dir():
-            return "file", raw_target
+    # 7. Positional argument
+    if args.target:
+        clean = args.target.strip()
+        if not clean or clean in (".", "/", "/workspace"):
+            return "overview", ".", None
 
-        cand_py = ws / f"{raw_target}.py"
+        # Clearly a file extension or path with separators
+        if clean.endswith(".py") or clean.endswith(".pyi") or "/" in clean or "\\" in clean:
+            return "file", clean, None
+
+        # Check direct existence as file or directory in workspace
+        cand_p = ws / clean
+        if cand_p.is_file() or cand_p.is_dir():
+            return "file", clean, None
+
+        cand_py = ws / f"{clean}.py"
         if cand_py.is_file():
-            return "file", f"{raw_target}.py"
+            return "file", f"{clean}.py", None
 
-        # Otherwise treated as a symbol
-        return "symbol", raw_target
+        # Check with resolve_target for glob/search matches
+        resolved, _ = resolve_target(clean, ws)
+        if resolved is not None and resolved.exists():
+            return "file", clean, None
 
-    # No arguments passed at all -> overview mode
-    return "overview", "."
+        # Otherwise, treat as symbol
+        return "symbol", clean, args.focus
+
+    # 8. No arguments passed at all -> overview mode
+    return "overview", ".", None
+
+
+def print_help():
+    """Print user/LLM help text."""
+    print("""code-map: AST code structure and symbol call-graph tracer.
+
+Usage:
+  python3 map.py [TARGET] [OPTIONS]
+
+Modes:
+  --symbol, -s <name>     Trace callers, callees, definitions, and class hierarchy across repository.
+  --file, -f <path>       Generate compact AST skeleton for a Python file or directory.
+  --dir, -d <path>        Generate AST skeleton for all modules in a directory.
+  --tree, -t [path]       Map directory tree structure and module skeletons.
+  --overview, -o          Display workspace overview, discovered packages, and key modules.
+  --callers [symbol]      Focus on inbound callers for the target symbol.
+  --callees [symbol]      Focus on outbound callees for the target symbol.
+  <target>                Positional shorthand (auto-detects file, directory, or symbol).
+  (empty)                 Displays workspace overview, discovered packages, and tailored commands.
+
+Options:
+  --json, -j              Output structured JSON schema (Pydantic v2).
+  --max-lines, -n <int>   Maximum lines of symbol output for directory outlines (default: 120).
+  --graph, -g <path>      Explicit path to precomputed codebase graph JSON.
+  --help, -h              Show this help message and exit.
+
+Examples:
+  python3 map.py                                # Repository overview & tailored usage guide
+  python3 map.py --symbol APIRouter             # Trace symbol callers/callees/definitions
+  python3 map.py -s APIRouter --callers         # Focus on inbound callers of APIRouter
+  python3 map.py -s APIRouter --callees         # Focus on outbound callees of APIRouter
+  python3 map.py --file fastapi/routing.py      # Compact AST outline of a single file
+  python3 map.py -f fastapi                     # Map directory modules up to max_lines budget
+  python3 map.py -d fastapi                     # Directory mapping shorthand
+  python3 map.py APIRouter                      # Auto-detected symbol mode
+  python3 map.py fastapi/routing.py             # Auto-detected file mode
+  python3 map.py fastapi                        # Auto-detected directory mode
+  python3 map.py --symbol APIRouter --json      # Output structured JSON schema
+""")
 
 
 # ==============================================================================
@@ -2003,77 +2425,27 @@ def determine_mode_and_target(
 # ==============================================================================
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        prog="map.py",
-        description="code-map: AST code structure and symbol call-graph tracer.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Modes:
-  --symbol <name>   Trace callers, callees, definitions, and class hierarchy across repository.
-  --file <path>     Generate compact AST skeleton for a Python file or directory.
-  <target>          Positional fallback (auto-detects file/dir vs symbol).
-  (empty)           Displays workspace overview, discovered packages, and tailored commands.
-
-Examples:
-  python3 map.py                                # Repository overview & tailored usage guide
-  python3 map.py --symbol APIRouter             # Trace symbol callers/callees/definitions
-  python3 map.py --file fastapi/routing.py      # Compact AST outline of a single file
-  python3 map.py --file fastapi                 # Map directory modules up to max_lines budget
-  python3 map.py APIRouter                      # Auto-detected symbol mode
-  python3 map.py fastapi/routing.py             # Auto-detected file mode
-  python3 map.py --symbol APIRouter --json      # Output structured JSON schema
-""",
-    )
-    parser.add_argument(
-        "--symbol",
-        dest="symbol",
-        default=None,
-        help="Symbol name (function, class, variable, method) to trace callers/callees/definitions.",
-    )
-    parser.add_argument(
-        "--file",
-        dest="file",
-        default=None,
-        help="Target Python file or directory path to generate compact AST skeleton.",
-    )
-    parser.add_argument(
-        "target",
-        nargs="?",
-        default=None,
-        help="Positional argument: auto-detects file/directory vs symbol.",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output result as formatted JSON adhering to Pydantic schema.",
-    )
-    parser.add_argument(
-        "--graph",
-        default=None,
-        help="Explicit path to precomputed codebase graph JSON.",
-    )
-    parser.add_argument(
-        "--max-lines",
-        type=int,
-        default=120,
-        help="Maximum lines of symbol output to display in --file mode (default: 120).",
-    )
-
-    args = parser.parse_args()
+def run_cli(argv: List[str]) -> int:
+    """Execute code-map CLI forgivingly."""
     ws_root = get_workspace_dir()
+    parsed_args, extra = parse_cli_args(argv)
 
-    mode, target_name = determine_mode_and_target(
-        symbol_arg=args.symbol,
-        file_arg=args.file,
-        target_arg=args.target,
-        ws=ws_root,
-    )
+    if extra and extra[0] == "help":
+        print_help()
+        return 0
 
-    # 1. Overview Mode (empty args, '.', '/workspace')
+    mode, target_name, focus = determine_mode_and_target(parsed_args, ws_root)
+
+    # Print notices if any (only in non-json mode)
+    if parsed_args.notices and not parsed_args.json:
+        for note in parsed_args.notices:
+            print(f"[code-map note] {note}")
+        print("")
+
+    # 1. Overview Mode
     if mode == "overview":
         res_overview = generate_workspace_overview(ws_root)
-        if args.json:
+        if parsed_args.json:
             print(res_overview.model_dump_json(indent=2))
         else:
             print(res_overview.rendered_text)
@@ -2081,8 +2453,8 @@ Examples:
 
     # 2. File / Directory Skeleton Mode
     if mode == "file":
-        res_file = generate_file_skeleton(target_name, max_lines=args.max_lines)
-        if args.json:
+        res_file = generate_file_skeleton(target_name, max_lines=parsed_args.max_lines)
+        if parsed_args.json:
             print(res_file.model_dump_json(indent=2))
         else:
             print(res_file.rendered_text)
@@ -2094,15 +2466,28 @@ Examples:
         symbol_name=target_name,
         target_path=target_path or ws_root,
         ws_root=ws_root,
-        explicit_graph_path=args.graph,
+        explicit_graph_path=parsed_args.graph,
+        focus=focus,
     )
 
-    if args.json:
+    if parsed_args.json:
         print(res_symbol.model_dump_json(indent=2))
     else:
         print(format_symbol_report(res_symbol))
 
     return 0
+
+
+def main() -> int:
+    try:
+        return run_cli(sys.argv[1:])
+    except Exception as e:
+        # Ultimate fallback: never crash with unhandled exception or leave LLM stranded
+        ws = get_workspace_dir()
+        overview = generate_workspace_overview(ws)
+        print(f"[code-map note] Command completed with fallback due to: {e}")
+        print(overview.rendered_text)
+        return 0
 
 
 if __name__ == "__main__":

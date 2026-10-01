@@ -4,19 +4,21 @@
 Provides deterministic diagnostics and inspection tools for domain nuances that
 commonly cause subtle bugs or failed assertions in SWE benchmarks:
 1. --eval <expr>: Safely evaluates a Python expression in the current environment
-   and outputs type, repr, len, and formatted string with actionable diagnostics.
+   with infinite loop timeout protection, full exception trapping, and actionable
+   diagnostics for SyntaxError and NameError.
 2. --hex <text>: Hex dump and escape sequence inspector. Decodes raw bytes and
    characters, highlights ANSI escapes, SGR parameters, OSC hyperlinks, and
    invisible control/zero-width characters (\r, \n, \t, \u200d, \ufe0f).
 3. --width <text>: Calculates exact terminal cell display width for monospaced
    terminals (handling CJK East Asian Width W/F as 2 cells, ZWJ sequences,
-   combining characters, ASCII as 1 cell) and compares terminal columns vs len(text).
+   combining characters, ASCII as 1 cell) and explains which characters cause width mismatches.
 4. --html-esc <snippet>: Inspects HTML/template strings. Verifies entity escaping
    (&lt;, &gt;, &amp;, quotes), tag matching (open/close tag balance), and warns if
    unescaped < or > exists inside script tags or attribute values.
 5. --schema <file_or_json>: Inspects JSON Schema / OpenAPI schema structure.
    Checks $defs vs definitions, validates $ref pointer resolution (flags dangling
-   references), checks anyOf with None/null, and validates schema tree health.
+   references with exact corrected paths), checks anyOf with None/null, handles
+   non-dict schemas, and protects against recursive $ref cycles.
 6. --syntax <file>: Validates AST syntax (ast.parse) and checks that top-level
    module imports can be resolved without executing module side-effects.
 
@@ -27,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import difflib
 import html
 from html.parser import HTMLParser
 import importlib.util
@@ -35,6 +38,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import unicodedata
@@ -65,7 +69,7 @@ def read_input_text(input_val: str) -> str:
     """If input_val is an existing file path, read its text, otherwise return input_val.
     
     Also decodes escaped literal backslashes if input appears to be shell-escaped
-    (e.g., r'\x1b[31m' -> actual ESC).
+    (e.g., r'\\x1b[31m' -> actual ESC).
     """
     if not input_val:
         return ""
@@ -79,7 +83,6 @@ def read_input_text(input_val: str) -> str:
     # Unescape raw string sequences if user passed literal backslash sequences like \x1b or \u
     if "\\" in input_val:
         try:
-            # Only unescape if it contains typical escape tokens
             if any(esc in input_val for esc in (r"\x", r"\u", r"\n", r"\r", r"\t")):
                 return input_val.encode("utf-8").decode("unicode_escape")
         except Exception:
@@ -161,8 +164,17 @@ def generate_snippet(
 # Mode 1: --eval <expr>
 # ==============================================================================
 
+class EvalTimeoutError(TimeoutError):
+    """Raised when expression evaluation exceeds execution timeout limit."""
+    pass
+
+
+def _eval_alarm_handler(signum: int, frame: Any) -> None:
+    raise EvalTimeoutError("Execution timed out (infinite loop or execution exceeded 2.0s limit).")
+
+
 def run_eval(expr: str, as_json: bool = False) -> int:
-    """Safely evaluates a Python expression in the current environment."""
+    """Safely evaluates a Python expression or statement in the current environment."""
     if not expr or not expr.strip():
         diag = "No expression provided to --eval. Example: python3 oracle.py --eval 'len([1, 2, 3])'"
         if as_json:
@@ -171,39 +183,91 @@ def run_eval(expr: str, as_json: bool = False) -> int:
             print(f"✗ [eval-error] {diag}")
         return 1
 
-    # First attempt to parse as eval expression to catch syntax errors cleanly
-    try:
-        compiled = compile(expr, "<eval>", "eval")
-    except SyntaxError as syn_err:
-        snippet = ""
-        if syn_err.text:
-            snippet = generate_snippet(syn_err.text.splitlines(), syn_err.lineno or 1, syn_err.offset or 1)
+    expr_clean = expr.strip()
 
+    # Attempt to compile: try eval first (expression), fallback to exec (statements like loops/assignments)
+    is_statement = False
+    compiled: Any = None
+    try:
+        compiled = compile(expr_clean, "<eval>", "eval")
+    except SyntaxError as syn_err:
+        try:
+            compiled = compile(expr_clean, "<eval>", "exec")
+            is_statement = True
+        except SyntaxError:
+            # Genuine syntax error for both eval and exec modes
+            snippet = ""
+            if syn_err.text:
+                snippet = generate_snippet(syn_err.text.splitlines(), syn_err.lineno or 1, syn_err.offset or 1)
+
+            diag = (
+                f"SyntaxError in expression: {syn_err.msg} (line {syn_err.lineno}, col {syn_err.offset}).\n"
+                f"What is wrong: Python parser encountered invalid syntax near {repr(syn_err.text.strip()) if syn_err.text else 'token'}.\n"
+                "Fix: Check for unbalanced parentheses, brackets, or unclosed string quotes. Ensure you passed a valid "
+                "expression or statement."
+            )
+            if as_json:
+                print(json.dumps({
+                    "status": "error",
+                    "mode": "eval",
+                    "error_type": "SyntaxError",
+                    "message": syn_err.msg,
+                    "line": syn_err.lineno,
+                    "column": syn_err.offset,
+                    "diagnostic": diag,
+                    "snippet": snippet,
+                }, indent=2))
+            else:
+                print("=" * 80)
+                print("✗ [code-oracle: eval] SyntaxError:")
+                print(f"  Message: {syn_err.msg} (col {syn_err.offset})")
+                if snippet:
+                    print("  Snippet:")
+                    for line in snippet.splitlines():
+                        print(f"    {line}")
+                print(f"\n  Fix: {diag}")
+                print("=" * 80)
+            return 1
+        except (ValueError, RecursionError, MemoryError) as comp_err:
+            err_type = type(comp_err).__name__
+            diag = (
+                f"{err_type} during compilation: {comp_err}.\n"
+                "What is wrong: Python compiler encountered an internal limit or invalid character (e.g. null bytes, extreme nesting depth).\n"
+                "Fix: Verify expression does not contain null bytes or excessive nesting depth."
+            )
+            if as_json:
+                print(json.dumps({
+                    "status": "error",
+                    "mode": "eval",
+                    "error_type": err_type,
+                    "message": str(comp_err),
+                    "diagnostic": diag,
+                }, indent=2))
+            else:
+                print("=" * 80)
+                print(f"✗ [code-oracle: eval] Compilation {err_type}: {comp_err}")
+                print(f"  Fix: {diag}")
+                print("=" * 80)
+            return 1
+    except (ValueError, RecursionError, MemoryError) as comp_err:
+        err_type = type(comp_err).__name__
         diag = (
-            f"SyntaxError in expression: {syn_err.msg} (line {syn_err.lineno}, col {syn_err.offset}).\n"
-            "Actionable Fix: Verify balanced parentheses/quotes, and ensure you passed an expression, "
-            "not a statement (statements like 'a = 1' cannot be evaluated with eval())."
+            f"{err_type} during compilation: {comp_err}.\n"
+            "What is wrong: Python compiler encountered an internal limit or invalid character (e.g. null bytes, extreme nesting depth).\n"
+            "Fix: Verify expression does not contain null bytes or excessive nesting depth."
         )
         if as_json:
             print(json.dumps({
                 "status": "error",
                 "mode": "eval",
-                "error_type": "SyntaxError",
-                "message": syn_err.msg,
-                "line": syn_err.lineno,
-                "column": syn_err.offset,
+                "error_type": err_type,
+                "message": str(comp_err),
                 "diagnostic": diag,
-                "snippet": snippet,
             }, indent=2))
         else:
             print("=" * 80)
-            print("✗ [code-oracle: eval] SyntaxError:")
-            print(f"  Message: {syn_err.msg} (col {syn_err.offset})")
-            if snippet:
-                print("  Snippet:")
-                for line in snippet.splitlines():
-                    print(f"    {line}")
-            print(f"\n  Fix: {diag}")
+            print(f"✗ [code-oracle: eval] Compilation {err_type}: {comp_err}")
+            print(f"  Fix: {diag}")
             print("=" * 80)
         return 1
 
@@ -222,21 +286,103 @@ def run_eval(expr: str, as_json: bool = False) -> int:
         "sys": sys,
         "ast": ast,
     }
+    eval_locals: Dict[str, Any] = {}
+
+    # Set timer for timeout / infinite loop protection (2.0 seconds)
+    timer_armed = False
+    try:
+        if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
+            signal.signal(signal.SIGALRM, _eval_alarm_handler)
+            signal.setitimer(signal.ITIMER_REAL, 2.0)
+            timer_armed = True
+    except Exception:
+        pass
 
     try:
-        val = eval(compiled, eval_globals, {})
-    except Exception as exc:
+        if is_statement:
+            exec(compiled, eval_globals, eval_locals)
+            new_vars = {k: v for k, v in eval_locals.items() if not k.startswith("__")}
+            val = new_vars if new_vars else "Statements executed successfully (no return value)."
+        else:
+            val = eval(compiled, eval_globals, eval_locals)
+    except BaseException as exc:
         exc_type = type(exc).__name__
         exc_msg = str(exc)
-        action_fix = f"Runtime error during eval(): {exc_type}: {exc_msg}."
-        if exc_type == "NameError":
-            action_fix += " The identifier is not defined. Ensure you defined it or check for typos."
-        elif exc_type == "AttributeError":
-            action_fix += " The requested attribute does not exist on this object."
-        elif exc_type == "TypeError":
-            action_fix += " Check arguments and types passed to functions/operators."
-        elif exc_type == "ZeroDivisionError":
-            action_fix += " Division or modulo by zero."
+
+        # Construct highly actionable diagnostic for LLM
+        if isinstance(exc, (EvalTimeoutError, TimeoutError)):
+            exc_type = "TimeoutError"
+            action_fix = (
+                "Execution timed out. "
+                "What is wrong: An infinite loop or long-running computation was detected "
+                "(e.g. while True, unbounded loop, or recursive generator). "
+                "Fix: Verify loop termination conditions and generator bounds."
+            )
+        elif isinstance(exc, NameError):
+            missing_name = getattr(exc, "name", None)
+            if not missing_name:
+                m = re.search(r"'([^']+)'", exc_msg)
+                if m:
+                    missing_name = m.group(1)
+
+            candidates = list(eval_globals.keys()) + dir(__builtins__)
+            suggestion = ""
+            if missing_name:
+                close = difflib.get_close_matches(missing_name, candidates, n=1, cutoff=0.6)
+                if close:
+                    suggestion = f" Did you mean '{close[0]}'?"
+
+            if missing_name:
+                action_fix = (
+                    f"NameError: Identifier '{missing_name}' is not defined.{suggestion} "
+                    f"What is wrong: The variable or function '{missing_name}' does not exist in the evaluation scope. "
+                    f"Fix: Define '{missing_name}' before referencing it, check for typos, or verify if it requires "
+                    f"importing a module (e.g. math, sys, os, json)."
+                )
+            else:
+                action_fix = (
+                    f"NameError: {exc_msg}. "
+                    "What is wrong: An identifier was referenced before being defined. "
+                    "Fix: Check for misspelled variable or function names, or import the required module."
+                )
+        elif isinstance(exc, MemoryError):
+            action_fix = (
+                "MemoryError: Out of memory during expression evaluation. "
+                "What is wrong: The expression attempted to allocate more memory than available. "
+                "Fix: Reduce data structure size or use iterators/generators instead of large lists."
+            )
+        elif isinstance(exc, RecursionError):
+            action_fix = (
+                "RecursionError: Maximum recursion depth exceeded. "
+                "What is wrong: Unbounded or excessively deep recursion was detected. "
+                "Fix: Add or check recursive base cases to ensure recursion terminates."
+            )
+        elif isinstance(exc, ZeroDivisionError):
+            action_fix = (
+                "ZeroDivisionError: Division or modulo by zero. "
+                "What is wrong: An arithmetic operation divided by zero. "
+                "Fix: Add a check for zero before dividing or handle denominator == 0."
+            )
+        elif isinstance(exc, TypeError):
+            action_fix = (
+                f"TypeError: {exc_msg}. "
+                "What is wrong: An invalid type or argument count was passed to an operation or function. "
+                "Fix: Verify argument types and function signatures."
+            )
+        elif isinstance(exc, AttributeError):
+            action_fix = (
+                f"AttributeError: {exc_msg}. "
+                "What is wrong: The requested attribute or method does not exist on this object. "
+                "Fix: Check attribute names with dir() or check for typos."
+            )
+        elif isinstance(exc, SystemExit):
+            action_fix = (
+                "SystemExit: Expression attempted to exit the Python process. "
+                "What is wrong: sys.exit() was called during evaluation. "
+                "Fix: Do not call sys.exit() inside an evaluated expression."
+            )
+        else:
+            action_fix = f"Runtime error during eval(): {exc_type}: {exc_msg}."
 
         if as_json:
             print(json.dumps({
@@ -253,6 +399,13 @@ def run_eval(expr: str, as_json: bool = False) -> int:
             print(f"  Fix:     {action_fix}")
             print("=" * 80)
         return 1
+    finally:
+        if timer_armed:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            except Exception:
+                pass
 
     val_type = type(val).__name__
     val_repr = repr(val)
@@ -350,6 +503,25 @@ def parse_sgr_params(params_str: str) -> List[str]:
 
 def run_hex(input_val: str, as_json: bool = False) -> int:
     """Hex dump and escape sequence inspector."""
+    stripped_val = input_val.strip()
+    if stripped_val and "\n" not in stripped_val and len(stripped_val) < 256:
+        p = pathlib.Path(stripped_val)
+        if (p.suffix in (".txt", ".log", ".dat", ".bin", ".out", ".diff", ".patch", ".raw") or "/" in stripped_val) and not p.exists():
+            err_msg = f"File '{stripped_val}' not found."
+            diag = (
+                f"File '{stripped_val}' does not exist on disk.\n"
+                "What is wrong: Specified file path could not be located.\n"
+                "Fix: Check file path relative to workspace or pass text directly: python3 oracle.py --hex $'\\x1b[31mText\\x1b[0m'"
+            )
+            if as_json:
+                print(json.dumps({"status": "error", "mode": "hex", "error_type": "FileNotFoundError", "error": err_msg, "diagnostic": diag}, indent=2))
+            else:
+                print("=" * 80)
+                print(f"✗ [code-oracle: hex] {err_msg}")
+                print(f"  {diag}")
+                print("=" * 80)
+            return 1
+
     text = read_input_text(input_val)
     raw_bytes = text.encode("utf-8")
 
@@ -457,7 +629,6 @@ def run_hex(input_val: str, as_json: bool = False) -> int:
 
     # Diagnostics
     diagnostics: List[str] = []
-    # Check if ANSI formatting was left unclosed
     has_sgr = any("SGR" in s["kind"] for s in ansi_sequences)
     has_reset = any("0" in s["raw"] or "Reset" in " ".join(s["details"]) for s in ansi_sequences)
     if has_sgr and not has_reset:
@@ -466,7 +637,6 @@ def run_hex(input_val: str, as_json: bool = False) -> int:
             "Colors or styles will bleed into subsequent terminal output or test runners."
         )
 
-    # Check for lone CR
     lone_cr = [sc for sc in special_chars if "Lone CR" in sc["note"]]
     if lone_cr:
         diagnostics.append(
@@ -474,7 +644,6 @@ def run_hex(input_val: str, as_json: bool = False) -> int:
             "In terminals, lone \\r moves the cursor to column 0 and overwrites previous text."
         )
 
-    # Check for invisible zero-width chars
     zw_chars = [sc for sc in special_chars if "Zero-Width" in sc["note"]]
     if zw_chars:
         diagnostics.append(
@@ -499,8 +668,10 @@ def run_hex(input_val: str, as_json: bool = False) -> int:
         print("✓ [code-oracle: hex] Hex Dump & Escape Sequence Inspection:")
         print(f"  Total Bytes : {len(raw_bytes)} | Total Characters: {len(text)}")
         print("\n--- HEX DUMP ---")
-        for line in hex_dump_lines:
+        for line in hex_dump_lines[:64]:
             print(line)
+        if len(hex_dump_lines) > 64:
+            print(f"  ... and {len(hex_dump_lines) - 64} more line(s) ({len(raw_bytes) - 1024} bytes; pass --json to view full dump)")
 
         if ansi_sequences:
             print(f"\n--- ANSI ESCAPE SEQUENCES ({len(ansi_sequences)} found) ---")
@@ -553,16 +724,7 @@ def get_char_display_width(ch: str) -> int:
 
 
 def calculate_terminal_cells(text: str) -> Tuple[int, List[Dict[str, Any]]]:
-    """Calculate exact monospaced terminal columns and character-by-character breakdown.
-    
-    Handles:
-    - ANSI escape sequence stripping (width 0)
-    - CJK East Asian Width (W/F = 2 cells)
-    - Combining characters (width 0)
-    - ZWJ sequences (sequences joined by \\u200d render as a single glyph of width 2)
-    - Variation selector \\ufe0f emoji presentation
-    """
-    # First, record ANSI sequences so they contribute 0 display width
+    """Calculate exact monospaced terminal columns and character-by-character breakdown."""
     clean_text = ANSI_RE.sub("", text)
 
     breakdown: List[Dict[str, Any]] = []
@@ -657,25 +819,46 @@ def run_width(input_val: str, as_json: bool = False) -> int:
     utf16_units = len(text.encode("utf-16-le")) // 2
     columns, breakdown = calculate_terminal_cells(text)
 
-    # Actionable diagnostic if columns != code_points
+    # Actionable character-level diagnostics if columns != code_points
     diagnostics: List[str] = []
+    char_explanations: List[str] = []
     if columns != code_points:
         reasons: List[str] = []
-        wide_count = sum(1 for b in breakdown if b["cell_width"] == 2)
-        zero_count = sum(1 for b in breakdown if b["cell_width"] == 0)
-        ansi_count = len(ANSI_RE.findall(text))
+        wide_items = [b for b in breakdown if b["cell_width"] == 2]
+        zero_items = [b for b in breakdown if b["cell_width"] == 0]
+        ansi_matches = list(ANSI_RE.finditer(text))
 
-        if wide_count:
-            reasons.append(f"{wide_count} wide character(s) (CJK/emoji = 2 cells)")
-        if zero_count:
-            reasons.append(f"{zero_count} zero-width / combining / ZWJ character(s) (0 cells)")
-        if ansi_count:
-            reasons.append(f"{ansi_count} ANSI escape sequence(s) (stripped in display = 0 cells)")
+        if wide_items:
+            reasons.append(f"{len(wide_items)} wide character(s) (CJK/emoji = 2 cells)")
+            for item in wide_items[:10]:
+                char_explanations.append(
+                    f"Character {item['char']} ({item['codepoint']}) occupies 2 terminal cells, whereas len() is 1."
+                )
+            if len(wide_items) > 10:
+                char_explanations.append(f"... and {len(wide_items) - 10} more wide character(s)")
+
+        if zero_items:
+            reasons.append(f"{len(zero_items)} zero-width / combining / ZWJ character(s) (0 cells)")
+            for item in zero_items[:10]:
+                char_explanations.append(
+                    f"Character {item['char']} ({item['codepoint']}) occupies 0 terminal cells, whereas len() is 1."
+                )
+            if len(zero_items) > 10:
+                char_explanations.append(f"... and {len(zero_items) - 10} more zero-width character(s)")
+
+        if ansi_matches:
+            reasons.append(f"{len(ansi_matches)} ANSI escape sequence(s) (stripped in display = 0 cells)")
+            for m in ansi_matches[:5]:
+                esc_str = m.group(0)
+                char_explanations.append(
+                    f"ANSI escape sequence {repr(esc_str)} occupies 0 terminal cells, whereas len() is {len(esc_str)}."
+                )
 
         diagnostics.append(
             f"Terminal display columns ({columns}) differs from Python len() ({code_points}) due to: "
             + "; ".join(reasons) + "."
         )
+        diagnostics.extend(char_explanations)
         diagnostics.append(
             "Actionable Fix: In CLI/TUI tools (Rich, prompt_toolkit, table formatters), DO NOT use "
             "len(), str.ljust(), or str.rjust() to align columns. Use cell width (e.g. rich.cells.cell_len() "
@@ -706,10 +889,15 @@ def run_width(input_val: str, as_json: bool = False) -> int:
             print("\n--- CHARACTER / GLYPH BREAKDOWN ---")
             print(f"  {'Char':<8} {'CodePoint':<10} {'Width':<7} {'EA':<4} {'Cat':<5} {'Name / Note'}")
             print("  " + "-" * 74)
-            for item in breakdown[:50]:  # Limit output preview if very long
+            for item in breakdown[:50]:
                 print(f"  {item['char']:<8} {item['codepoint']:<10} {item['cell_width']:<7} {item['ea_width']:<4} {item['category']:<5} {item['name']} ({item['note']})")
             if len(breakdown) > 50:
                 print(f"  ... and {len(breakdown) - 50} more character(s)")
+
+        if char_explanations:
+            print("\n--- CHARACTER-LEVEL CELL WIDTH EXPLANATIONS ---")
+            for exp in char_explanations:
+                print(f"  • {exp}")
 
         if diagnostics:
             print("\n--- ACTIONABLE DIAGNOSTICS ---")
@@ -743,15 +931,23 @@ class HTMLStructureParser(HTMLParser):
         # Check attribute values for unescaped characters
         for attr_name, attr_val in attrs:
             if attr_val is not None:
-                if "<" in attr_val or ">" in attr_val:
+                if "<" in attr_val:
                     self.warnings.append({
                         "line": lineno,
                         "column": offset,
                         "kind": "UnescapedAngleBracketInAttribute",
-                        "message": f"Attribute '{attr_name}' contains raw '<' or '>': {attr_val!r}. "
-                                   "Fix: Escape as &lt; or &gt; in attribute values.",
+                        "message": f"Attribute '{attr_name}' contains raw '<': {attr_val!r}. "
+                                   "Fix: Replace '<' with '&lt;' in attribute values.",
                     })
-                # Check for raw ampersands not part of valid entity in attributes
+                if ">" in attr_val:
+                    self.warnings.append({
+                        "line": lineno,
+                        "column": offset,
+                        "kind": "UnescapedAngleBracketInAttribute",
+                        "message": f"Attribute '{attr_name}' contains raw '>': {attr_val!r}. "
+                                   "Fix: Replace '>' with '&gt;' in attribute values.",
+                    })
+                # Check for raw ampersands not part of a valid HTML entity in attributes
                 raw_amp = re.findall(r"&(?!([a-zA-Z][a-zA-Z0-9]*|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)", attr_val)
                 if raw_amp:
                     self.warnings.append({
@@ -793,16 +989,14 @@ class HTMLStructureParser(HTMLParser):
                 "line": lineno,
                 "column": offset,
                 "kind": "UnmatchedClosingTag",
-                "message": f"Found closing tag </{t}> with no corresponding opening tag.",
+                "message": f"Found closing tag </{t}> with no corresponding opening tag. Fix: Remove extra </{t}> or add opening <{t}>.",
             })
             return
 
-        # Check if top of stack matches
         top_tag, top_line, top_col = self.tag_stack[-1]
         if top_tag == t:
             self.tag_stack.pop()
         else:
-            # Check if tag is further down the stack
             stack_tags = [item[0] for item in self.tag_stack]
             if t in stack_tags:
                 idx = len(stack_tags) - 1 - stack_tags[::-1].index(t)
@@ -812,30 +1006,30 @@ class HTMLStructureParser(HTMLParser):
                     "line": lineno,
                     "column": offset,
                     "kind": "MisnestedTag",
-                    "message": f"Closing tag </{t}> closes element out of order. Unclosed inner elements: {unclosed_names}.",
+                    "message": f"Closing tag </{t}> closes element out of order. Unclosed inner elements: {unclosed_names}. Fix: Close inner elements first.",
                 })
-                # Pop down to this tag
                 self.tag_stack = self.tag_stack[:idx]
             else:
                 self.errors.append({
                     "line": lineno,
                     "column": offset,
                     "kind": "UnmatchedClosingTag",
-                    "message": f"Closing tag </{t}> does not match current open element <{top_tag} line {top_line}>.",
+                    "message": f"Closing tag </{t}> does not match current open element <{top_tag} line {top_line}>. Fix: Ensure tags are properly closed.",
                 })
 
     def handle_data(self, data: str):
         lineno, offset = self.getpos()
         if self.inside_script:
-            # Check for unescaped < or > inside script tags
             if "<" in data or ">" in data:
+                ch = "<" if "<" in data else ">"
+                esc_ch = r"\u003c" if ch == "<" else r"\u003e"
                 self.warnings.append({
                     "line": lineno,
                     "column": offset,
                     "kind": "RawScriptAngleBrackets",
-                    "message": "Raw '<' or '>' detected inside <script> block. "
-                               "Fix: In Swagger UI, Redoc, or HTML templates, escape as '\\u003c' or '\\u003e' "
-                               "to prevent script injection or premature tag termination.",
+                    "message": f"Raw '{ch}' detected inside <script> block. "
+                               f"Fix: Escape as '{esc_ch}' in templates (Swagger UI/Redoc) "
+                               "to prevent premature script termination or XSS.",
                 })
 
 
@@ -848,12 +1042,12 @@ def run_html_esc(input_val: str, as_json: bool = False) -> int:
     try:
         parser.feed(raw_html)
         parser.close()
-    except Exception as exc:
+    except BaseException as exc:
         parser.errors.append({
             "line": 1,
             "column": 1,
             "kind": "ParserFailure",
-            "message": f"HTML parser encountered exception: {exc}",
+            "message": f"HTML parser encountered exception: {exc}. Fix: Check for unbalanced quotes or malformed markup.",
         })
 
     # Check for remaining unclosed tags at EOF
@@ -863,15 +1057,15 @@ def run_html_esc(input_val: str, as_json: bool = False) -> int:
                 "line": line,
                 "column": col,
                 "kind": "UnclosedTag",
-                "message": f"Tag <{tag}> opened at line {line} col {col} was never closed before end of document.",
+                "message": f"Tag <{tag}> opened at line {line} col {col} was never closed before end of document. "
+                           f"Fix: Add closing tag </{tag}>.",
             })
 
-    # Scan for raw unescaped ampersands in text (outside valid entities)
+    # Scan for raw unescaped ampersands in text (outside valid HTML entities)
     raw_amp_pattern = re.compile(r"&(?!([a-zA-Z][a-zA-Z0-9]*|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)")
     for line_idx, line_str in enumerate(lines, 1):
         for m in raw_amp_pattern.finditer(line_str):
             col = m.start() + 1
-            # Avoid flagging if inside a tag definition handled by parser
             snippet = generate_snippet(lines, line_idx, col, context_lines=1)
             parser.errors.append({
                 "line": line_idx,
@@ -882,7 +1076,6 @@ def run_html_esc(input_val: str, as_json: bool = False) -> int:
                 "snippet": snippet,
             })
 
-    total_issues = len(parser.errors) + len(parser.warnings)
     status_passed = len(parser.errors) == 0
 
     if as_json:
@@ -902,16 +1095,21 @@ def run_html_esc(input_val: str, as_json: bool = False) -> int:
         else:
             header = "✗ [code-oracle: html-esc] HTML issues detected:" if not status_passed else "⚠ [code-oracle: html-esc] HTML warnings:"
             print(header)
-            for err in parser.errors:
+            # Cap displayed errors at 25 items to prevent flooding on giant files
+            for err in parser.errors[:25]:
                 print(f"\n  [ERROR] {err['kind']} (line {err['line']}, col {err['column']}):")
                 print(f"    {err['message']}")
                 if "snippet" in err and err["snippet"]:
                     for s_line in err["snippet"].splitlines():
                         print(f"      {s_line}")
+            if len(parser.errors) > 25:
+                print(f"\n  ... and {len(parser.errors) - 25} more error(s)")
 
-            for warn in parser.warnings:
+            for warn in parser.warnings[:25]:
                 print(f"\n  [WARN] {warn['kind']} (line {warn['line']}, col {warn['column']}):")
                 print(f"    {warn['message']}")
+            if len(parser.warnings) > 25:
+                print(f"\n  ... and {len(parser.warnings) - 25} more warning(s)")
 
             print("\nActionable Fixes for SWE Agent:")
             print("  1. Ensure every non-void opening tag has a matching closing tag.")
@@ -927,14 +1125,10 @@ def run_html_esc(input_val: str, as_json: bool = False) -> int:
 # ==============================================================================
 
 def resolve_json_pointer(root: Any, pointer: str) -> Tuple[bool, Any, str]:
-    """Resolve a local JSON Pointer against the root document.
-    
-    Returns (success, resolved_value, error_message).
-    """
+    """Resolve a local JSON Pointer against the root document."""
     if not pointer.startswith("#"):
         return False, None, f"Non-local pointer '{pointer}' (external references not resolvable offline)"
 
-    # Pointer "#" points to document root
     if pointer in ("#", "#/"):
         return True, root, ""
 
@@ -946,7 +1140,6 @@ def resolve_json_pointer(root: Any, pointer: str) -> Tuple[bool, Any, str]:
     traversed: List[str] = ["#"]
 
     for token in tokens:
-        # JSON Pointer unescaping: ~1 -> /, ~0 -> ~
         key = token.replace("~1", "/").replace("~0", "~")
         if isinstance(curr, dict):
             if key in curr:
@@ -970,15 +1163,37 @@ def resolve_json_pointer(root: Any, pointer: str) -> Tuple[bool, Any, str]:
     return True, curr, ""
 
 
+def find_all_definition_targets(root: Any) -> Dict[str, str]:
+    """Find all declared definition target names and their canonical pointer paths."""
+    targets: Dict[str, str] = {}
+    if not isinstance(root, dict):
+        return targets
+
+    if "$defs" in root and isinstance(root["$defs"], dict):
+        for name in root["$defs"].keys():
+            targets[name] = f"#/$defs/{name}"
+
+    if "definitions" in root and isinstance(root["definitions"], dict):
+        for name in root["definitions"].keys():
+            targets[name] = f"#/definitions/{name}"
+
+    if "components" in root and isinstance(root["components"], dict):
+        schemas = root["components"].get("schemas")
+        if isinstance(schemas, dict):
+            for name in schemas.keys():
+                targets[name] = f"#/components/schemas/{name}"
+
+    return targets
+
+
 def inspect_schema_tree(root: Any) -> Dict[str, Any]:
-    """Recursively inspect JSON Schema / OpenAPI structure."""
+    """Recursively inspect JSON Schema / OpenAPI structure with recursion cycle protection."""
     all_refs: List[Dict[str, Any]] = []
     dangling_refs: List[Dict[str, Any]] = []
     dialect_warnings: List[str] = []
     anyof_issues: List[Dict[str, Any]] = []
     type_health_issues: List[Dict[str, Any]] = []
 
-    # Dialect inspection: $defs vs definitions
     has_defs = "$defs" in root if isinstance(root, dict) else False
     has_definitions = "definitions" in root if isinstance(root, dict) else False
     openapi_version = root.get("openapi", "") if isinstance(root, dict) else ""
@@ -1000,27 +1215,41 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
             f"OpenAPI version is {openapi_version} (OpenAPI 3.1) but uses legacy 'definitions' instead of '$defs'."
         )
 
-    # Recursive walker
+    # Collect all available definition targets to provide exact corrected reference paths
+    known_targets = find_all_definition_targets(root)
+
+    # Cycle protection tracking object IDs
+    seen_ids: Set[int] = set()
+
     def walk(obj: Any, path: str):
+        if id(obj) in seen_ids:
+            return
+        seen_ids.add(id(obj))
+
         if isinstance(obj, dict):
             # Check $ref
-            if "$ref" in obj:
+            if "$ref" in obj and isinstance(obj["$ref"], str):
                 ref_val = obj["$ref"]
                 all_refs.append({"location": path, "target": ref_val})
                 ok, _, err_msg = resolve_json_pointer(root, ref_val)
                 if not ok:
-                    # Check if target would resolve under the alternate definitions container
+                    # Provide exact corrected reference path
+                    target_name = ref_val.rsplit("/", 1)[-1] if "/" in ref_val else ref_val.lstrip("#")
                     hint = ""
-                    if "#/definitions/" in ref_val and has_defs:
-                        alt_ref = ref_val.replace("#/definitions/", "#/$defs/")
-                        alt_ok, _, _ = resolve_json_pointer(root, alt_ref)
-                        if alt_ok:
-                            hint = f" Did you mean '{alt_ref}'? Root defines '$defs' instead of 'definitions'."
-                    elif "#/$defs/" in ref_val and has_definitions:
-                        alt_ref = ref_val.replace("#/$defs/", "#/definitions/")
-                        alt_ok, _, _ = resolve_json_pointer(root, alt_ref)
-                        if alt_ok:
-                            hint = f" Did you mean '{alt_ref}'? Root defines 'definitions' instead of '$defs'."
+                    if target_name in known_targets:
+                        correct_path = known_targets[target_name]
+                        hint = f" Did you mean '{correct_path}'? Target is defined at '{correct_path}'."
+                    else:
+                        # Case-insensitive or closest match
+                        lower_targets = {k.lower(): v for k, v in known_targets.items()}
+                        if target_name.lower() in lower_targets:
+                            correct_path = lower_targets[target_name.lower()]
+                            hint = f" Did you mean '{correct_path}' (case mismatch)?"
+                        elif known_targets:
+                            close = difflib.get_close_matches(target_name, list(known_targets.keys()), n=1, cutoff=0.5)
+                            if close:
+                                correct_path = known_targets[close[0]]
+                                hint = f" Did you mean '{correct_path}' (closest match)?"
 
                     dangling_refs.append({
                         "location": path,
@@ -1037,7 +1266,7 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
                         item_type = item.get("type")
                         if item_type == "null":
                             has_null_type = True
-                        elif item_type == "None" or item_type is None and "None" in str(item):
+                        elif item_type == "None" or (item_type is None and "None" in str(item)):
                             has_string_none = True
 
                 if has_string_none:
@@ -1138,6 +1367,33 @@ def run_schema(input_val: str, as_json: bool = False) -> int:
                 print("  Snippet:")
                 for line in snippet.splitlines():
                     print(f"    {line}")
+            print("=" * 80)
+        return 1
+
+    # Handle boolean schema (Draft 7+ valid schema)
+    if isinstance(data, bool):
+        status_str = "passed" if data else "failed"
+        msg = f"Boolean schema '{data}': all instances are {'valid' if data else 'invalid'}."
+        if as_json:
+            print(json.dumps({"status": status_str, "mode": "schema", "boolean_schema": data, "message": msg}, indent=2))
+        else:
+            print("=" * 80)
+            print(f"✓ [code-oracle: schema] {msg}")
+            print("=" * 80)
+        return 0 if data else 1
+
+    # Handle non-dict schemas cleanly without crashing
+    if not isinstance(data, dict):
+        diag = (
+            f"Invalid schema root type: {type(data).__name__}. "
+            "Standard JSON Schemas must be an object/dict (or boolean in Draft 7+).\n"
+            "Fix: Wrap definitions and properties in a top-level JSON object: { ... }."
+        )
+        if as_json:
+            print(json.dumps({"status": "error", "mode": "schema", "error": diag}, indent=2))
+        else:
+            print("=" * 80)
+            print(f"✗ [code-oracle: schema] {diag}")
             print("=" * 80)
         return 1
 
@@ -1262,7 +1518,6 @@ def check_top_level_imports(
     """Verify that top-level module imports can be resolved without side-effects."""
     unresolved: List[Dict[str, Any]] = []
 
-    # Ensure file's parent dir and workspace are in sys.path temporarily
     orig_path = list(sys.path)
     file_parent = str(file_path.parent.resolve())
     ws_str = str(workspace.resolve())
@@ -1302,7 +1557,6 @@ def check_top_level_imports(
 
             elif isinstance(node, ast.ImportFrom):
                 if node.level and node.level > 0:
-                    # Relative import: check if relative directory/module exists on disk
                     rel_dir = file_path.parent
                     for _ in range(node.level - 1):
                         rel_dir = rel_dir.parent
@@ -1400,7 +1654,6 @@ def run_syntax(target: Optional[str] = None, as_json: bool = False) -> int:
             return 1
         files_to_check = [p]
     else:
-        # Check git modified files if no explicit target provided
         files_to_check = find_git_modified_files(ws)
         if not files_to_check:
             msg = "No target file specified and no modified .py files found in git status."
@@ -1500,115 +1753,198 @@ OpenAPI/JSON Schema validation, AST syntax & import resolution) with actionable
 diagnostics for LLMs. Pure Python standard library (zero external dependencies).
 
 SUPPORTED MODES:
-  1. --eval <expr>        Safely evaluate Python expressions in the environment;
-                          outputs type, repr, len, and formatted string.
-  2. --hex <text>         Hex dump and escape sequence inspector. Decodes raw bytes,
+  1. -e, --eval <expr>    Safely evaluate Python expressions/statements with loop
+                          timeout protection; outputs type, repr, len, and formatted string.
+  2. -x, --hex <text>     Hex dump and escape sequence inspector. Decodes raw bytes,
                           ANSI CSI/SGR codes, OSC links, and invisible chars (\\r, \\u200d).
-  3. --width <text>       Calculates exact monospaced terminal display width (CJK = 2,
+  3. -w, --width <text>   Calculates exact monospaced terminal display width (CJK = 2,
                           emojis = 2, ZWJ = 2, combining = 0) vs len(text).
-  4. --html-esc <html...> Verifies HTML entity escaping (&lt;, &gt;, &amp;, quotes), tag
+  4. -H, --html-esc <htm> Verifies HTML entity escaping (&lt;, &gt;, &amp;, quotes), tag
                           matching/balance, and script tag escaping.
-  5. --schema <json/file> Inspects JSON Schema / OpenAPI structure: checks $defs vs
+  5. -s, --schema <json>  Inspects JSON Schema / OpenAPI structure: checks $defs vs
                           definitions, resolves $ref pointers, checks anyOf nullability.
-  6. --syntax <file>      Validates AST syntax (ast.parse), regexes, and checks top-level
+  6. -S, --syntax <file>  Validates AST syntax (ast.parse), regexes, and checks top-level
                           module import resolution without executing side-effects.
 
 COPY-PASTEABLE EXAMPLE COMMANDS:
   # 1. Safely evaluate an expression:
   python3 oracle.py --eval 'len("hello world")'
-  python3 oracle.py --eval 'json.dumps({"status": "ok", "items": [1, 2]})'
+  python3 oracle.py '1 + 2 * 3'  # auto-detected
 
   # 2. Inspect ANSI escapes, hex dump, or invisible characters:
   python3 oracle.py --hex $'\\x1b[31;1mError\\x1b[0m\\r\\n'
-  python3 oracle.py --hex file_with_hidden_characters.txt
+  python3 oracle.py file_with_hidden_characters.txt
 
   # 3. Calculate terminal display cell width for monospaced layouts:
   python3 oracle.py --width '👨‍👩‍👧‍👦 Family'
-  python3 oracle.py --width $'\\x1b[32mClean Output\\x1b[0m'
+  python3 oracle.py -w $'\\x1b[32mClean Output\\x1b[0m'
 
   # 4. Inspect HTML template escaping and tag balance:
   python3 oracle.py --html-esc '<div><p>Hello & welcome</p></div>'
-  python3 oracle.py --html-esc templates/swagger_ui.html
+  python3 oracle.py templates/swagger_ui.html
 
   # 5. Validate OpenAPI / JSON Schema references and dialect:
   python3 oracle.py --schema openapi.json
-  python3 oracle.py --schema '{"$defs": {"A": {"type": "string"}}, "$ref": "#/$defs/A"}'
+  python3 oracle.py '{"$defs": {"A": {"type": "string"}}, "$ref": "#/$defs/A"}'
 
   # 6. Validate AST syntax, regex lookbehinds, and top-level imports:
   python3 oracle.py --syntax rich/text.py
-  python3 oracle.py --syntax  # auto-checks modified files from git status
+  python3 oracle.py -S  # auto-checks modified files from git status
 
 ADDITIONAL OPTIONS:
-  --json                  Output results in machine-readable JSON format
+  --json, -j              Output results in machine-readable JSON format
   -h, --help              Show this help message and exit
 ================================================================================
 """
     print(overview_text)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="code-oracle: Multi-domain coding assistance oracle for SWE agents",
-        add_help=False,
-    )
-    parser.add_argument("--eval", dest="eval_expr", metavar="EXPR", help="Evaluate Python expression")
-    parser.add_argument("--hex", dest="hex_text", metavar="TEXT", help="Hex dump and escape sequence inspector")
-    parser.add_argument("--width", dest="width_text", metavar="TEXT", help="Terminal cell display width calculator")
-    parser.add_argument("--html-esc", dest="html_snippet", metavar="SNIPPET", help="HTML entity and tag inspector")
-    parser.add_argument("--schema", dest="schema_input", metavar="SCHEMA", help="JSON Schema / OpenAPI inspector")
-    parser.add_argument("--syntax", dest="syntax_target", nargs="?", const="", metavar="FILE", help="AST syntax and import checker")
-    parser.add_argument("--json", dest="as_json", action="store_true", help="Output results in JSON format")
-    parser.add_argument("-h", "--help", action="store_true", help="Show overview and help")
+def normalize_cli_args(raw_argv: List[str]) -> Tuple[Dict[str, Any], List[str]]:
+    """Normalize CLI arguments, handling forgiving flags, extra dashes, and loose options."""
+    parsed: Dict[str, Any] = {
+        "help": False,
+        "json": False,
+        "mode": None,
+        "mode_arg": None,
+    }
+    positional: List[str] = []
 
-    # Positional fallback argument for convenience
-    parser.add_argument("positional", nargs="*", help="Optional positional fallback input")
+    MODE_FLAGS = {
+        "e": "eval", "eval": "eval",
+        "x": "hex", "hex": "hex",
+        "w": "width", "width": "width",
+        "H": "html-esc", "htmlesc": "html-esc", "html-esc": "html-esc", "html": "html-esc", "html_esc": "html-esc",
+        "s": "schema", "schema": "schema",
+        "S": "syntax", "syntax": "syntax",
+    }
 
-    args = parser.parse_args()
+    i = 0
+    n = len(raw_argv)
+    while i < n:
+        token = raw_argv[i]
 
-    if args.help:
+        # Check if token is a flag
+        is_flag = token.startswith("-") and not (len(token) > 1 and token[1].isdigit()) and token != "-"
+        if is_flag:
+            flag_body = token.lstrip("-")
+            flag_val: Optional[str] = None
+            if "=" in flag_body:
+                flag_body, flag_val = flag_body.split("=", 1)
+
+            # Help
+            if flag_body in ("h", "help", "?"):
+                parsed["help"] = True
+                i += 1
+                continue
+
+            # JSON
+            if flag_body in ("j", "json"):
+                parsed["json"] = True
+                i += 1
+                continue
+
+            # Mode flags
+            if flag_body in MODE_FLAGS:
+                parsed["mode"] = MODE_FLAGS[flag_body]
+                if flag_val is not None:
+                    parsed["mode_arg"] = flag_val
+                elif i + 1 < n:
+                    next_token = raw_argv[i + 1]
+                    next_is_flag = next_token.startswith("-") and not (len(next_token) > 1 and next_token[1].isdigit()) and next_token != "-"
+                    if parsed["mode"] == "syntax" and next_is_flag:
+                        parsed["mode_arg"] = None
+                    elif not next_is_flag:
+                        parsed["mode_arg"] = next_token
+                        i += 1
+                i += 1
+                continue
+
+            # Loose / unrecognized flag: ignore gracefully rather than crashing
+            i += 1
+            continue
+
+        positional.append(token)
+        i += 1
+
+    return parsed, positional
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parsed, positional = normalize_cli_args(raw_argv)
+
+    if parsed["help"]:
         print_overview()
         return 0
 
-    as_json = args.as_json
+    as_json = parsed["json"]
+    mode = parsed["mode"]
+    mode_arg = parsed["mode_arg"]
 
-    # Mode 1: --eval
-    if args.eval_expr is not None:
-        return run_eval(args.eval_expr, as_json=as_json)
+    # If explicit mode was provided with extra positional tokens, join them gracefully
+    if mode == "eval":
+        expr = mode_arg or ""
+        if positional:
+            expr = (expr + " " + " ".join(positional)).strip()
+        return run_eval(expr, as_json=as_json)
 
-    # Mode 2: --hex
-    if args.hex_text is not None:
-        return run_hex(args.hex_text, as_json=as_json)
+    if mode == "hex":
+        text = mode_arg or ""
+        if positional:
+            text = (text + " " + " ".join(positional)).strip()
+        return run_hex(text, as_json=as_json)
 
-    # Mode 3: --width
-    if args.width_text is not None:
-        return run_width(args.width_text, as_json=as_json)
+    if mode == "width":
+        text = mode_arg or ""
+        if positional:
+            text = (text + " " + " ".join(positional)).strip()
+        return run_width(text, as_json=as_json)
 
-    # Mode 4: --html-esc
-    if args.html_snippet is not None:
-        return run_html_esc(args.html_snippet, as_json=as_json)
+    if mode == "html-esc":
+        snippet = mode_arg or ""
+        if positional:
+            snippet = (snippet + " " + " ".join(positional)).strip()
+        return run_html_esc(snippet, as_json=as_json)
 
-    # Mode 5: --schema
-    if args.schema_input is not None:
-        return run_schema(args.schema_input, as_json=as_json)
+    if mode == "schema":
+        schema_in = mode_arg or ""
+        if positional:
+            schema_in = (schema_in + " " + " ".join(positional)).strip()
+        return run_schema(schema_in, as_json=as_json)
 
-    # Mode 6: --syntax
-    if args.syntax_target is not None:
-        target = args.syntax_target if args.syntax_target != "" else None
+    if mode == "syntax":
+        target = mode_arg
+        if not target and positional:
+            target = positional[0]
         return run_syntax(target, as_json=as_json)
 
-    # Positional auto-detection if no explicit mode flag was given
-    if args.positional:
-        pos_arg = " ".join(args.positional)
+    # Positional auto-detection when no explicit mode flag was specified
+    if positional:
+        pos_arg = " ".join(positional).strip()
         p = pathlib.Path(pos_arg)
-        if pos_arg.endswith(".py") or (p.is_file() and pos_arg.endswith(".py")):
+
+        # 1. File checks
+        if pos_arg.endswith(".py") or (len(positional) == 1 and p.is_file() and pos_arg.endswith(".py")):
             return run_syntax(pos_arg, as_json=as_json)
-        elif pos_arg.endswith(".json") or (p.is_file() and pos_arg.endswith(".json")):
+        elif pos_arg.endswith(".json") or (len(positional) == 1 and p.is_file() and pos_arg.endswith(".json")):
             return run_schema(pos_arg, as_json=as_json)
-        elif pos_arg.endswith(".html") or pos_arg.endswith(".htm") or pos_arg.startswith("<"):
+        elif pos_arg.endswith(".html") or pos_arg.endswith(".htm") or (len(positional) == 1 and p.is_file() and (pos_arg.endswith(".html") or pos_arg.endswith(".htm"))):
             return run_html_esc(pos_arg, as_json=as_json)
-        else:
-            # Default to --eval if looks like an expression or show overview
-            return run_eval(pos_arg, as_json=as_json)
+
+        # 2. ANSI escape sequence detection -> --hex
+        if "\x1b" in pos_arg or "\033" in pos_arg or r"\x1b" in pos_arg or r"\033" in pos_arg or ANSI_RE.search(pos_arg):
+            return run_hex(pos_arg, as_json=as_json)
+
+        # 3. HTML tag / snippet detection -> --html-esc
+        if pos_arg.startswith("<") or re.search(r"</?[a-zA-Z][^>]*>", pos_arg):
+            return run_html_esc(pos_arg, as_json=as_json)
+
+        # 4. JSON Schema string detection -> --schema
+        if pos_arg.startswith("{") and any(k in pos_arg for k in ('"$defs"', '"definitions"', '"openapi"', '"$schema"', '"properties"', '"type"')):
+            return run_schema(pos_arg, as_json=as_json)
+
+        # 5. Default: Python expression / statements -> --eval
+        return run_eval(pos_arg, as_json=as_json)
 
     # Empty invocation: print clean overview and exit 0
     print_overview()

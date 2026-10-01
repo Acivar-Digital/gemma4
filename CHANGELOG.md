@@ -2,7 +2,36 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01 (5-Skill Architecture: Code-Oracle, Test-Gate, Repro-Check Deep Diagnostics)
+## [Unreleased] - 2026-10-01 (5-Skill Hardening & Resilience Audit: Omnivorous CLI, Loop Immunity, Actionable Diagnostics)
+
+### 5-Skill Hardening & Full Resilience Audit (projects-yr2, projects-2cl, projects-805, projects-fai, projects-7k5)
+- **`skills/code-map` (`projects-yr2`)**:
+  - *Omnivorous CLI*: Added seamless positional argument auto-detection (`map.py <dir>` -> directory outline, `map.py <file>` -> file symbols, `map.py <symbol>` -> definition/caller/callee tracer). Supports short/long flag aliases (`-s`, `-f`, `-d`, `-t`, `--callers`, `--callees`, `--overview`).
+  - *Crash & Loop Immunity*: Protected against circular symlinks, inode collision loops, and unbounded AST depth with recursion guards. Catches `SyntaxError` and invalid UTF-8 files cleanly without raw tracebacks.
+  - *Actionable Diagnostics*: When symbols or files are not found, provides fuzzy candidate suggestions (`difflib`) with exact file paths, line numbers, and copy-pasteable follow-up queries.
+  - *Verification*: `test_code_map_gauntlet.py` expanded to 10/10 tests passing (exit 0). `map.py` and `scripts/map.py` byte-identical.
+- **`skills/fast-grep` (`projects-2cl`)**:
+  - *Omnivorous CLI*: Added positional search syntax (`grep.py <pattern> [path]`). Raw regex error immunity: invalid or unescaped regex patterns (e.g. `def foo(`, dangling quantifiers) automatically fall back to literal substring search with a gentle notification rather than dying with `re.error`.
+  - *Crash & Loop Immunity*: Hard bounds on file size (500KB) and lines per file (5,000 lines), line scan limit (1,000 chars) to prevent ReDoS, binary file null-byte detection, and result capping (50 ranked items, 15 previews) to prevent LLM context flooding.
+  - *Actionable Diagnostics*: On 0 matches, automatically checks case-insensitive matches (`💡 0 exact matches, but N matches exist with -i / --ignore-case!`), warns if path filter was too narrow with matches found elsewhere in workspace, and suggests closest token candidates.
+  - *Verification*: `test_fast_grep_gauntlet.py` passes 9/9 tests (exit 0). `grep.py` and `scripts/grep.py` byte-identical.
+- **`skills/code-oracle` (`projects-805`)**:
+  - *Omnivorous CLI*: Positional auto-routing: expressions/statements -> `--eval`, `.json`/schema strings -> `--schema`, `.py` files -> `--syntax`, ANSI strings -> `--hex`, HTML snippets -> `--html-esc`. Unquoted multi-token arguments (`1 + 2 * 3`) concatenated cleanly without argument parsing failures.
+  - *Crash & Loop Immunity*: Configurable 2.0s timeout via `setitimer` to terminate runaway `while True` loops and infinite generators in `--eval`. Traps `BaseException`, `RecursionError`, `MemoryError`, and `SystemExit` cleanly. Cyclic `$ref` resolution protected against recursion blowup.
+  - *Actionable Diagnostics*: Extracted missing names in `NameError` with definition tips. Dangling `$ref` inspection maps all defined components across `$defs`, `definitions`, and `components/schemas` to provide exact replacement suggestions. Terminal width explanations detail character-level cell discrepancies.
+  - *Verification*: `test_code_oracle.py` expanded to 13/13 tests passing (exit 0). `oracle.py` and `scripts/oracle.py` byte-identical.
+- **`skills/repro-check` (`projects-fai`)**:
+  - *Omnivorous CLI*: Accepts raw code positional arguments, `--code`, `--b64`, file paths, and stdin pipes. Robust multi-pass stripper removes markdown code fences (` ```python...``` `), triple quotes (`"""..."""`, `'''...'''`), and escaped JSON quotes.
+  - *Crash & Loop Immunity*: Subprocess execution timeout (15s default, configurable) running in dedicated process groups; terminates hanging processes cleanly via `os.killpg(os.getpgid(pid), signal.SIGKILL)` and outputs clean timeout diagnostics. AST pre-parse syntax checking displays clean caret pointers without raw tracebacks.
+  - *Actionable Diagnostics*: Deep assertion dissection for strings (hex byte divergence, CRLF vs LF, ANSI escape decodes), dicts/JSON (missing/extra keys, value differences), and sequences. Emits `💡 ROOT CAUSE HINT FOR LLM:` with concrete fix guidance.
+  - *Verification*: `test_repro_check_diagnostics.py` expanded to 10/10 tests passing (exit 0). `check.py` and `scripts/check.py` byte-identical.
+- **`skills/test-gate` (`projects-7k5`)**:
+  - *Omnivorous CLI*: Positional routing: `gate.py` (smart default: runs blast regression if files modified; shows status if clean), `gate.py diff`, `gate.py blast`, `gate.py status`, `gate.py <file>` (targets specific file). Forgiving flags and conversational filler words accepted cleanly.
+  - *Crash & Loop Immunity*: Per-file pytest execution timeout (default 60s) prevents hanging test fixtures. Safe diff truncation: diffs >500 lines or >50KB are truncated cleanly with file-by-file summary and total line counts to prevent context blowout. Non-git repositories and uncommitted binary files handled cleanly.
+  - *Actionable Diagnostics*: Emits prominent `🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE` warning with `git checkout -- <file>` instructions when any test file is touched. Detailed test failure summaries output exact failing test IDs, lines, statement, and cleaned tracebacks.
+  - *Verification*: `test_test_gate.py` passes 9/9 tests (exit 0). `gate.py` and `scripts/gate.py` byte-identical.
+
+## [2026-10-01] - 5-Skill Architecture Baseline
 
 ### 5-Skill Architecture: Code-Oracle, Test-Gate, Repro-Check & Integration (projects-57i, projects-x9g, projects-rdn, projects-6x4)
 - **Built `skills/code-oracle` (`projects-57i`)**:
