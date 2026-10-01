@@ -10,8 +10,34 @@ backups/
 *.whl
 *.tar.gz
 *.tar
+
+# Secrets, Credentials & Private Keys (Strict Security Guardrail)
+*.env
+*.env.*
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*id_rsa*
+*id_ed25519*
+*credentials*
+*secret*
+kaggle.json
+*.token
+*.token.json
+.beads/
+asus_vpn/
+
+# Bytecode & Caches
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .pytest_cache/
 .DS_Store
+*.log
+.ipynb_checkpoints/
+venv/
+.venv/
+env/
 test.txt
