@@ -110,6 +110,11 @@ class AssertionDiagnostic(BaseModel):
     expected_length: Optional[int] = Field(default=None, description="Length of expected value if applicable")
     char_diff: Optional[str] = Field(default=None, description="Character-by-character or unified diff")
     first_diff_index: Optional[int] = Field(default=None, description="First index where values differ")
+    divergence_detail: Optional[str] = Field(default=None, description="Exact divergence detail with hex characters")
+    escape_breakdown: Optional[str] = Field(default=None, description="Decoded ANSI escape sequences and control characters")
+    dict_diff_summary: Optional[str] = Field(default=None, description="Detailed dictionary diff summary")
+    sequence_diff_summary: Optional[str] = Field(default=None, description="Detailed sequence diff summary")
+    root_cause_hint: Optional[str] = Field(default=None, description="Actionable root cause hint for LLM")
     message: Optional[str] = Field(default=None, description="Assertion failure message")
     explanation: str = Field(..., description="Plain-English explanation of why assertion failed")
     remediation_hint: Optional[str] = Field(default=None, description="Actionable remediation hint for common defects")
@@ -300,6 +305,279 @@ def extract_call_stack(exc: BaseException) -> List[StackFrameInfo]:
     return frames
 
 
+# =============================================================================
+# ANSI & Control Sequence Decoding
+# =============================================================================
+
+ANSI_CSI_RE = re.compile(r"\x1b\[([0-9;]*)([a-zA-Z])")
+ANSI_OSC_RE = re.compile(r"\x1b\]([^\x07\x1b]*)(?:\x07|\x1b\\)")
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]"
+)
+
+SGR_CODES: Dict[str, str] = {
+    "0": "Reset / Normal",
+    "1": "Bold",
+    "2": "Dim / Faint",
+    "3": "Italic",
+    "4": "Underline",
+    "5": "Slow Blink",
+    "6": "Rapid Blink",
+    "7": "Invert / Reverse video",
+    "8": "Concealed / Hidden",
+    "9": "Strikethrough / Crossed-out",
+    "22": "Normal intensity",
+    "23": "Not italic",
+    "24": "Not underlined",
+    "27": "Not inverted",
+    "28": "Reveal (not concealed)",
+    "29": "Not crossed out",
+    "30": "Black text",
+    "31": "Red text",
+    "32": "Green text",
+    "33": "Yellow text",
+    "34": "Blue text",
+    "35": "Magenta text",
+    "36": "Cyan text",
+    "37": "White text",
+    "39": "Default text color",
+    "40": "Black background",
+    "41": "Red background",
+    "42": "Green background",
+    "43": "Yellow background",
+    "44": "Blue background",
+    "45": "Magenta background",
+    "46": "Cyan background",
+    "47": "White background",
+    "49": "Default background color",
+    "90": "Bright Black / Dark Gray text",
+    "91": "Bright Red text",
+    "92": "Bright Green text",
+    "93": "Bright Yellow text",
+    "94": "Bright Blue text",
+    "95": "Bright Magenta text",
+    "96": "Bright Cyan text",
+    "97": "Bright White text",
+    "100": "Bright Black background",
+    "101": "Bright Red background",
+    "102": "Bright Green background",
+    "103": "Bright Yellow background",
+    "104": "Bright Blue background",
+    "105": "Bright Magenta background",
+    "106": "Bright Cyan background",
+    "107": "Bright White background",
+}
+
+CONTROL_CHAR_NAMES: Dict[int, str] = {
+    0x00: "NUL (null byte)",
+    0x01: "SOH (start of heading)",
+    0x02: "STX (start of text)",
+    0x03: "ETX (end of text)",
+    0x04: "EOT (end of transmission)",
+    0x05: "ENQ (enquiry)",
+    0x06: "ACK (acknowledge)",
+    0x07: "BEL (bell / alert)",
+    0x08: "BS (backspace)",
+    0x09: "HT (horizontal tab)",
+    0x0A: "LF (line feed / newline)",
+    0x0B: "VT (vertical tab)",
+    0x0C: "FF (form feed)",
+    0x0D: "CR (carriage return)",
+    0x0E: "SO (shift out)",
+    0x0F: "SI (shift in)",
+    0x10: "DLE (data link escape)",
+    0x11: "DC1 (device control 1)",
+    0x12: "DC2 (device control 2)",
+    0x13: "DC3 (device control 3)",
+    0x14: "DC4 (device control 4)",
+    0x15: "NAK (negative acknowledge)",
+    0x16: "SYN (synchronous idle)",
+    0x17: "ETB (end of trans block)",
+    0x18: "CAN (cancel)",
+    0x19: "EM (end of medium)",
+    0x1A: "SUB (substitute)",
+    0x1B: "ESC (escape)",
+    0x1C: "FS (file separator)",
+    0x1D: "GS (group separator)",
+    0x1E: "RS (record separator)",
+    0x1F: "US (unit separator)",
+    0x7F: "DEL (delete)",
+    0x200B: "Zero-Width Space",
+    0x200C: "Zero-Width Non-Joiner",
+    0x200D: "Zero-Width Joiner",
+    0x200E: "Left-to-Right Mark",
+    0x200F: "Right-to-Left Mark",
+    0xFEFF: "Zero-Width No-Break Space / BOM",
+    0x00A0: "Non-Breaking Space",
+    0x2028: "Line Separator",
+    0x2029: "Paragraph Separator",
+}
+
+
+def decode_ansi_sequence(seq: str) -> str:
+    """Decode an ANSI escape sequence into a human-readable description."""
+    m_csi = ANSI_CSI_RE.fullmatch(seq)
+    if m_csi:
+        params, cmd = m_csi.group(1), m_csi.group(2)
+        if cmd == "m":
+            if not params or params == "0":
+                return f"ANSI CSI SGR {seq[2:]}: Reset / Normal"
+            param_list = params.split(";")
+            meanings = []
+            skip_next = 0
+            for i, p in enumerate(param_list):
+                if skip_next > 0:
+                    skip_next -= 1
+                    continue
+                if p in ("38", "48") and i + 1 < len(param_list):
+                    mode = param_list[i + 1]
+                    target = "text" if p == "38" else "background"
+                    if mode == "5" and i + 2 < len(param_list):
+                        color_idx = param_list[i + 2]
+                        meanings.append(f"256-color {target} #{color_idx}")
+                        skip_next = 2
+                        continue
+                    elif mode == "2" and i + 4 < len(param_list):
+                        r, g, b = param_list[i + 2 : i + 5]
+                        meanings.append(f"RGB {target} ({r},{g},{b})")
+                        skip_next = 4
+                        continue
+                desc = SGR_CODES.get(p, f"code {p}")
+                meanings.append(desc)
+            return f"ANSI CSI SGR {seq[2:]}: {', '.join(meanings)}"
+        elif cmd == "K":
+            mode = params or "0"
+            k_map = {
+                "0": "Clear line from cursor to end",
+                "1": "Clear line from cursor to start",
+                "2": "Clear entire line",
+            }
+            return f"ANSI CSI {seq[2:]}: {k_map.get(mode, 'Clear line')}"
+        elif cmd == "J":
+            mode = params or "0"
+            j_map = {
+                "0": "Clear screen from cursor to end",
+                "1": "Clear screen from cursor to start",
+                "2": "Clear entire screen",
+            }
+            return f"ANSI CSI {seq[2:]}: {j_map.get(mode, 'Clear display')}"
+        elif cmd in ("H", "f"):
+            pos = params or "1;1"
+            return f"ANSI CSI {seq[2:]}: Move cursor to row;col {pos}"
+        elif cmd == "A":
+            return f"ANSI CSI {seq[2:]}: Move cursor up {params or 1} lines"
+        elif cmd == "B":
+            return f"ANSI CSI {seq[2:]}: Move cursor down {params or 1} lines"
+        elif cmd == "C":
+            return f"ANSI CSI {seq[2:]}: Move cursor right {params or 1} cols"
+        elif cmd == "D":
+            return f"ANSI CSI {seq[2:]}: Move cursor left {params or 1} cols"
+        else:
+            return f"ANSI CSI command '{cmd}' (params: {params or 'none'})"
+
+    m_osc = ANSI_OSC_RE.fullmatch(seq)
+    if m_osc:
+        content = m_osc.group(1)
+        if content.startswith("0;"):
+            return f"ANSI OSC 0: Set window title '{content[2:]}'"
+        elif content.startswith("8;;"):
+            return f"ANSI OSC 8: Hyperlink '{content[3:]}'"
+        return f"ANSI OSC: '{content}'"
+
+    return f"ANSI escape sequence: {repr(seq)}"
+
+
+def scan_escape_and_control_codes(s: str) -> List[Tuple[int, str, str]]:
+    """Scan string for ANSI escape sequences and control characters.
+
+    Returns list of (char_index, raw_repr, description).
+    """
+    results: List[Tuple[int, str, str]] = []
+    covered_spans: List[Tuple[int, int]] = []
+
+    # 1. Match ANSI sequences
+    for m in ANSI_ESCAPE_RE.finditer(s):
+        start, end = m.span()
+        seq = m.group(0)
+        desc = decode_ansi_sequence(seq)
+        results.append((start, repr(seq), desc))
+        covered_spans.append((start, end))
+
+    # 2. Match control characters outside covered spans
+    for i, c in enumerate(s):
+        in_span = any(start <= i < end for start, end in covered_spans)
+        if in_span:
+            continue
+        cp = ord(c)
+        if cp in CONTROL_CHAR_NAMES:
+            name = CONTROL_CHAR_NAMES[cp]
+            results.append((i, repr(c), f"Control char 0x{cp:02x}: {name}"))
+        elif cp < 32 and c not in ("\n", "\t"):
+            results.append((i, repr(c), f"Control char 0x{cp:02x}: non-printable"))
+        elif 127 <= cp <= 159:
+            results.append((i, repr(c), f"Control char 0x{cp:02x}: C1 control code"))
+
+    results.sort(key=lambda x: x[0])
+    return results
+
+
+def format_escape_breakdown(actual: str, expected: str) -> Optional[str]:
+    """Generate human-readable escape and control sequence breakdown."""
+    act_codes = scan_escape_and_control_codes(actual)
+    exp_codes = scan_escape_and_control_codes(expected)
+
+    if not act_codes and not exp_codes:
+        return None
+
+    lines = ["📟 ANSI & CONTROL ESCAPE BREAKDOWN:"]
+
+    lines.append(f"  Actual ({len(act_codes)} code(s) detected):")
+    if act_codes:
+        for idx, raw_rep, desc in act_codes:
+            lines.append(f"    - Index {idx:3d}: {raw_rep} -> {desc}")
+    else:
+        lines.append("    (None - plain text, no escape or control sequences)")
+
+    lines.append(f"  Expected ({len(exp_codes)} code(s) detected):")
+    if exp_codes:
+        for idx, raw_rep, desc in exp_codes:
+            lines.append(f"    - Index {idx:3d}: {raw_rep} -> {desc}")
+    else:
+        lines.append("    (None - plain text, no escape or control sequences)")
+
+    return "\n".join(lines)
+
+
+def compute_string_divergence(actual: str, expected: str) -> Tuple[Optional[int], str]:
+    """Find character index of first divergence and format exact diagnostic."""
+    min_len = min(len(actual), len(expected))
+    for i in range(min_len):
+        if actual[i] != expected[i]:
+            c_a = actual[i]
+            c_e = expected[i]
+            diff_msg = (
+                f"Diff at index {i}: actual={c_a!r} (hex: {hex(ord(c_a))}) vs expected={c_e!r} (hex: {hex(ord(c_e))})"
+            )
+            return i, diff_msg
+
+    if len(actual) < len(expected):
+        first_diff = len(actual)
+        c_e = expected[first_diff]
+        diff_msg = (
+            f"Diff at index {first_diff}: actual string ended (length {len(actual)}) vs expected={c_e!r} (hex: {hex(ord(c_e))})"
+        )
+        return first_diff, diff_msg
+    elif len(actual) > len(expected):
+        first_diff = len(expected)
+        c_a = actual[first_diff]
+        diff_msg = (
+            f"Diff at index {first_diff}: actual={c_a!r} (hex: {hex(ord(c_a))}) vs expected string ended (length {len(expected)})"
+        )
+        return first_diff, diff_msg
+
+    return None, "Strings are identical"
+
+
 def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
     """Generate targeted remediation hint for common string and boundary defects."""
     if not isinstance(actual, str) or not isinstance(expected, str):
@@ -328,6 +606,121 @@ def get_string_remediation_hint(actual: Any, expected: Any) -> Optional[str]:
 
 
 compute_assertion_remediation_hint = get_string_remediation_hint
+
+
+def generate_root_cause_hint(
+    actual: Any,
+    op: str,
+    expected: Any,
+    first_diff_idx: Optional[int] = None,
+) -> str:
+    """Generate clear, actionable root cause hint for the LLM."""
+    if isinstance(actual, str) and isinstance(expected, str):
+        act_has_ansi = bool(ANSI_ESCAPE_RE.search(actual))
+        exp_has_ansi = bool(ANSI_ESCAPE_RE.search(expected))
+
+        if act_has_ansi and not exp_has_ansi:
+            return (
+                "Actual string contains ANSI styling/escape codes that are absent from expected. "
+                "If plain text was expected, strip ANSI escapes (e.g. using strip_ansi(), Text.plain, "
+                "or re.sub(r'\\x1b\\[[0-9;]*[a-zA-Z]', '', text)). "
+                "If styled output was expected, update the assertion or expected string with matching ANSI codes."
+            )
+        elif exp_has_ansi and not act_has_ansi:
+            return (
+                "Expected string contains ANSI styling/escape codes that are missing from actual output. "
+                "Ensure terminal styling, color formatting, or highlighter is enabled and invoked."
+            )
+        elif act_has_ansi and exp_has_ansi:
+            idx_str = f" at index {first_diff_idx}" if first_diff_idx is not None else ""
+            return (
+                f"ANSI escape sequences differ{idx_str}. "
+                "Check the exact style tags, color parameter numbers, or reset codes in the formatting pipeline."
+            )
+
+        # Check trailing whitespace or newline differences
+        if actual.rstrip() == expected.rstrip():
+            return (
+                "String mismatch is caused by trailing newline or whitespace differences. "
+                "Verify rstrip(), strip(), or newline emission logic."
+            )
+
+        # Line count mismatch
+        if actual.count("\n") != expected.count("\n"):
+            return (
+                f"Line count mismatch (actual has {actual.count('\n')} newlines, "
+                f"expected has {expected.count('\n')}). "
+                "Check for dropped empty lines, delimiter parsing, or splitlines() handling."
+            )
+
+        # Boundary empty string
+        if (actual == "" and expected != "") or (actual != "" and expected == ""):
+            return (
+                "Boundary value mismatch (empty string vs non-empty string). "
+                "Verify edge-case handling for empty or boundary inputs."
+            )
+
+        # General string difference
+        idx_str = f" at index {first_diff_idx}" if first_diff_idx is not None else ""
+        c_a = actual[first_diff_idx] if first_diff_idx is not None and first_diff_idx < len(actual) else "ended"
+        c_e = expected[first_diff_idx] if first_diff_idx is not None and first_diff_idx < len(expected) else "ended"
+        return (
+            f"Strings diverge{idx_str} (actual={c_a!r} vs expected={c_e!r}). "
+            "Verify character formatting, escaping, or string manipulation around this position."
+        )
+
+    if isinstance(actual, dict) and isinstance(expected, dict):
+        missing_keys = [k for k in expected if k not in actual]
+        extra_keys = [k for k in actual if k not in expected]
+        common_keys = [k for k in actual if k in expected]
+        val_diff_keys = [k for k in common_keys if actual[k] != expected[k]]
+
+        hints = []
+        if missing_keys:
+            hints.append(f"missing expected key(s): {missing_keys}")
+        if extra_keys:
+            hints.append(f"unexpected extra key(s): {extra_keys}")
+        if val_diff_keys:
+            hints.append(f"differing values for key(s): {val_diff_keys}")
+
+        hint_desc = "; ".join(hints) if hints else "dictionary contents differ"
+        return (
+            f"Dictionary mismatch ({hint_desc}). "
+            "Check dictionary construction, field serialization, or schema mapping logic."
+        )
+
+    if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        if len(actual) != len(expected):
+            return (
+                f"Sequence length mismatch: actual has {len(actual)} items, expected has {len(expected)}. "
+                "Check loop iteration, filtering conditions, or item appending logic."
+            )
+        idx_str = f" at index {first_diff_idx}" if first_diff_idx is not None else ""
+        return (
+            f"Sequence elements differ{idx_str}. "
+            "Verify item construction, sorting order, or transformation logic at this position."
+        )
+
+    if type(actual) is not type(expected):
+        return (
+            f"Type mismatch: actual is of type '{type(actual).__name__}' but expected '{type(expected).__name__}'. "
+            "Check function return type or explicit type casting."
+        )
+
+    if isinstance(actual, (int, float, complex)) and isinstance(expected, (int, float, complex)):
+        try:
+            diff = actual - expected
+            return (
+                f"Numeric value mismatch: actual is {actual}, expected is {expected} (difference: {diff:+}). "
+                "Verify calculation, rounding, or offset logic."
+            )
+        except Exception:
+            pass
+
+    return (
+        f"Assertion condition '{op}' failed between actual and expected values. "
+        "Inspect the logic computing the actual value to ensure it matches expected criteria."
+    )
 
 
 def explain_string_diff(actual: str, expected: str) -> Tuple[str, Optional[int]]:
@@ -374,7 +767,7 @@ def explain_string_diff(actual: str, expected: str) -> Tuple[str, Optional[int]]
         summary = (
             f"MISMATCH: Actual string ({act_short}, {len(actual)} chars) differs from "
             f"Expected string ({exp_short}, {len(expected)} chars) at index {first_diff}. "
-            f"Actual has {repr(c_act)} (ASCII {ord(c_act)}), Expected has {repr(c_exp)} (ASCII {ord(c_exp)}){case_note}."
+            f"Actual has {repr(c_act)} (hex: {hex(ord(c_act))}), Expected has {repr(c_exp)} (hex: {hex(ord(c_exp))}){case_note}."
         )
         return summary, first_diff
 
@@ -410,59 +803,187 @@ def generate_string_char_diff(actual: str, expected: str, first_diff_idx: Option
             c_act = actual[first_diff_idx]
             c_exp = expected[first_diff_idx]
             diff_lines.append(
-                f"  index {first_diff_idx}: Actual has {repr(c_act)} (ASCII {ord(c_act)}), "
-                f"Expected has {repr(c_exp)} (ASCII {ord(c_exp)})"
+                f"  Diff at index {first_diff_idx}: actual={c_act!r} (hex: {hex(ord(c_act))}) vs expected={c_exp!r} (hex: {hex(ord(c_exp))})"
             )
         elif first_diff_idx == len(actual) and len(actual) < len(expected):
-            missing_part = expected[len(actual):]
+            c_exp = expected[first_diff_idx]
             diff_lines.append(
-                f"  index {first_diff_idx}: Actual string ends early; "
-                f"Expected continues with {repr(missing_part)}"
+                f"  Diff at index {first_diff_idx}: actual string ended (length {len(actual)}) vs expected={c_exp!r} (hex: {hex(ord(c_exp))})"
             )
         elif first_diff_idx == len(expected) and len(actual) > len(expected):
-            extra_part = actual[len(expected):]
+            c_act = actual[first_diff_idx]
             diff_lines.append(
-                f"  index {first_diff_idx}: Expected string ends early; "
-                f"Actual has extra {repr(extra_part)}"
+                f"  Diff at index {first_diff_idx}: actual={c_act!r} (hex: {hex(ord(c_act))}) vs expected string ended (length {len(expected)})"
             )
 
     return "\n".join(diff_lines)
+
+
+def format_sequence_mismatch(actual: Any, expected: Any) -> Tuple[str, str, Optional[int]]:
+    """Generate detailed sequence comparison showing length differences and first differing element.
+
+    Returns (explanation_summary, detailed_diff_text, first_diff_index).
+    """
+    seq_name = type(actual).__name__.capitalize()
+    len_a = len(actual)
+    len_b = len(expected)
+    min_len = min(len_a, len_b)
+
+    first_diff_idx = None
+    for i in range(min_len):
+        if actual[i] != expected[i]:
+            first_diff_idx = i
+            break
+
+    if first_diff_idx is None and len_a != len_b:
+        first_diff_idx = min_len
+
+    summary_parts = []
+    if len_a != len_b:
+        summary_parts.append(f"length differs (actual has {len_a}, expected has {len_b})")
+    if first_diff_idx is not None and first_diff_idx < min_len:
+        summary_parts.append(f"first item differs at index {first_diff_idx}")
+    elif first_diff_idx is not None:
+        summary_parts.append(f"prefix matches through index {first_diff_idx - 1 if first_diff_idx > 0 else 0}")
+
+    explanation = f"{seq_name.upper()} MISMATCH: {'; '.join(summary_parts) if summary_parts else 'items differ'}."
+
+    lines = ["📋 SEQUENCE / LIST MISMATCH:"]
+    lines.append("  Length difference:")
+    lines.append(f"    Actual length:   {len_a}")
+    lines.append(f"    Expected length: {len_b}")
+    lines.append(f"    Difference:      {len_a - len_b:+d} item(s)")
+
+    if first_diff_idx is not None:
+        lines.append(f"  First differing element at index {first_diff_idx}:")
+        if first_diff_idx < len_a:
+            lines.append(f"    Actual:   {format_value_repr(actual[first_diff_idx])} ({type(actual[first_diff_idx]).__name__})")
+        else:
+            lines.append(f"    Actual:   [End of sequence - length {len_a}]")
+        if first_diff_idx < len_b:
+            lines.append(f"    Expected: {format_value_repr(expected[first_diff_idx])} ({type(expected[first_diff_idx]).__name__})")
+        else:
+            lines.append(f"    Expected: [End of sequence - length {len_b}]")
+    else:
+        lines.append("  All corresponding elements match.")
+
+    return explanation, "\n".join(lines), first_diff_idx
 
 
 def generate_sequence_diff(actual: Any, expected: Any, first_diff_idx: Optional[int]) -> str:
     """Generate unified diff for lists, tuples, or sequences."""
-    diff_lines: List[str] = []
-    act_lines = [repr(item) + "\n" for item in actual]
-    exp_lines = [repr(item) + "\n" for item in expected]
-    ud = list(difflib.unified_diff(exp_lines, act_lines, fromfile="expected", tofile="actual"))
-    if ud:
-        for line in ud:
-            diff_lines.append(f"  {line.rstrip()}")
-    if first_diff_idx is not None and first_diff_idx < min(len(actual), len(expected)):
-        diff_lines.append(
-            f"  Index {first_diff_idx}: Actual has {repr(actual[first_diff_idx])}, "
-            f"Expected has {repr(expected[first_diff_idx])}"
-        )
-    return "\n".join(diff_lines)
+    _, diff_str, _ = format_sequence_mismatch(actual, expected)
+    return diff_str
+
+
+def format_dict_mismatch(actual: dict, expected: dict) -> Tuple[str, str]:
+    """Generate detailed dict comparison showing missing, extra, and differing keys.
+
+    Returns (explanation_summary, detailed_diff_text).
+    """
+    missing_keys = sorted([k for k in expected if k not in actual], key=lambda x: str(x))
+    extra_keys = sorted([k for k in actual if k not in expected], key=lambda x: str(x))
+    common_keys = sorted([k for k in actual if k in expected], key=lambda x: str(x))
+    val_diffs = {k: (actual[k], expected[k]) for k in common_keys if actual[k] != expected[k]}
+
+    summary_parts = []
+    if missing_keys:
+        summary_parts.append(f"missing {len(missing_keys)} key(s): {missing_keys}")
+    if extra_keys:
+        summary_parts.append(f"extra {len(extra_keys)} key(s): {extra_keys}")
+    if val_diffs:
+        summary_parts.append(f"{len(val_diffs)} value difference(s) in shared keys")
+
+    explanation = f"DICT MISMATCH: {'; '.join(summary_parts) if summary_parts else 'contents differ'}."
+
+    lines = ["📋 DICTIONARY / JSON MISMATCH:"]
+    lines.append("  Missing keys (in expected but not actual):")
+    if missing_keys:
+        for k in missing_keys:
+            lines.append(f"    - {k!r}: expected value {expected[k]!r}")
+    else:
+        lines.append("    (None)")
+
+    lines.append("  Extra keys (in actual but not expected):")
+    if extra_keys:
+        for k in extra_keys:
+            lines.append(f"    + {k!r}: actual value {actual[k]!r}")
+    else:
+        lines.append("    (None)")
+
+    lines.append("  Value differences for shared keys:")
+    if val_diffs:
+        for k, (a_v, e_v) in val_diffs.items():
+            lines.append(f"    * Key {k!r}:")
+            lines.append(f"        Actual:   {format_value_repr(a_v)} ({type(a_v).__name__})")
+            lines.append(f"        Expected: {format_value_repr(e_v)} ({type(e_v).__name__})")
+    else:
+        lines.append("    (None)")
+
+    return explanation, "\n".join(lines)
 
 
 def generate_dict_diff(actual: dict, expected: dict) -> str:
     """Generate key and value diff for mappings."""
-    diff_lines: List[str] = []
-    missing_keys = set(expected.keys()) - set(actual.keys())
-    extra_keys = set(actual.keys()) - set(expected.keys())
-    common_keys = set(actual.keys()) & set(expected.keys())
-    val_diffs = {k: (actual[k], expected[k]) for k in common_keys if actual[k] != expected[k]}
+    _, diff_str = format_dict_mismatch(actual, expected)
+    return diff_str
 
-    if missing_keys:
-        diff_lines.append(f"  - Missing keys: {list(missing_keys)}")
-    if extra_keys:
-        diff_lines.append(f"  + Extra keys: {list(extra_keys)}")
-    if val_diffs:
-        diff_lines.append("  Key value differences:")
-        for k, (a_v, e_v) in val_diffs.items():
-            diff_lines.append(f"    Key '{k}': Actual has {repr(a_v)}, Expected has {repr(e_v)}")
-    return "\n".join(diff_lines)
+
+def build_assertion_diagnostic(
+    actual: Any,
+    expected: Any,
+    op_str: str,
+    code_str: str,
+    msg: Optional[str] = None,
+) -> AssertionDiagnostic:
+    """Build a comprehensive, structured AssertionDiagnostic with deep diffs."""
+    actual_type = type(actual).__name__ if actual is not None else "unknown"
+    actual_repr = format_value_repr(actual)
+    actual_len = get_length(actual)
+
+    expected_type = type(expected).__name__ if expected is not None else "unknown"
+    expected_repr = format_value_repr(expected)
+    expected_len = get_length(expected)
+
+    explanation, diff_str, first_diff_idx = explain_assertion_failure(
+        actual, op_str, expected, msg or ""
+    )
+
+    divergence_detail = None
+    escape_breakdown = None
+    dict_diff_summary = None
+    sequence_diff_summary = None
+
+    if isinstance(actual, str) and isinstance(expected, str):
+        first_diff_idx, divergence_detail = compute_string_divergence(actual, expected)
+        escape_breakdown = format_escape_breakdown(actual, expected)
+    elif isinstance(actual, dict) and isinstance(expected, dict):
+        _, dict_diff_summary = format_dict_mismatch(actual, expected)
+    elif isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
+        _, sequence_diff_summary, first_diff_idx = format_sequence_mismatch(actual, expected)
+
+    root_hint = generate_root_cause_hint(actual, op_str, expected, first_diff_idx)
+
+    return AssertionDiagnostic(
+        assertion_code=code_str,
+        op=op_str,
+        actual_type=actual_type,
+        actual_repr=actual_repr,
+        actual_length=actual_len,
+        expected_type=expected_type,
+        expected_repr=expected_repr,
+        expected_length=expected_len,
+        char_diff=diff_str,
+        first_diff_index=first_diff_idx,
+        divergence_detail=divergence_detail,
+        escape_breakdown=escape_breakdown,
+        dict_diff_summary=dict_diff_summary,
+        sequence_diff_summary=sequence_diff_summary,
+        root_cause_hint=root_hint,
+        message=msg if msg else None,
+        explanation=explanation,
+        remediation_hint=root_hint,
+    )
 
 
 def explain_assertion_failure(
@@ -510,57 +1031,12 @@ def explain_assertion_failure(
 
     # Case 3: Both are lists or tuples
     if isinstance(actual, (list, tuple)) and isinstance(expected, (list, tuple)):
-        min_len = min(len(actual), len(expected))
-        for i in range(min_len):
-            if actual[i] != expected[i]:
-                first_diff_idx = i
-                break
-        if first_diff_idx is None and len(actual) != len(expected):
-            first_diff_idx = min_len
-
-        seq_type = "List" if isinstance(actual, list) else "Tuple"
-        if len(actual) != len(expected):
-            explanation = (
-                f"SEQUENCE MISMATCH: {seq_type} length differs (Actual has {len(actual)} items, "
-                f"Expected has {len(expected)} items)."
-            )
-            if first_diff_idx is not None and first_diff_idx < min_len:
-                explanation += (
-                    f" First item difference at index {first_diff_idx}: Actual has "
-                    f"{format_value_repr(actual[first_diff_idx])}, Expected has {format_value_repr(expected[first_diff_idx])}."
-                )
-        elif first_diff_idx is not None:
-            explanation = (
-                f"SEQUENCE MISMATCH: {seq_type} items differ at index {first_diff_idx}: "
-                f"Actual has {format_value_repr(actual[first_diff_idx])}, "
-                f"Expected has {format_value_repr(expected[first_diff_idx])}."
-            )
-        else:
-            explanation = f"{seq_type}s appear identical."
-
-        diff_str = generate_sequence_diff(actual, expected, first_diff_idx)
+        explanation, diff_str, first_diff_idx = format_sequence_mismatch(actual, expected)
         return explanation, diff_str, first_diff_idx
 
     # Case 4: Both are dicts
     if isinstance(actual, dict) and isinstance(expected, dict):
-        missing_keys = set(expected.keys()) - set(actual.keys())
-        extra_keys = set(actual.keys()) - set(expected.keys())
-        common_keys = set(actual.keys()) & set(expected.keys())
-        val_diffs = {k: (actual[k], expected[k]) for k in common_keys if actual[k] != expected[k]}
-
-        parts = []
-        if missing_keys:
-            parts.append(f"missing expected key(s) {list(missing_keys)}")
-        if extra_keys:
-            parts.append(f"unexpected extra key(s) {list(extra_keys)}")
-        if val_diffs:
-            first_k = next(iter(val_diffs))
-            a_v, e_v = val_diffs[first_k]
-            parts.append(f"value differs for key '{first_k}' (Actual has {format_value_repr(a_v)}, Expected has {format_value_repr(e_v)})")
-
-        summary_body = "; ".join(parts) if parts else "contents differ"
-        explanation = f"DICT MISMATCH: {summary_body}."
-        diff_str = generate_dict_diff(actual, expected)
+        explanation, diff_str = format_dict_mismatch(actual, expected)
         return explanation, diff_str, None
 
     # Case 5: Both are sets
@@ -1338,39 +1814,18 @@ def run_harness(
                     if not k.startswith("__") and k not in ("__repro_assert__", "__repro_assert_truthy__"):
                         locals_dict[k] = introspect_variable(k, v)
 
-            actual_type = type(exc.actual).__name__
-            actual_repr = format_value_repr(exc.actual)
-            actual_len = get_length(exc.actual)
-
-            expected_type = type(exc.expected).__name__
-            expected_repr = format_value_repr(exc.expected)
-            expected_len = get_length(exc.expected)
-
-            explanation, diff_str, first_diff_idx = explain_assertion_failure(
-                exc.actual, exc.op, exc.expected, exc.msg
-            )
-            hint = get_string_remediation_hint(exc.actual, exc.expected)
-
-            assertion_diag = AssertionDiagnostic(
-                assertion_code=exc.code_str,
-                op=exc.op,
-                actual_type=actual_type,
-                actual_repr=actual_repr,
-                actual_length=actual_len,
-                expected_type=expected_type,
-                expected_repr=expected_repr,
-                expected_length=expected_len,
-                char_diff=diff_str,
-                first_diff_index=first_diff_idx,
-                message=exc.msg if exc.msg else None,
-                explanation=explanation,
-                remediation_hint=hint,
+            assertion_diag = build_assertion_diagnostic(
+                actual=exc.actual,
+                expected=exc.expected,
+                op_str=exc.op,
+                code_str=exc.code_str,
+                msg=exc.msg,
             )
 
             report = DiagnosticReport(
                 status="assertion_error",
                 exit_code=1,
-                summary=explanation,
+                summary=assertion_diag.explanation,
                 assertion_diagnostic=assertion_diag,
                 local_variables=locals_dict,
                 raw_stdout=stdout_val,
@@ -1410,9 +1865,6 @@ def run_harness(
             actual_val = None
             expected_val = None
             op_str = "=="
-            explanation = f"Assertion failed: {str(exc) or code_line or 'AssertionError'}"
-            first_diff_idx = None
-            diff_str = None
 
             if code_line:
                 try:
@@ -1426,43 +1878,23 @@ def run_harness(
                                 try:
                                     actual_val = eval(compile(ast.Expression(assert_node.test.left), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
                                     expected_val = eval(compile(ast.Expression(assert_node.test.comparators[0]), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
-                                    explanation, diff_str, first_diff_idx = explain_assertion_failure(actual_val, op_str, expected_val, str(exc))
                                 except Exception:
                                     pass
                 except Exception:
                     pass
 
-            act_type = type(actual_val).__name__ if actual_val is not None else "unknown"
-            act_repr = format_value_repr(actual_val) if actual_val is not None else "unknown"
-            exp_type = type(expected_val).__name__ if expected_val is not None else "unknown"
-            exp_repr = format_value_repr(expected_val) if expected_val is not None else "unknown"
-
-            hint = (
-                get_string_remediation_hint(actual_val, expected_val)
-                if actual_val is not None and expected_val is not None
-                else None
-            )
-
-            assertion_diag = AssertionDiagnostic(
-                assertion_code=code_line or f"assert {str(exc)}",
-                op=op_str,
-                actual_type=act_type,
-                actual_repr=act_repr,
-                actual_length=get_length(actual_val) if actual_val is not None else None,
-                expected_type=exp_type,
-                expected_repr=exp_repr,
-                expected_length=get_length(expected_val) if expected_val is not None else None,
-                char_diff=diff_str,
-                first_diff_index=first_diff_idx,
-                message=str(exc) if str(exc) else None,
-                explanation=explanation,
-                remediation_hint=hint,
+            assertion_diag = build_assertion_diagnostic(
+                actual=actual_val,
+                expected=expected_val,
+                op_str=op_str,
+                code_str=code_line or f"assert {str(exc)}",
+                msg=str(exc) if str(exc) else None,
             )
 
             report = DiagnosticReport(
                 status="assertion_error",
                 exit_code=1,
-                summary=explanation,
+                summary=assertion_diag.explanation,
                 assertion_diagnostic=assertion_diag,
                 local_variables=locals_dict,
                 raw_stdout=stdout_val,
@@ -1700,7 +2132,7 @@ def _format_assertion_failure(
     diag_or_actual: Union[AssertionDiagnostic, Any],
     locals_or_expected: Any = None,
 ) -> Union[List[str], str]:
-    """Format assertion failure details and diagnostic remediation hints.
+    """Format assertion failure details, deep diffs, and root cause hints.
 
     When called with (AssertionDiagnostic, Optional[Dict[str, VariableInfo]]):
         Returns List[str] formatted lines with assertion details and remediation hints.
@@ -1722,37 +2154,63 @@ def _format_assertion_failure(
     ]
     if diag.assertion_code:
         lines.append(f"  Failing Statement: {diag.assertion_code}")
-    if diag.first_diff_index is not None:
+    if diag.divergence_detail:
+        lines.append(f"  {diag.divergence_detail}")
+    elif diag.first_diff_index is not None:
         lines.append(f"  Difference at index: {diag.first_diff_index}")
 
     lines.append("")
     lines.append("  🔍 DIAGNOSTIC SUMMARY:")
     lines.append(f"    {diag.explanation}")
 
-    hint = diag.remediation_hint
-    if not hint and diag.actual_repr and diag.expected_repr:
+    # Actionable Diagnostics: Section 💡 ROOT CAUSE HINT FOR LLM:
+    root_hint = diag.root_cause_hint or diag.remediation_hint
+    if not root_hint and diag.actual_repr and diag.expected_repr:
         try:
             act_val = ast.literal_eval(diag.actual_repr)
             exp_val = ast.literal_eval(diag.expected_repr)
-            hint = get_string_remediation_hint(act_val, exp_val)
+            root_hint = generate_root_cause_hint(act_val, diag.op, exp_val, diag.first_diff_index)
         except Exception:
             pass
 
-    if hint:
+    if root_hint:
         lines.append("")
-        if not hint.startswith("💡"):
-            lines.append(f"  💡 HINT: {hint}")
-        else:
-            lines.append(f"  {hint}")
+        lines.append("  💡 ROOT CAUSE HINT FOR LLM:")
+        for hl in root_hint.splitlines():
+            clean_hl = hl.lstrip("💡 HINT: ")
+            lines.append(f"    {clean_hl}")
 
     lines.append("")
     lines.append("  📊 VALUE COMPARISON:")
-    act_len_str = f", len={diag.actual_length}" if diag.actual_length is not None else ""
-    exp_len_str = f", len={diag.expected_length}" if diag.expected_length is not None else ""
-    lines.append(f"    Actual   ({diag.actual_type}{act_len_str}): {diag.actual_repr}")
-    lines.append(f"    Expected ({diag.expected_type}{exp_len_str}): {diag.expected_repr}")
+    if diag.actual_type == "str" and diag.expected_type == "str":
+        lines.append(f"    Actual:   {diag.actual_repr} (length {diag.actual_length})")
+        lines.append(f"    Expected: {diag.expected_repr} (length {diag.expected_length})")
+    else:
+        act_len_str = f" (length {diag.actual_length})" if diag.actual_length is not None else ""
+        exp_len_str = f" (length {diag.expected_length})" if diag.expected_length is not None else ""
+        lines.append(f"    Actual:   {diag.actual_repr}{act_len_str}")
+        lines.append(f"    Expected: {diag.expected_repr}{exp_len_str}")
 
-    if diag.char_diff:
+    # Decoded ANSI escape breakdown
+    if diag.escape_breakdown:
+        lines.append("")
+        for el in diag.escape_breakdown.splitlines():
+            lines.append(f"  {el}")
+
+    # Dictionary / JSON mismatch
+    if diag.dict_diff_summary:
+        lines.append("")
+        for dl in diag.dict_diff_summary.splitlines():
+            lines.append(f"  {dl}")
+
+    # Sequence / List mismatch
+    if diag.sequence_diff_summary:
+        lines.append("")
+        for sl in diag.sequence_diff_summary.splitlines():
+            lines.append(f"  {sl}")
+
+    # Character diff (for strings and general comparisons)
+    if diag.char_diff and not diag.dict_diff_summary and not diag.sequence_diff_summary:
         lines.append("")
         lines.append("  🔀 CHARACTER DIFF:")
         for dl in diag.char_diff.splitlines():

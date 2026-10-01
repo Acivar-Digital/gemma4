@@ -96,6 +96,23 @@ cat /tmp/repro.py | python3 check.py --expect-exception ValueError
 - `--stdin, -`: Execute raw Python script read from standard input.
 - `--help, -h`: Show usage instructions and exit (exit code 0).
 
+## Deep Assertion Diagnostics & Value Diffs
+When standard assertions fail (e.g. `assert a == b`), standard Python output often conceals subtle differences like invisible ANSI escapes, Unicode widths, or dictionary key sets. `repro-check` provides deterministic, high-signal diagnostics:
+
+1. **String Mismatch**:
+   - Explicit `Actual:` and `Expected:` values with exact string lengths.
+   - Pinpoints the first character divergence: `Diff at index <i>: actual=<val_a> (hex: <hex_a>) vs expected=<val_b> (hex: <hex_b>)`.
+   - **ANSI & Control Escape Breakdown**: When `\x1b` or control characters are present, decodes escape sequences (e.g. CSI 31m Red text, CSI 0m Reset) and invisible characters (CR `\r`, zero-width spaces `\u200b`, BOM `\ufeff`) so hidden differences are immediately visible.
+2. **Dictionary / JSON Mismatch**:
+   - Identifies **Missing keys** (in expected but missing from actual).
+   - Identifies **Extra keys** (in actual but not expected).
+   - Highlights **Value differences for shared keys** with types and representations.
+3. **Sequence / List Mismatch**:
+   - Reports exact **Length differences** (`actual` vs `expected`).
+   - Pinpoints the **First differing element with its index** and types.
+4. **Actionable Root Cause Hints**:
+   - Outputs a dedicated section: `💡 ROOT CAUSE HINT FOR LLM:` summarizing what differed and providing actionable instructions for adjusting the codebase.
+
 ## Hardened Quote Sanitization & Syntax Pre-Validation
 `repro-check` includes native hardening against common LLM formatting artifacts:
 1. **Redundant Outer Quotes**: Strips outer `'...'`, `"..."`, `"""..."""`, `'''...'''`, and escaped outer `\"...\"` / `\'...\'`.
