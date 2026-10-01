@@ -45,7 +45,7 @@ python3 oracle.py '<div class="btn">Click</div>'  # auto-detected
 Inspects JSON Schema / OpenAPI structure, checks `$defs` vs `definitions`, resolves local `$ref` pointers with exact corrected path suggestions, checks `anyOf` with `null`, handles boolean/non-dict schemas, and prevents recursive `$ref` cycles:
 ```bash
 python3 oracle.py --schema openapi.json
-python3 oracle.py '{"$defs": {"Item": {"type": "string"}}, "$ref": "#/$defs/Item"}'
+python3 oracle.py schema.json
 ```
 *Catches Pydantic v1 vs v2 `$defs`/`definitions` migration bugs and invalid type leaks.*
 

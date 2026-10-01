@@ -369,6 +369,24 @@ def run_eval(expr: str, as_json: bool = False) -> int:
                 "What is wrong: An invalid type or argument count was passed to an operation or function. "
                 "Fix: Verify argument types and function signatures."
             )
+        elif isinstance(exc, ValueError):
+            action_fix = (
+                f"ValueError: {exc_msg}. "
+                "What is wrong: An invalid value was passed to a function or operation. "
+                "Fix: Check argument formats, ranges, or numeric conversions."
+            )
+        elif isinstance(exc, KeyError):
+            action_fix = (
+                f"KeyError: {exc_msg}. "
+                "What is wrong: The dictionary key does not exist. "
+                "Fix: Check dictionary keys with .keys() or use .get() with a default value."
+            )
+        elif isinstance(exc, IndexError):
+            action_fix = (
+                f"IndexError: {exc_msg}. "
+                "What is wrong: Sequence index out of range. "
+                "Fix: Check sequence length with len() before indexing."
+            )
         elif isinstance(exc, AttributeError):
             action_fix = (
                 f"AttributeError: {exc_msg}. "
@@ -1218,12 +1236,14 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
     # Collect all available definition targets to provide exact corrected reference paths
     known_targets = find_all_definition_targets(root)
 
-    # Cycle protection tracking object IDs
+    # Cycle protection tracking object IDs; iterative stack avoids RecursionError
     seen_ids: Set[int] = set()
+    stack: List[Tuple[Any, str]] = [(root, "#")]
 
-    def walk(obj: Any, path: str):
+    while stack:
+        obj, path = stack.pop()
         if id(obj) in seen_ids:
-            return
+            continue
         seen_ids.add(id(obj))
 
         if isinstance(obj, dict):
@@ -1312,15 +1332,13 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
                             "message": f"Property '{req}' listed in 'required' is not defined in 'properties'.",
                         })
 
-            # Recurse
-            for k, v in obj.items():
-                walk(v, f"{path}/{k}")
+            # Push children to stack (reversed to preserve document order)
+            for k, v in reversed(list(obj.items())):
+                stack.append((v, f"{path}/{k}"))
 
         elif isinstance(obj, list):
-            for idx, item in enumerate(obj):
-                walk(item, f"{path}/{idx}")
-
-    walk(root, "#")
+            for idx in reversed(range(len(obj))):
+                stack.append((obj[idx], f"{path}/{idx}"))
 
     return {
         "openapi_version": openapi_version,
@@ -1336,6 +1354,24 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
 
 def run_schema(input_val: str, as_json: bool = False) -> int:
     """Inspects JSON Schema / OpenAPI schema structure."""
+    stripped = input_val.strip()
+    if stripped and not stripped.startswith(("{", "[")) and (stripped.endswith((".json", ".yaml", ".yml")) or "/" in stripped):
+        p = pathlib.Path(stripped)
+        if not p.is_file():
+            diag = (
+                f"File '{stripped}' not found.\n"
+                "What is wrong: The specified schema file does not exist on disk.\n"
+                "Fix: Check file path relative to workspace or pass inline JSON: python3 oracle.py --schema '{\"type\": \"object\"}'"
+            )
+            if as_json:
+                print(json.dumps({"status": "error", "mode": "schema", "error_type": "FileNotFoundError", "error": f"File '{stripped}' not found.", "diagnostic": diag}, indent=2))
+            else:
+                print("=" * 80)
+                print(f"✗ [code-oracle: schema] File '{stripped}' not found.")
+                print(f"  {diag}")
+                print("=" * 80)
+            return 1
+
     text = read_input_text(input_val)
     if not text.strip():
         diag = "No schema content provided to --schema."
@@ -1646,11 +1682,46 @@ def run_syntax(target: Optional[str] = None, as_json: bool = False) -> int:
         if not p.is_absolute():
             p = (ws / p).resolve()
         if not p.is_file():
+            # Search workspace for closest .py file candidates
+            py_candidates: List[str] = []
+            try:
+                for root_dir, dirs, files in os.walk(str(ws)):
+                    dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("venv", "node_modules", ".git", "__pycache__")]
+                    for f in files:
+                        if f.endswith(".py"):
+                            full = pathlib.Path(root_dir) / f
+                            try:
+                                rel = str(full.relative_to(ws))
+                                py_candidates.append(rel)
+                            except ValueError:
+                                pass
+            except Exception:
+                pass
+
+            target_name = pathlib.Path(target).name
+            close_matches = difflib.get_close_matches(target, py_candidates, n=3, cutoff=0.5)
+            if not close_matches:
+                matched_names = difflib.get_close_matches(target_name, [pathlib.Path(c).name for c in py_candidates], n=3, cutoff=0.5)
+                close_matches = [c for c in py_candidates if pathlib.Path(c).name in matched_names]
+
+            suggestion_msg = ""
+            if close_matches:
+                suggestion_msg = f"\n  Did you mean: {close_matches[0]}?\n  Fix: python3 oracle.py --syntax {close_matches[0]}"
+
             err_msg = f"Target file '{target}' does not exist."
             if as_json:
-                print(json.dumps({"status": "error", "mode": "syntax", "error": err_msg}, indent=2))
+                print(json.dumps({
+                    "status": "error",
+                    "mode": "syntax",
+                    "error_type": "FileNotFoundError",
+                    "error": err_msg,
+                    "suggestions": close_matches,
+                    "fix": f"python3 oracle.py --syntax {close_matches[0]}" if close_matches else None,
+                }, indent=2))
             else:
-                print(f"✗ [syntax-error] {err_msg}")
+                print("=" * 80)
+                print(f"✗ [code-oracle: syntax] {err_msg}{suggestion_msg}")
+                print("=" * 80)
             return 1
         files_to_check = [p]
     else:
@@ -1695,11 +1766,31 @@ def run_syntax(target: Optional[str] = None, as_json: bool = False) -> int:
                 "snippet": snip,
             })
             continue
+        except (RecursionError, MemoryError, ValueError) as ast_err:
+            all_errors.append({
+                "file": str(fpath),
+                "line": 1,
+                "column": 1,
+                "error_type": type(ast_err).__name__,
+                "message": f"AST parsing failure: {ast_err}",
+                "snippet": "",
+            })
+            continue
 
         # Regex syntax check
-        regex_checker = RegexSyntaxChecker(str(fpath), lines)
-        regex_checker.visit(tree)
-        all_errors.extend(regex_checker.issues)
+        try:
+            regex_checker = RegexSyntaxChecker(str(fpath), lines)
+            regex_checker.visit(tree)
+            all_errors.extend(regex_checker.issues)
+        except RecursionError:
+            all_errors.append({
+                "file": str(fpath),
+                "line": 1,
+                "column": 1,
+                "error_type": "RecursionError",
+                "message": "Maximum AST recursion depth exceeded during regex inspection.",
+                "snippet": "",
+            })
 
         # Import resolution check
         import_issues = check_top_level_imports(tree, fpath, ws, lines)
@@ -1800,7 +1891,7 @@ ADDITIONAL OPTIONS:
 
 
 def normalize_cli_args(raw_argv: List[str]) -> Tuple[Dict[str, Any], List[str]]:
-    """Normalize CLI arguments, handling forgiving flags, extra dashes, and loose options."""
+    """Normalize CLI arguments, handling forgiving flags, extra dashes, aliases, and loose options."""
     parsed: Dict[str, Any] = {
         "help": False,
         "json": False,
@@ -1810,12 +1901,27 @@ def normalize_cli_args(raw_argv: List[str]) -> Tuple[Dict[str, Any], List[str]]:
     positional: List[str] = []
 
     MODE_FLAGS = {
-        "e": "eval", "eval": "eval",
-        "x": "hex", "hex": "hex",
-        "w": "width", "width": "width",
-        "H": "html-esc", "htmlesc": "html-esc", "html-esc": "html-esc", "html": "html-esc", "html_esc": "html-esc",
-        "s": "schema", "schema": "schema",
-        "S": "syntax", "syntax": "syntax",
+        # Mode 1: eval
+        "e": "eval", "eval": "eval", "evaluate": "eval", "expr": "eval",
+        "expression": "eval", "exec": "eval", "execute": "eval", "calc": "eval", "py": "eval",
+        # Mode 2: hex
+        "x": "hex", "hex": "hex", "hexdump": "hex", "dump": "hex", "bytes": "hex",
+        "ansi": "hex", "escape": "hex", "escapes": "hex", "raw": "hex",
+        # Mode 3: width
+        "w": "width", "width": "width", "cell": "width", "cells": "width",
+        "cellwidth": "width", "cell-width": "width", "column": "width",
+        "columns": "width", "col": "width", "cols": "width", "display-width": "width", "displaywidth": "width",
+        # Mode 4: html-esc
+        "H": "html-esc", "htmlesc": "html-esc", "html-esc": "html-esc", "html": "html-esc",
+        "htm": "html-esc", "html_esc": "html-esc", "htmlescape": "html-esc",
+        "html-escape": "html-esc", "tags": "html-esc", "tag": "html-esc",
+        # Mode 5: schema
+        "s": "schema", "schema": "schema", "openapi": "schema", "jsonschema": "schema",
+        "json-schema": "schema", "defs": "schema", "definitions": "schema", "swagger": "schema", "spec": "schema",
+        # Mode 6: syntax
+        "S": "syntax", "syntax": "syntax", "ast": "syntax", "check": "syntax",
+        "checksyntax": "syntax", "check-syntax": "syntax", "lint": "syntax",
+        "imports": "syntax", "import": "syntax", "pycompile": "syntax", "compile": "syntax",
     }
 
     i = 0
@@ -1831,21 +1937,33 @@ def normalize_cli_args(raw_argv: List[str]) -> Tuple[Dict[str, Any], List[str]]:
             if "=" in flag_body:
                 flag_body, flag_val = flag_body.split("=", 1)
 
-            # Help
+            # Help check
             if flag_body in ("h", "help", "?"):
                 parsed["help"] = True
                 i += 1
                 continue
 
-            # JSON
+            # JSON check
             if flag_body in ("j", "json"):
                 parsed["json"] = True
                 i += 1
                 continue
 
-            # Mode flags
+            # Mode flags check (exact or case-normalized / fuzzy)
+            matched_mode: Optional[str] = None
             if flag_body in MODE_FLAGS:
-                parsed["mode"] = MODE_FLAGS[flag_body]
+                matched_mode = MODE_FLAGS[flag_body]
+            elif len(flag_body) > 1:
+                clean_body = flag_body.lower().replace("_", "-")
+                if clean_body in MODE_FLAGS:
+                    matched_mode = MODE_FLAGS[clean_body]
+                else:
+                    close = difflib.get_close_matches(clean_body, list(MODE_FLAGS.keys()), n=1, cutoff=0.7)
+                    if close:
+                        matched_mode = MODE_FLAGS[close[0]]
+
+            if matched_mode:
+                parsed["mode"] = matched_mode
                 if flag_val is not None:
                     parsed["mode_arg"] = flag_val
                 elif i + 1 < n:
@@ -1923,27 +2041,41 @@ def main(argv: Optional[List[str]] = None) -> int:
         pos_arg = " ".join(positional).strip()
         p = pathlib.Path(pos_arg)
 
-        # 1. File checks
-        if pos_arg.endswith(".py") or (len(positional) == 1 and p.is_file() and pos_arg.endswith(".py")):
-            return run_syntax(pos_arg, as_json=as_json)
-        elif pos_arg.endswith(".json") or (len(positional) == 1 and p.is_file() and pos_arg.endswith(".json")):
-            return run_schema(pos_arg, as_json=as_json)
-        elif pos_arg.endswith(".html") or pos_arg.endswith(".htm") or (len(positional) == 1 and p.is_file() and (pos_arg.endswith(".html") or pos_arg.endswith(".htm"))):
-            return run_html_esc(pos_arg, as_json=as_json)
+        # 1. Existing file auto-detection
+        if len(positional) == 1 and p.is_file():
+            suffix = p.suffix.lower()
+            if suffix == ".py":
+                return run_syntax(pos_arg, as_json=as_json)
+            elif suffix in (".json", ".yaml", ".yml"):
+                return run_schema(pos_arg, as_json=as_json)
+            elif suffix in (".html", ".htm", ".xml", ".svg"):
+                return run_html_esc(pos_arg, as_json=as_json)
+            else:
+                return run_hex(pos_arg, as_json=as_json)
 
-        # 2. ANSI escape sequence detection -> --hex
+        # 2. File extension path detection (even if missing)
+        if pos_arg.endswith(".py"):
+            return run_syntax(pos_arg, as_json=as_json)
+        elif pos_arg.endswith((".json", ".yaml", ".yml")):
+            return run_schema(pos_arg, as_json=as_json)
+        elif pos_arg.endswith((".html", ".htm", ".xml", ".svg")):
+            return run_html_esc(pos_arg, as_json=as_json)
+        elif pos_arg.endswith((".txt", ".log", ".out", ".diff", ".patch", ".dat", ".bin", ".raw")):
+            return run_hex(pos_arg, as_json=as_json)
+
+        # 3. ANSI escape sequence detection -> --hex
         if "\x1b" in pos_arg or "\033" in pos_arg or r"\x1b" in pos_arg or r"\033" in pos_arg or ANSI_RE.search(pos_arg):
             return run_hex(pos_arg, as_json=as_json)
 
-        # 3. HTML tag / snippet detection -> --html-esc
+        # 4. HTML tag / snippet detection -> --html-esc
         if pos_arg.startswith("<") or re.search(r"</?[a-zA-Z][^>]*>", pos_arg):
             return run_html_esc(pos_arg, as_json=as_json)
 
-        # 4. JSON Schema string detection -> --schema
+        # 5. JSON Schema string detection -> --schema
         if pos_arg.startswith("{") and any(k in pos_arg for k in ('"$defs"', '"definitions"', '"openapi"', '"$schema"', '"properties"', '"type"')):
             return run_schema(pos_arg, as_json=as_json)
 
-        # 5. Default: Python expression / statements -> --eval
+        # 6. Default: Python expression / statements -> --eval
         return run_eval(pos_arg, as_json=as_json)
 
     # Empty invocation: print clean overview and exit 0

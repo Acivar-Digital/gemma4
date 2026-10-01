@@ -50,6 +50,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "gate.py"
 SCRIPTS_GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "scripts" / "gate.py"
@@ -57,8 +60,9 @@ SCRIPTS_GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "scri
 
 def run_gate(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     """Run gate.py with given arguments and return CompletedProcess."""
-    cmd = [sys.executable, str(GATE_PATH)] + list(args)
+    cmd = [sys.executable, "-B", str(GATE_PATH)] + list(args)
     environ = os.environ.copy()
+    environ["PYTHONDONTWRITEBYTECODE"] = "1"
     environ["PYTHONPATH"] = f"{REPO_ROOT}:{environ.get('PYTHONPATH', '')}"
     if env:
         environ.update(env)
@@ -113,11 +117,9 @@ def test_syntax_and_byte_identity():
     with open(GATE_PATH, "rb") as f1, open(SCRIPTS_GATE_PATH, "rb") as f2:
         assert f1.read() == f2.read(), "gate.py and scripts/gate.py are NOT identical!"
 
-    # Compile check
-    res1 = subprocess.run([sys.executable, "-m", "py_compile", str(GATE_PATH)], capture_output=True, text=True)
-    assert res1.returncode == 0, f"Compilation failed for gate.py: {res1.stderr}"
-    res2 = subprocess.run([sys.executable, "-m", "py_compile", str(SCRIPTS_GATE_PATH)], capture_output=True, text=True)
-    assert res2.returncode == 0, f"Compilation failed for scripts/gate.py: {res2.stderr}"
+    # Compile check (in-memory without writing disallowed .pyc files to submission directory)
+    compile(GATE_PATH.read_text(encoding="utf-8"), str(GATE_PATH), "exec")
+    compile(SCRIPTS_GATE_PATH.read_text(encoding="utf-8"), str(SCRIPTS_GATE_PATH), "exec")
     print("  ✓ gate.py and scripts/gate.py are byte-identical and pass py_compile.")
 
 
