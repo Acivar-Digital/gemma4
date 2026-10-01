@@ -1779,6 +1779,23 @@ def run_harness(
     expect_exception: Optional[str] = None,
 ) -> None:
     """Internal runner executed inside isolated subprocess with diagnostic recording."""
+    # Defensive Sandboxing: Fast-fail socket timeouts to prevent network hanging
+    try:
+        import socket
+        socket.setdefaulttimeout(3.0)
+    except Exception:
+        pass
+
+    # Memory runaway guard (prevents infinite while True append loops from crashing container)
+    try:
+        import resource
+        curr_soft, curr_hard = resource.getrlimit(resource.RLIMIT_AS)
+        limit_1g = 1024 * 1024 * 1024
+        if curr_hard == resource.RLIM_INFINITY or curr_hard >= limit_1g:
+            resource.setrlimit(resource.RLIMIT_AS, (min(limit_1g, curr_hard), curr_hard))
+    except Exception:
+        pass
+
     source_code = script_path.read_text(encoding="utf-8")
 
     global_ns: Dict[str, Any] = {

@@ -1,4 +1,4 @@
-# Gemma 4 Developer Agent — External Technical Review Packet (v2)
+# Gemma 4 Developer Agent — External Technical Review Packet (v3 — Consensus Edition)
 
 This document contains the complete technical briefing, source code, prompt architecture, and fine-tuning pipeline for external review of the **Gemma 4 Developer Agent** repository:
 👉 **Repository:** [https://github.com/Acivar-Digital/gemma4](https://github.com/Acivar-Digital/gemma4)  
@@ -8,36 +8,40 @@ This document contains the complete technical briefing, source code, prompt arch
 ---
 
 ## Table of Contents
-1. [Executive Summary & Direct Answers to Reviewer Critique](#1-executive-summary--direct-answers-to-reviewer-critique)
+1. [Executive Summary & Triple-Reviewer Consensus](#1-executive-summary--triple-reviewer-consensus)
 2. [Agent Prompt & Execution Governor (`my_submission/prompts/main.md`)](#2-agent-prompt--execution-governor-my_submissionpromptsmainmd)
-3. [Upgraded Stratified SFT Dataset Pipeline (`scripts/build_unsloth_dataset.py`)](#3-upgraded-stratified-sft-dataset-pipeline-scriptsbuild_unsloth_datasetpy)
-4. [Hardened LoRA Training Pipeline (`kaggle_unsloth/`)](#4-hardened-lora-training-pipeline-kaggle_unsloth)
-5. [Line-Level Audit: Subprocess Isolation & Timeouts (`check.py` & `oracle.py`)](#5-line-level-audit-subprocess-isolation--timeouts-checkpy--oraclepy)
+3. [Multi-Turn Conversational Tool SFT Pipeline (`scripts/build_unsloth_dataset.py`)](#3-multi-turn-conversational-tool-sft-pipeline-scriptsbuild_unsloth_datasetpy)
+4. [Hardened LoRA Training Pipeline with 16K Context (`kaggle_unsloth/`)](#4-hardened-lora-training-pipeline-with-16k-context-kaggle_unsloth)
+5. [Line-Level Audit: Subprocess Defensive Shield & Timeouts (`check.py` & `oracle.py`)](#5-line-level-audit-subprocess-defensive-shield--timeouts-checkpy--oraclepy)
 6. [Architectural Index of All 5 Skill Engines](#6-architectural-index-of-all-5-skill-engines)
 
 ---
 
-## 1. Executive Summary & Direct Answers to Reviewer Critique
+## 1. Executive Summary & Triple-Reviewer Consensus
 
-Following the expert review, we executed four critical architectural fixes across the codebase:
+Following three independent expert peer reviews (Reviewer 1, Consultant 2, and Consultant 3), all reviewers reached unanimous consensus on four foundational architectural requirements, plus one critical hidden bug:
 
-### A. Prompt Governor: Eliminated Contradictions & Loops
-1. **Collapsed `read_file` Single Mandate:** Eliminated the conflicting "omit `end_line`" vs "MUST be `start_line + 40`" rule. The prompt now mandates a single rule: **"ALWAYS omit `end_line`."**
-2. **Edit Oscillation Circuit Breaker:** Added an explicit attempt ceiling: **"Maximum 2 consecutive failed `edit_file` attempts on the same location; on the 3rd attempt, expand to a wider 8–10 line anchor or select an alternate surrounding block."**
-3. **Explicit Discovery Phase Ceiling:** Enforced that Phase 1 & 2 search/inspection cannot exceed 8 tool calls, mandating the initial `edit_file` by call 9 at the latest.
-4. **Phase-Scoped Scratchpad Governor:** Clarified that the 2-call probe ceiling applies strictly to **pre-edit hypothesis probes** (`repro-check`/`code-oracle`). Post-edit verification in Phase 4 via `code-oracle` and `test-gate` is explicitly **exempt**.
+### A. Elimination of the Fatal Modality Mismatch (Multi-Turn Tool Trajectories)
+* **The Fatal Flaw:** The initial SFT pipeline formatted targets as single-turn plain text markdown diffs (`### Proposed Unified Git Diff Patch: \`\`\`diff ...`). When deployed in Google ADK, an agent fine-tuned this way ignores tool calling, outputs plain text diffs into chat, and fails with a 0% resolution score.
+* **The Consensus Fix:** We completely rebuilt `scripts/build_unsloth_dataset.py` to extract the full **multi-turn conversational tool-calling trajectories** from our 56 winning runs in `run_B39` (`System` $\to$ `User` $\to$ `Agent(thought + tool_calls)` $\to$ `Tool(observation)` $\to \dots \to$ `Agent(submit_patch)`).
 
-### B. Dataset Builder: Supervision Quality & Stratification
-1. **Adjacent Pre-Edit Reasoning:** Replaced naive `thoughts[0]` with `extract_agent_reasoning_pre_edit()`, extracting the agent thought immediately preceding the final successful edit turn.
-2. **Outlier Filtering:** Dropped non-surgical diffs (`patch_lines > 150`) and flailing trajectories (`tool_calls > 35`).
-3. **Dedup Pass:** Added SequenceMatcher deduplication (>90% similarity) to collapse near-duplicate tutorial variants.
-4. **Stratified 80/20 Split:** Hardened into 38 train rows and 10 held-out validation rows stratified across repositories (FastAPI 20/5, Rich 12/3, Requests 6/2).
-5. **Zero Double-Templating:** Emits pure Gemma-4 chat turns directly (`<start_of_turn>user...<end_of_turn>\n<start_of_turn>model...<end_of_turn>`) without a redundant `messages` object.
+### B. The Hidden Sequence Length Bug ($16,384$ Tokens)
+* **Hidden Bug Spotted by Consultant 3:** At `max_seq_length=4096`, full 20–30 turn trajectories with tool observations were being silently truncated right before the final `edit_file` and `submit_patch()` turns!
+* **The Consensus Fix:** We expanded `max_seq_length` to **`16384`** in `kaggle_unsloth/train_gemma4_lora.ipynb` and enabled Unsloth gradient checkpointing, while adding observation compaction (capping oversized tool outputs to 800 chars) to comfortably fit long trajectories.
 
-### C. LoRA Hyperparameters: Anti-Memorization Hardening
-1. **Rank & Projections:** Dropped from Rank-16 on all 7 layers down to **Rank 8 on attention + output heads only (`q_proj`, `v_proj`, `o_proj`)**.
-2. **Epoch Reduction:** Cut training from 60 steps (~8.5 epochs) to **20 steps (~2.5 epochs)** with cosine schedule.
-3. **Learning Rate & Regularization:** Reduced learning rate to **$2.0 \times 10^{-5}$**, set `weight_decay = 0.05`, `lora_dropout = 0.05`, and injected **NEFTune noise (`neftune_noise_alpha = 5`)**.
+### C. Anti-Memorization LoRA Hyperparameters
+* **Rank & Projections:** Dropped from Rank-16 across all 7 layers down to **Rank 8 on attention + output heads only (`q_proj`, `v_proj`, `o_proj`)**, freezing MLPs to preserve base Python syntax reasoning.
+* **Regularization & Steps:** Set $lr = 2.0 \times 10^{-5}$, `weight_decay = 0.05`, `lora_dropout = 0.05`, `neftune_noise_alpha = 5`, and capped training at **20 steps (~2.5 epochs)** with cosine decay.
+* **Stratified 80/20 Validation Split:** 38 train trajectories and 10 held-out validation trajectories stratified across FastAPI, Rich, and Requests, evaluated every 5 steps.
+
+### D. Dynamic Scratchpad Budgeting & Anti-Thrashing Circuit Breaker
+* **Data-Driven Governor:** An empirical audit of our 56 winning runs revealed an average of **5.66 `repro-check` calls** and **8.2 turns before the first edit**. A rigid 2-call ceiling was artificially choking complex bug isolation.
+* **The Consensus Fix:** Expanded hypothesis probes up to 4 calls, backed by an **anti-thrashing circuit breaker** (if `repro-check` fails twice with the identical error without progress, pivot immediately to `read_file` or `code-map`), plus a tiered budget rule forcing edits when `remaining <= 10` or `used >= 30`.
+
+### E. Subprocess Defensive Shields in `repro-check`
+* **Process Group Cleanup:** `start_new_session=True` (`setsid`) + `os.killpg(os.getpgid(proc.pid), signal.SIGKILL)` on 15s timeout prevents orphaned daemon/server process leaks.
+* **Socket Fast-Fail:** Injected `socket.setdefaulttimeout(3.0)` in the test execution wrapper so accidental external network calls fail fast (3.0s) rather than hanging for 15 seconds.
+* **Memory Runaway Guard:** Injected a 1 GiB memory runaway guard inside the `/tmp` execution snippet to catch infinite `while True: x.append(...)` loops before they affect container RAM.
 
 ---
 
@@ -81,13 +85,17 @@ You are the Autonomous Software Developer fixing Python defects in /workspace.
 - If you need symbol caller/callee relationships, class inheritance, or structural definitions, use `code-map`:
   `run_skill_script(skill_name="code-map", file_path="map.py", args=["--symbol", "<symbol_name>"])`
 - If search in source files is ambiguous or returns many results, search the test suite: `run_skill_script(skill_name="fast-grep", file_path="grep.py", args=["<term>", "tests/"])`. Existing unit tests are the fastest, most precise map of where a feature or behavior is defined and tested.
-- PHASE 1 & 2 DISCOVERY CEILING: Maximum 8 discovery tool calls total across search, mapping, and file inspection. You MUST apply your initial code fix via `edit_file` by tool call 9 at the latest.
+- DISCOVERY & HYPOTHESIS BUDGET: Maximum 8–9 discovery tool calls total across search, mapping, and file inspection before applying your initial fix. You MUST apply your initial code fix via `edit_file` by tool call 10 at the latest.
 
 ### Phase 2: Targeted Inspection & Hypothesis
 - Single Rule for `read_file`: ALWAYS omit `end_line`! The harness automatically reads 150 lines from `start_line` without bounds errors. Center `start_line` around the line number found by `fast-grep`: `read_file(filepath="pkg/module.py", start_line=110)`. Never pass `end_line`.
 - If testing a hypothesis or missing validator, run an isolated probe in `/tmp` via `repro-check`:
   `run_skill_script(skill_name="repro-check", file_path="check.py", args=["<assertion_code>"])`
-- HARD SCRATCHPAD GOVERNOR: Maximum 2 *pre-edit* hypothesis probe calls total across `repro-check` or `code-oracle`. NEVER enter an interactive evaluation loop! Once a probe finishes, pivot directly to applying your surgical edit via `edit_file`. (Note: Post-edit domain checks and regression verification in Phase 4 are EXEMPT from this ceiling).
+- DYNAMIC SCRATCHPAD BUDGET & ANTI-THRASHING GUARD:
+  - You may use `repro-check` up to 4 times to formulate and verify your hypothesis.
+  - ANTI-THRASHING CIRCUIT BREAKER: If `repro-check` fails twice with the identical error without progress, STOP probing immediately. Pivot to `code-map` or `read_file` to re-examine the source structure rather than looping in the scratchpad.
+  - BUDGET EXHAUSTION GUARD: If `tool_calls_remaining <= 10` or `tool_calls_used >= 30`, immediately stop investigating and apply your best surgical fix via `edit_file`. Never exhaust your budget without applying an edit!
+  - (Note: Post-edit domain checks and regression verification in Phase 4 are EXEMPT from pre-edit scratchpad ceilings).
 
 ### Phase 3: Surgical Fix Implementation
 - Mandatory tool for modifying existing code: `edit_file`.
@@ -146,25 +154,29 @@ You are the Autonomous Software Developer fixing Python defects in /workspace.
 
 5. ACTIVE BUDGET SELF-METERING:
 - Call `get_status()` periodically to check `tool_calls_used` and `tool_calls_remaining` (FREE tool, 0 cost).
-- If `tool_calls_remaining <= 5` or `tool_calls_used >= 45`: Apply your best surgical fix via `edit_file` BEFORE calling `submit_patch()`. Never submit an empty patch!
+- If `tool_calls_remaining <= 10` or `tool_calls_used >= 30`: Immediately cease open-ended discovery/probing and focus exclusively on surgical code edits via `edit_file`.
+- If `tool_calls_remaining <= 4` or `tool_calls_used >= 36`: Emergency wrap-up! Apply your best surgical fix via `edit_file` immediately and invoke `submit_patch()`. Never submit an empty patch!
 ```
 
 ---
 
-## 3. Upgraded Stratified SFT Dataset Pipeline (`scripts/build_unsloth_dataset.py`)
+## 3. Multi-Turn Conversational Tool SFT Pipeline (`scripts/build_unsloth_dataset.py`)
 
 ```python
 #!/usr/bin/env python3
-"""Builds high-quality, stratified SFT training & validation datasets for Unsloth Gemma 31B.
+"""Builds high-quality, stratified Multi-Turn Tool SFT training & validation datasets for Unsloth Gemma 31B.
 
-Sources & Hardening:
-1. Verified resolved tasks from SWE-Gemma run_B39 (ground truth winning trajectories).
-2. Supervision quality: Extracts agent thought immediately adjacent to the successful final edit.
-3. Outlier filtering: Rejects non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
-4. Near-duplicate deduplication: Collapses patches with >90% similarity via difflib SequenceMatcher.
-5. Stratified 80/20 split: Balances train/validation sets across repository domains.
-6. Zero template duplication: Outputs pure Gemma-4 chat template turns directly to avoid tokenizer bugs.
-7. Strict error budget: Logs failures and hard-fails if corrupted traces exceed 5%.
+Consensus Architectural Upgrades (Triple-Reviewer Harmonized):
+1. ELIMINATES MODALITY MISMATCH: Formats data as full multi-turn conversational tool-calling
+   trajectories (system -> user -> agent tool_calls -> tool observation -> submit_patch),
+   NOT plain text markdown diffs, preserving autonomous agent reflexes in Google ADK.
+2. OBSERVATION COMPACTION: Compresses voluminous tool outputs (capped at 800 chars) to ensure
+   complete 20-30 turn trajectories fit comfortably inside the 16,384 token window.
+3. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
+4. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
+5. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
+6. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
+7. STRICT INTEGRITY GUARD: Hard-fails if corrupted or skipped traces exceed 5%.
 """
 
 from collections import defaultdict
@@ -173,7 +185,7 @@ import json
 import logging
 from pathlib import Path
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("build_unsloth_dataset")
@@ -193,61 +205,125 @@ MAX_TOOL_CALLS = 35
 DEDUP_SIMILARITY_THRESHOLD = 0.90
 MAX_SKIP_RATE = 0.05
 VAL_RATIO = 0.20
+MAX_OBSERVATION_CHARS = 800
 SEED = 42
 
 
-def extract_problem_statement(trace_path: Path) -> str:
-    """Extracts user problem statement from trace JSON with explicit error logging."""
+def compact_observation(raw_obs: Any) -> str:
+    """Compacts tool observation output to fit long trajectories into 16K context."""
+    if isinstance(raw_obs, dict):
+        if "stdout" in raw_obs and raw_obs["stdout"]:
+            text = str(raw_obs["stdout"])
+        elif "content" in raw_obs and raw_obs["content"]:
+            text = str(raw_obs["content"])
+        else:
+            text = json.dumps(raw_obs, ensure_ascii=False)
+    else:
+        text = str(raw_obs or "").strip()
+
+    if len(text) <= MAX_OBSERVATION_CHARS:
+        return text
+
+    half = MAX_OBSERVATION_CHARS // 2 - 20
+    return text[:half] + "\n... [truncated] ...\n" + text[-half:]
+
+
+def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Extracts system instruction, user prompt, and multi-turn tool interaction messages."""
     if not trace_path.exists():
         logger.warning(f"Trace file missing: {trace_path}")
-        return ""
+        return None, []
+
     try:
         with open(trace_path, encoding="utf-8") as f:
             trace = json.load(f)
-        for step in trace.get("steps", []):
-            if step.get("source") == "user":
-                msg = step.get("message", "").strip()
-                if msg:
-                    return msg
     except Exception as exc:
-        logger.error(f"Failed to read user prompt from {trace_path}: {exc}")
-    return ""
+        logger.error(f"Failed to parse trace {trace_path}: {exc}")
+        return None, []
+
+    steps = trace.get("steps", [])
+    user_prompt = ""
+    messages: List[Dict[str, Any]] = []
+
+    for step in steps:
+        src = step.get("source")
+        msg = (step.get("message") or "").strip()
+        tcalls = step.get("tool_calls", [])
+        obs = step.get("observation")
+
+        if src == "system" and msg:
+            if not messages or messages[0].get("role") != "system":
+                messages.append({"role": "system", "content": msg})
+
+        elif src == "user" and msg:
+            if not user_prompt:
+                user_prompt = msg
+                messages.append({"role": "user", "content": msg})
+
+        elif src == "agent":
+            asst_dict: Dict[str, Any] = {"role": "assistant"}
+            if msg:
+                asst_dict["content"] = msg
+            if tcalls:
+                formatted_calls = []
+                for idx, tc in enumerate(tcalls):
+                    call_id = tc.get("tool_call_id") or f"call_{len(messages)}_{idx}"
+                    formatted_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("function_name"),
+                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False)
+                        }
+                    })
+                asst_dict["tool_calls"] = formatted_calls
+
+            if "content" in asst_dict or "tool_calls" in asst_dict:
+                messages.append(asst_dict)
+
+            if obs:
+                compact_text = compact_observation(obs)
+                call_id = (tcalls[0].get("tool_call_id") or f"call_{len(messages)-1}_0") if tcalls else "call_0"
+                fn_name = tcalls[0].get("function_name") if tcalls else "tool"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": fn_name,
+                    "content": compact_text
+                })
+
+    return user_prompt, messages
 
 
-def extract_agent_reasoning_pre_edit(trace_path: Path) -> str:
-    """Extracts agent thought immediately preceding the successful final edit."""
-    if not trace_path.exists():
-        return ""
-    try:
-        with open(trace_path, encoding="utf-8") as f:
-            trace = json.load(f)
-        steps = trace.get("steps", [])
+def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
+    """Renders structured messages into canonical Gemma turn markers."""
+    turns: List[str] = []
 
-        # Find the last successful or final edit_file / write_file step
-        last_edit_idx = -1
-        for idx, step in enumerate(steps):
-            for tc in step.get("tool_calls", []):
-                if tc.get("function_name") in ("edit_file", "write_file"):
-                    last_edit_idx = idx
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls", [])
 
-        # Extract closest preceding agent message
-        if last_edit_idx > 0:
-            for p in range(last_edit_idx - 1, -1, -1):
-                msg = steps[p].get("message")
-                if steps[p].get("source") == "agent" and msg and isinstance(msg, str):
-                    clean_msg = msg.strip()
-                    if len(clean_msg) > 10:
-                        return clean_msg
+        if role == "system":
+            turns.append(f"<start_of_turn>system\n{content}<end_of_turn>")
+        elif role == "user":
+            turns.append(f"<start_of_turn>user\n{content}<end_of_turn>")
+        elif role == "assistant":
+            parts = []
+            if content:
+                parts.append(content)
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name")
+                    fn_args = fn.get("arguments")
+                    parts.append(f"<|tool_call|>call:{fn_name}{fn_args}<|tool_call|>")
+            asst_body = "\n".join(parts)
+            turns.append(f"<start_of_turn>model\n{asst_body}<end_of_turn>")
+        elif role == "tool":
+            turns.append(f"<start_of_turn>tool\n{content}<end_of_turn>")
 
-        # Fallback to the first substantive agent thought if no pre-edit thought exists
-        for step in steps:
-            if step.get("source") == "agent":
-                msg = step.get("message")
-                if msg and isinstance(msg, str) and len(msg.strip()) > 10:
-                    return msg.strip()
-    except Exception as exc:
-        logger.error(f"Failed to extract reasoning from {trace_path}: {exc}")
-    return ""
+    return "\n".join(turns)
 
 
 def build_dataset():
@@ -268,9 +344,9 @@ def build_dataset():
     assert total_resolved > 0, "No resolved tasks found!"
 
     skipped_no_patch = 0
-    skipped_no_prompt = 0
+    skipped_no_trace = 0
     filtered_outliers = 0
-    candidate_examples: List[Dict] = []
+    candidate_examples: List[Dict[str, Any]] = []
 
     for rec in resolved_records:
         inst_id = rec.get("instance_id")
@@ -301,16 +377,10 @@ def build_dataset():
             logger.info(f"Skipping {inst_id}: tool calls ({tool_calls}) > {MAX_TOOL_CALLS} (flailing run)")
             continue
 
-        problem_text = extract_problem_statement(trace_file)
-        if not problem_text:
-            skipped_no_prompt += 1
-            logger.warning(f"Task {inst_id} missing problem statement.")
-            continue
-
-        pre_edit_thought = extract_agent_reasoning_pre_edit(trace_file)
-        if not pre_edit_thought:
-            skipped_no_prompt += 1
-            logger.warning(f"Task {inst_id} missing pre-edit thought.")
+        user_prompt, messages = extract_trajectory_messages(trace_file)
+        if not user_prompt or not messages or len(messages) < 4:
+            skipped_no_trace += 1
+            logger.warning(f"Task {inst_id} invalid or missing trajectory steps.")
             continue
 
         candidate_examples.append({
@@ -318,13 +388,14 @@ def build_dataset():
             "repo": repo,
             "patch_lines": patch_lines,
             "tool_calls": tool_calls,
-            "problem_text": problem_text,
-            "reasoning": pre_edit_thought,
+            "user_prompt": user_prompt,
             "patch_text": patch_text,
+            "messages": messages,
+            "turns_count": len(messages),
         })
 
     # Hard-fail guard against corrupted traces
-    total_skipped = skipped_no_patch + skipped_no_prompt
+    total_skipped = skipped_no_patch + skipped_no_trace
     skip_rate = total_skipped / total_resolved
     if skip_rate > MAX_SKIP_RATE:
         raise RuntimeError(
@@ -335,7 +406,7 @@ def build_dataset():
     logger.info(f"Passed quality filters: {len(candidate_examples)} candidates (dropped {filtered_outliers} outliers).")
 
     # Near-duplicate patch deduplication within same repository
-    deduped_examples: List[Dict] = []
+    deduped_examples: List[Dict[str, Any]] = []
     collapsed_duplicates = 0
 
     for cand in candidate_examples:
@@ -355,42 +426,30 @@ def build_dataset():
             deduped_examples.append(cand)
 
     logger.info(
-        f"Deduplication complete: {len(deduped_examples)} unique examples "
+        f"Deduplication complete: {len(deduped_examples)} unique multi-turn trajectories "
         f"({collapsed_duplicates} collapsed)."
     )
 
-    # Format into pure Gemma-4 chat turns (avoiding dual-template bugs in Unsloth)
     formatted_dataset = []
     for ex in deduped_examples:
-        user_content = (
-            f"You are an expert software engineer fixing an issue in `{ex['repo']}`.\n\n"
-            f"Problem Statement:\n{ex['problem_text']}\n\n"
-            "Please analyze the defect and provide the minimal, correct unified git diff patch to resolve the issue."
-        )
-        model_content = (
-            f"### Root Cause Analysis:\n{ex['reasoning']}\n\n"
-            f"### Proposed Unified Git Diff Patch:\n```diff\n{ex['patch_text']}\n```"
-        )
-        raw_text = (
-            f"<start_of_turn>user\n{user_content}<end_of_turn>\n"
-            f"<start_of_turn>model\n{model_content}<end_of_turn>"
-        )
+        raw_text = render_gemma_chat_turns(ex["messages"])
         formatted_dataset.append({
             "task_id": ex["task_id"],
             "repo": ex["repo"],
             "patch_lines": ex["patch_lines"],
             "tool_calls": ex["tool_calls"],
+            "turns_count": ex["turns_count"],
+            "messages": ex["messages"],
             "text": raw_text,
         })
 
-    # Stratified 80/20 Train/Validation Split
     repo_groups = defaultdict(list)
     for row in formatted_dataset:
         repo_groups[row["repo"]].append(row)
 
     random.seed(SEED)
-    train_rows: List[Dict] = []
-    val_rows: List[Dict] = []
+    train_rows: List[Dict[str, Any]] = []
+    val_rows: List[Dict[str, Any]] = []
 
     for repo, rows in sorted(repo_groups.items()):
         random.shuffle(rows)
@@ -403,23 +462,22 @@ def build_dataset():
 
     with open(TRAIN_OUT_PATH, "w", encoding="utf-8") as f_train:
         for row in train_rows:
-            f_train.write(json.dumps(row) + "\n")
+            f_train.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     with open(VAL_OUT_PATH, "w", encoding="utf-8") as f_val:
         for row in val_rows:
-            f_val.write(json.dumps(row) + "\n")
+            f_val.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print("\n" + "=" * 60)
-    print("           STRATIFIED DATASET CURATION SUMMARY")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("      STRATIFIED MULTI-TURN SFT DATASET CURATION SUMMARY")
+    print("=" * 65)
     print(f"Total verified input traces:        {total_resolved}")
     print(f"Passed filters & deduplication:     {len(formatted_dataset)}")
-    print(f"Training set (80%):                 {len(train_rows)} rows -> {TRAIN_OUT_PATH}")
-    print(f"Validation set (20% held-out):      {len(val_rows)} rows -> {VAL_OUT_PATH}")
-    print(f"Skipped missing patch/prompt:       {total_skipped}")
+    print(f"Training set (80%):                 {len(train_rows)} trajectories -> {TRAIN_OUT_PATH}")
+    print(f"Validation set (20% held-out):      {len(val_rows)} trajectories -> {VAL_OUT_PATH}")
     print(f"Filtered outliers (>150 lines/>35): {filtered_outliers}")
     print(f"Collapsed near-duplicate patches:   {collapsed_duplicates}")
-    print("=" * 60)
+    print("=" * 65)
 
 
 if __name__ == "__main__":
@@ -428,20 +486,20 @@ if __name__ == "__main__":
 
 ---
 
-## 4. Hardened LoRA Training Pipeline (`kaggle_unsloth/`)
+## 4. Hardened LoRA Training Pipeline with 16K Context (`kaggle_unsloth/`)
 
 From updated `kaggle_unsloth/train_gemma4_lora.ipynb`:
 
 ```python
-# Unsloth FastLanguageModel QLoRA Initialization
+# Unsloth FastLanguageModel QLoRA Initialization with 16,384 Sequence Length
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name="google/gemma-4-31b-it",
-    max_seq_length=4096,
+    max_seq_length=16384,          # Expanded from 4096 to prevent truncating multi-turn trajectories!
     dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
     load_in_4bit=True,
 )
 
-# Targeted Rank-8 PEFT: attention + output projection only
+# Targeted Rank-8 PEFT: attention + output projection only (freeze MLPs)
 model = FastLanguageModel.get_peft_model(
     model,
     r=8,
@@ -464,7 +522,7 @@ training_args = TrainingArguments(
     bf16=torch.cuda.is_bf16_supported(),
     logging_steps=2,
     eval_strategy="steps",
-    eval_steps=5,                   # Tracks held-out validation loss
+    eval_steps=5,                   # Tracks held-out validation loss across 10 held-out rows
     optim="adamw_8bit",
     weight_decay=0.05,
     lr_scheduler_type="cosine",
@@ -476,12 +534,27 @@ training_args = TrainingArguments(
 
 ---
 
-## 5. Line-Level Audit: Subprocess Isolation & Timeouts (`check.py` & `oracle.py`)
+## 5. Line-Level Audit: Subprocess Defensive Shield & Timeouts (`check.py` & `oracle.py`)
 
-As requested for the line-level audit, here are the exact subprocess isolation, process group killing, and timeout mechanisms:
-
-### A. Subprocess Process-Group Termination in `repro-check` (`check.py` lines 2090–2157)
+### A. Subprocess Process-Group Termination & Fast Socket Timeout in `repro-check` (`check.py`)
 ```python
+# 1. Runner environment hardening (lines 1780-1798):
+try:
+    import socket
+    socket.setdefaulttimeout(3.0)  # Fast-fail external network calls rather than hanging
+except Exception:
+    pass
+
+try:
+    import resource
+    curr_soft, curr_hard = resource.getrlimit(resource.RLIMIT_AS)
+    limit_1g = 1024 * 1024 * 1024
+    if curr_hard == resource.RLIM_INFINITY or curr_hard >= limit_1g:
+        resource.setrlimit(resource.RLIMIT_AS, (min(limit_1g, curr_hard), curr_hard))
+except Exception:
+    pass
+
+# 2. Process Group Spawning and Clean SIGKILL Termination (lines 2090-2157):
 proc = subprocess.Popen(
     cmd,
     cwd=temp_dir_path,
@@ -495,7 +568,7 @@ proc = subprocess.Popen(
 try:
     stdout_out, stderr_out = proc.communicate(timeout=timeout_secs)
 except subprocess.TimeoutExpired:
-    # Terminate entire process group cleanly via SIGKILL
+    # Cleanly kill entire process group on timeout
     if proc is not None:
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -508,15 +581,7 @@ except subprocess.TimeoutExpired:
             proc.communicate(timeout=2)
         except Exception:
             pass
-
-    timeout_summary = f"⏱️ Execution timed out after {timeout_secs}s (possible infinite loop in repro script)"
-    timeout_report = DiagnosticReport(
-        status="timeout",
-        exit_code=124,
-        summary=timeout_summary,
-        raw_stderr=f"Timeout expired ({timeout_secs}s)",
-    )
-    return 124, "", timeout_summary, timeout_report
+    return 124, "", f"⏱️ Execution timed out after {timeout_secs}s", timeout_report
 ```
 
 ### B. Timeout & Sentinel Handling in `code-oracle` (`oracle.py`)
@@ -544,5 +609,5 @@ except Exception:
 | **`fast-grep`** | 2,342 | `grep.py` | AST-aware keyword/regex search. Auto-fallback to literal substring on `re.error`; flashes enclosing functions; outputs `[CLEAN CODE FOR edit_file]`; fuzzy AST symbol suggestions on zero matches; max 500KB / 5000 lines bounds per file. |
 | **`code-map`** | 2,494 | `map.py` | Symbol call-graph & workspace indexer. Builds caller/callee AST graph across modules; `--file <path>` produces compact outlines under 100 lines without language server dependencies. |
 | **`code-oracle`** | 2,087 | `oracle.py` | Multi-domain evaluation oracle. Expression eval with 5.0s timeout; ANSI/hex terminal escape code validation (`\x1b[0m` check); CJK/emoji display width calculation; OWASP script tag escaping verification; OpenAPI schema resolution. |
-| **`repro-check`** | 2,729 | `check.py` | Isolated bug reproduction. Executes in `/tmp` using repo `PYTHONPATH`; distinct process group (`start_new_session=True`) killed via `os.killpg`; base64 argument bypass (`--b64 <payload>`); `--expect-exception` verification. |
+| **`repro-check`** | 2,746 | `check.py` | Isolated bug reproduction. Executes in `/tmp` using repo `PYTHONPATH`; distinct process group (`start_new_session=True`) killed via `os.killpg`; default socket timeout (3.0s); 1GB memory runaway guard; base64 argument bypass (`--b64 <payload>`); `--expect-exception` verification. |
 | **`test-gate`** | 1,612 | `gate.py` | Pre-submission regression gatekeeper. Blast-radius neighbor test runner; asserts zero test files (`tests/*`) modified; asserts no untracked scratch files in `/workspace`; validates AST syntax before `submit_patch()`. |
