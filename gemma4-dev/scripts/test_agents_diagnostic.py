@@ -49,7 +49,7 @@ async def test_agent(agent, agent_name: str):
 async def main():
     models = setup_gemma_model_registry(
         api_base="http://literouter.lan:7766/v1",
-        api_key="lr-or-oa-ch-no",
+        api_key=os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
         served_model="stealth/space-bunny-alpha",
     )
     mgr = SubprocessManager(system_site_packages=True)
