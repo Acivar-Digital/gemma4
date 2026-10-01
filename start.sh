@@ -14,7 +14,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
 export PYTHONDONTWRITEBYTECODE=1
-export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-30}"
+export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-15}"
 
 # Clean any stray bytecode cache in submission directory before ADK compilation
 find "$PROJECT_DIR/my_submission" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

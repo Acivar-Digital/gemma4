@@ -41,9 +41,9 @@ class EvalRunConfig(BaseModel):
         description="API Key (default: lr-or-oa-ch-no)",
     )
     concurrency: int = Field(
-        default_factory=lambda: int(os.getenv("SWEGEMMA_CONCURRENCY", "30")),
+        default_factory=lambda: int(os.getenv("SWEGEMMA_CONCURRENCY", "15")),
         ge=1,
-        description="Parallel task evaluations (default: 30)",
+        description="Parallel task evaluations (default: 15)",
     )
     max_tool_calls: int = Field(
         default=50,
@@ -279,8 +279,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--concurrency",
         type=int,
-        default=int(os.getenv("SWEGEMMA_CONCURRENCY", "30")),
-        help="Parallel task evaluations (default: 30)",
+        default=int(os.getenv("SWEGEMMA_CONCURRENCY", "15")),
+        help="Parallel task evaluations (default: 15)",
     )
     parser.add_argument(
         "--model",
