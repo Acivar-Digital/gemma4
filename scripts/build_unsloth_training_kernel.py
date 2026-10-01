@@ -2,10 +2,11 @@
 """Builds a standalone Kaggle training kernel for Unsloth Gemma 31B LoRA fine-tuning.
 
 Embeds:
-1. The curated SFT training dataset (data/unsloth_sft_train.jsonl) containing 56 verified winning trajectories.
-2. Unsloth FastLanguageModel 4-bit QLoRA configuration (Rank 16, alpha 16, target attention + MLP modules).
-3. SFTTrainer loop with cosine learning rate schedule, fp16/bf16 auto-detection, and gradient checkpointing.
-4. Export pipeline saving clean adapter_model.safetensors (~200MB) to /kaggle/working/adapters/.
+1. Hardened, stratified SFT datasets (train 38 rows, val 10 rows held out).
+2. Conservative Rank-8 LoRA configuration targeting attention & output projections only (q_proj, v_proj, o_proj).
+3. Anti-memorization controls: NEFTune noise alpha 5, lora_dropout 0.05, lr 2e-5, max_steps 20 (~2.5 epochs).
+4. Evaluation loop tracking validation loss across training steps.
+5. Export pipeline saving clean adapter_model.safetensors (~100-200MB) to /kaggle/working/adapters/.
 """
 
 import base64
@@ -13,13 +14,18 @@ import json
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-DATA_PATH = ROOT_DIR / "data" / "unsloth_sft_train.jsonl"
+DATA_TRAIN_PATH = ROOT_DIR / "data" / "unsloth_sft_train.jsonl"
+DATA_VAL_PATH = ROOT_DIR / "data" / "unsloth_sft_val.jsonl"
 KERNEL_DIR = ROOT_DIR / "kaggle_unsloth"
 KERNEL_DIR.mkdir(parents=True, exist_ok=True)
 
-assert DATA_PATH.exists(), f"SFT dataset not found at {DATA_PATH}"
-b64_data = base64.b64encode(DATA_PATH.read_bytes()).decode("ascii")
-print(f"Embedded SFT dataset base64 payload: {len(b64_data)} chars ({DATA_PATH.stat().st_size / 1024:.1f} KB)")
+assert DATA_TRAIN_PATH.exists(), f"Train dataset not found at {DATA_TRAIN_PATH}"
+assert DATA_VAL_PATH.exists(), f"Val dataset not found at {DATA_VAL_PATH}"
+
+b64_train = base64.b64encode(DATA_TRAIN_PATH.read_bytes()).decode("ascii")
+b64_val = base64.b64encode(DATA_VAL_PATH.read_bytes()).decode("ascii")
+print(f"Embedded Train payload: {len(b64_train)} chars ({DATA_TRAIN_PATH.stat().st_size / 1024:.1f} KB)")
+print(f"Embedded Val payload:   {len(b64_val)} chars ({DATA_VAL_PATH.stat().st_size / 1024:.1f} KB)")
 
 # Cell 0: Environment setup and Unsloth installation
 cell_0_env = """import subprocess
@@ -53,20 +59,28 @@ WORKING_DIR = Path("/kaggle/working")
 DATA_DIR = WORKING_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-B64_DATA = "{b64_data}"
+B64_TRAIN = "{b64_train}"
+B64_VAL = "{b64_val}"
+
 train_path = DATA_DIR / "train.jsonl"
-train_path.write_bytes(base64.b64decode(B64_DATA))
+train_path.write_bytes(base64.b64decode(B64_TRAIN))
+
+val_path = DATA_DIR / "val.jsonl"
+val_path.write_bytes(base64.b64decode(B64_VAL))
 
 with open(train_path, "r", encoding="utf-8") as f:
-    examples = [json.loads(line) for line in f if line.strip()]
+    train_examples = [json.loads(line) for line in f if line.strip()]
 
-print(f"Loaded {{len(examples)}} training examples into {{train_path}}.")
-print(f"First example task ID: {{examples[0].get('task_id')}}, repo: {{examples[0].get('repo')}}")
+with open(val_path, "r", encoding="utf-8") as f:
+    val_examples = [json.loads(line) for line in f if line.strip()]
+
+print(f"Loaded {{len(train_examples)}} training rows and {{len(val_examples)}} held-out validation rows.")
 """
 
 # Cell 2: Model and LoRA configuration
 cell_2_model = """import torch
 from unsloth import FastLanguageModel
+from pathlib import Path
 
 max_seq_length = 4096
 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
@@ -74,7 +88,6 @@ load_in_4bit = True
 
 print(f"Loading Gemma 31B in 4-bit QLoRA (max_seq_length={max_seq_length}, dtype={dtype})...")
 
-# Check for local Kaggle model path first, otherwise load from HuggingFace
 LOCAL_MODEL_PATH = Path("/kaggle/input/models/google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2")
 model_name = str(LOCAL_MODEL_PATH) if LOCAL_MODEL_PATH.exists() else "google/gemma-4-31b-it"
 
@@ -85,16 +98,13 @@ model, tokenizer = FastLanguageModel.from_pretrained(
     load_in_4bit=load_in_4bit,
 )
 
-print("Adding Rank-16 LoRA adapter to attention and MLP projections...")
+print("Configuring anti-memorization Rank-8 LoRA adapter on attention and output heads (q_proj, v_proj, o_proj)...")
 model = FastLanguageModel.get_peft_model(
     model,
-    r=16,
-    target_modules=[
-        "q_proj", "k_proj", "v_proj", "o_proj",
-        "gate_proj", "up_proj", "down_proj"
-    ],
+    r=8,
+    target_modules=["q_proj", "v_proj", "o_proj"],
     lora_alpha=16,
-    lora_dropout=0,
+    lora_dropout=0.05,
     bias="none",
     use_gradient_checkpointing="unsloth",
     random_state=42,
@@ -109,8 +119,9 @@ cell_3_train = """from datasets import load_dataset
 from trl import SFTTrainer
 from transformers import TrainingArguments
 
-dataset = load_dataset("json", data_files=str(train_path), split="train")
-print(f"HuggingFace dataset loaded: {len(dataset)} rows.")
+train_dataset = load_dataset("json", data_files=str(train_path), split="train")
+val_dataset = load_dataset("json", data_files=str(val_path), split="train")
+print(f"HuggingFace datasets loaded: train={len(train_dataset)}, val={len(val_dataset)}")
 
 OUTPUT_DIR = WORKING_DIR / "training_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -119,15 +130,18 @@ training_args = TrainingArguments(
     output_dir=str(OUTPUT_DIR),
     per_device_train_batch_size=2,
     gradient_accumulation_steps=4,
-    warmup_steps=5,
-    max_steps=60,
-    learning_rate=1.5e-4,
+    warmup_steps=3,
+    max_steps=20,
+    learning_rate=2.0e-5,
     fp16=not torch.cuda.is_bf16_supported(),
     bf16=torch.cuda.is_bf16_supported(),
-    logging_steps=5,
+    logging_steps=2,
+    eval_strategy="steps",
+    eval_steps=5,
     optim="adamw_8bit",
-    weight_decay=0.01,
+    weight_decay=0.05,
     lr_scheduler_type="cosine",
+    neftune_noise_alpha=5,
     seed=42,
     report_to="none",
 )
@@ -135,7 +149,8 @@ training_args = TrainingArguments(
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
-    train_dataset=dataset,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
     dataset_text_field="text",
     max_seq_length=max_seq_length,
     dataset_num_proc=2,
@@ -143,7 +158,7 @@ trainer = SFTTrainer(
     args=training_args,
 )
 
-print("Starting Unsloth LoRA fine-tuning...")
+print("Starting Unsloth LoRA fine-tuning with NEFTune noise alpha 5 and held-out validation...")
 train_stats = trainer.train()
 print("Training complete! Train stats:")
 print(train_stats)

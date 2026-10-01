@@ -170,7 +170,7 @@ class EvalTimeoutError(TimeoutError):
 
 
 def _eval_alarm_handler(signum: int, frame: Any) -> None:
-    raise EvalTimeoutError("Execution timed out (infinite loop or execution exceeded 2.0s limit).")
+    raise EvalTimeoutError("Execution timed out (infinite loop or execution exceeded 5.0s limit).")
 
 
 def run_eval(expr: str, as_json: bool = False) -> int:
@@ -288,12 +288,12 @@ def run_eval(expr: str, as_json: bool = False) -> int:
     }
     eval_locals: Dict[str, Any] = {}
 
-    # Set timer for timeout / infinite loop protection (2.0 seconds)
+    # Set timer for timeout / infinite loop protection (5.0 seconds for heavy imports)
     timer_armed = False
     try:
         if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
             signal.signal(signal.SIGALRM, _eval_alarm_handler)
-            signal.setitimer(signal.ITIMER_REAL, 2.0)
+            signal.setitimer(signal.ITIMER_REAL, 5.0)
             timer_armed = True
     except Exception:
         pass
