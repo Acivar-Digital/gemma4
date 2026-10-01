@@ -35,3 +35,4 @@ User cancelled YAML drafting (`projects-ey0` closed). Key task is LLM context on
 ## Workflow
 - `bd` for all tracking. Non-interactive shell flags (`cp -f`, `mv -f`, `rm -f`, `rm -rf`).
 - Verify by reading files / running `swegemma eval --task-id ...`, never by guessing.
+- **CRITICAL EXECUTION PROTOCOL (bd `execution-protocol-only-start-sh`):** The user ONLY runs `./start.sh` to execute SWE-Gemma evaluations and tests. Agents must NEVER run evaluation runners directly, NEVER invoke `scripts/run_eval.py`, NEVER launch evaluations in tmux windows, and NEVER execute tests automatically. All test executions are initiated exclusively by the user running `./start.sh`.

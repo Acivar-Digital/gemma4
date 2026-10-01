@@ -14,6 +14,7 @@ In SWE-bench and real-world issues, there is **no unit test in the repo for the 
 
 ## How to Run
 
+### 1. Direct Python Snippet
 Pass a Python code string containing your reproduction assertion:
 
 ```python
@@ -24,7 +25,8 @@ run_skill_script(
 )
 ```
 
-You can also pass multi-line Python snippets:
+Or multiline assertion matrix:
+
 ```python
 run_skill_script(
     skill_name="repro-check",
@@ -38,18 +40,88 @@ assert Text.from_ansi("\\n").plain == "\\n"
 )
 ```
 
+### 2. Missing-Validation Defect Verification (`--expect-exception`)
+For bugs where invalid input is silently accepted without validation:
+
+```python
+run_skill_script(
+    skill_name="repro-check",
+    file_path="check.py",
+    args=["--expect-exception", "ValueError", "from mypkg import validate; validate(-1)"]
+)
+```
+- **Baseline reproduction**: If the baseline code fails to raise `ValueError`, `repro-check` marks `defect_confirmed=True` (`🎯 DEFECT CONFIRMED (Expected Exception Not Raised)`).
+- **Post-fix verification**: When the fix causes `ValueError` to be raised, `repro-check` marks `status=PASSED` (`✅ PASSED: Expected exception 'ValueError' was raised as expected`).
+- Supports built-in and custom exception types (e.g. `ValueError`, `KeyError`, `AssertionError`, `pydantic.ValidationError`).
+
+### 3. Base64-Encoded Assertion Code (`--b64` / `--base64`)
+To completely eliminate JSON delimiter collisions and shell escaping bugs:
+
+```python
+run_skill_script(
+    skill_name="repro-check",
+    file_path="check.py",
+    args=["--b64", "YXNzZXJ0IDQgKyA0ID09IDg="]
+)
+```
+
+CLI:
+```bash
+python3 check.py --b64 "YXNzZXJ0IDQgKyA0ID09IDg="
+# Or with --expect-exception:
+python3 check.py --expect-exception ValueError --b64 "cmFpc2UgVmFsdWVFcnJvcignYmFkJyk="
+```
+
+### 4. Raw Multiline Script Execution (`--file` / `--stdin`)
+To avoid shell quote-escaping issues, newlines, and emoji/unicode truncation:
+
+```bash
+# Write script to /tmp using write_file
+# Then execute via --file:
+python3 check.py --file /tmp/repro.py
+
+# Or with --expect-exception:
+python3 check.py --file /tmp/repro.py --expect-exception ValueError
+
+# Or via stdin pipe:
+cat /tmp/repro.py | python3 check.py --expect-exception ValueError
+```
+
+## CLI Options & Flags
+- `--expect-exception, -e <EXC>`: Expect a specific exception type (e.g. `ValueError`, `KeyError`, `AssertionError`).
+  - Baseline silently completes -> `defect_confirmed=True` (exit 1).
+  - Fix raises exception -> `status=PASSED` (exit 0).
+- `--b64, --base64 <B64>`: Execute base64-encoded Python assertion code to completely eliminate shell quote-escaping or JSON crashes.
+- `--file, -f <FILE>`: Execute raw Python script from file inside `/tmp`.
+- `--stdin, -`: Execute raw Python script read from standard input.
+- `--help, -h`: Show usage instructions and exit (exit code 0).
+
+## Hardened Quote Sanitization & Syntax Pre-Validation
+`repro-check` includes native hardening against common LLM formatting artifacts:
+1. **Redundant Outer Quotes**: Strips outer `'...'`, `"..."`, `"""..."""`, `'''...'''`, and escaped outer `\"...\"` / `\'...\'`.
+2. **Markdown Code Fences**: Automatically strips ```python ... ``` and ``` ... ``` fences.
+3. **Escaped Quote Normalization**: Normalizes literal `\"` to `"` and `\'` to `'` when passed due to double-escaping in JSON tool payloads.
+4. **AST Pre-Parse Syntax Check**: Before writing any file to `/tmp` or spawning a process, `check.py` validates the code syntax with `ast.parse()`. If syntax is malformed, it outputs a clean, formatted `SYNTAX_ERROR` message with line number, snippet, and caret, exiting with code 1 rather than hanging or crashing.
+
 ## Guarantees
+- **Native Exception Expectation**: Deterministically catches missing validation bugs with `--expect-exception`.
 - **Omnivorous Execution**: Auto-asserts bare comparisons (`a == b`), auto-invokes uncalled test functions (`def test_...():`), and cleanly strips markdown fences.
-- **Runs outside `/workspace`**: Uses a temporary directory in `/tmp` as `cwd`, leaving `git diff HEAD` 100% clean and preventing any scratch file pollution.
-- **Uses workspace code**: Automatically sets `PYTHONPATH` to `/workspace/src:/workspace` so changes in your edited files are immediately reflected, supporting both flat and `src/` layouts.
-- **Smart Result Classification**: Distinguishes between `DEFECT CONFIRMED (Assertion Failed)`, `DEFECT REPRODUCED (Workspace Runtime Exception)`, `PASSED`, and `PROBE EXECUTION`.
-- **Probe Budget Limiter (Circuit Breaker)**: Enforces a strict 2-probe cap on pure exploratory checks before warning the agent to formulate a hypothesis and edit source code immediately.
-- **Fast & Safe (<2s)**: 45-second timeout, capped output, and always exits cleanly with code 0.
+- **Quote Sanitization & Hardening**: Automatically handles outer quotes, escaped quotes from JSON, and markdown fences.
+- **AST Pre-Parse Validation**: Pre-checks Python syntax and cleanly reports `SYNTAX_ERROR` without unhandled crashes.
+- **Deterministic Exit Codes**: Exits 0 on verification pass; exits 1 on assertion failure, missing expected exception, runtime exception, or syntax error.
+- **Path Containment Guard (Strict `/tmp` Isolation)**:
+  - All scratch files are strictly written into `/tmp`.
+  - Execution runs with `cwd` inside an isolated temporary directory in `/tmp`.
+  - Active containment guard intercepts and cleans up any accidental `/workspace/tmp/...` files, leaving `git diff HEAD` 100% clean.
+- **Uses workspace code**: Automatically sets `PYTHONPATH` prioritizing `/workspace` and `/workspace/src` so edits are immediately reflected across flat and `src/` layouts.
+- **Smart Result Classification**: Distinguishes between `DEFECT CONFIRMED (Assertion Failed)`, `DEFECT CONFIRMED (Expected Exception Not Raised)`, `DEFECT REPRODUCED (Workspace Runtime Exception)`, `PASSED`, and `PROBE RUN`.
+- **Probe Budget Limiter (Circuit Breaker)**: Enforces a strict 2-probe cap on pure exploratory checks. Automatically bypassed when testing assertions or `--expect-exception`.
+- **Fast & Safe (<2s)**: 35-second execution timeout, capped output, zero git pollution.
 
 ## Probe Budget & Circuit Breaker (Max 2 Probes)
 To prevent burning tool calls on open-ended exploratory `print()` probes:
-- Pure probe snippets (exit code 0 with no assertions or test functions) increment a probe counter stored in `/tmp/.swegemma_repro_probe_count`.
+- Pure probe snippets (exit code 0 with no assertions, test functions, or expected exceptions) increment a probe counter stored in `/tmp/.swegemma_repro_probe_count`.
 - **2-Probe Cap**: When counter reaches 2, `repro-check` emits:
   `[repro-check] ⚠️ PROBE BUDGET REACHED (2/2 probes used): You have executed 2 exploratory probes without reproducing a defect or failing an assertion. Stop probing! Formulate your defect hypothesis, locate candidate source lines, and call edit_file immediately.`
-- **Automatic Reset**: Any defect reproduction (`AssertionError` or `Workspace Runtime Exception`) or passing verification (`✅ PASSED`) automatically resets the probe counter to 0.
+- **Automatic Reset**: Any defect reproduction (`AssertionError`, missing exception, or `Workspace Runtime Exception`) or passing verification (`✅ PASSED`) automatically resets the probe counter to 0.
 - **Rule**: Do not continue probing after 2 exploratory probes. Immediately formulate a candidate fix and invoke `edit_file`.

@@ -7,12 +7,11 @@ tools:
   - write_file
   - get_status
   - submit_patch
-  - search_similar_code
 skills:
   - skills/repro-check
   - skills/blast-radius
   - skills/fast-grep
-  - skills/repo-map
-  - skills/code-graph
+  - skills/code-map
   - skills/diff-inspect
+  - skills/syntax-guard
 generate_content_config: !include configs/sampling.yaml

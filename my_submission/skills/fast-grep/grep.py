@@ -11,6 +11,7 @@ Eats ANY input format:
 - Explains regex syntax errors in plain English and suggests escaped patterns
 - 100% Pydantic v2 structured schemas (FastGrepResult, MatchExplanation, FuzzySuggestion, etc.)
 - Flashes top 3 enclosing functions with complete decorators via AST
+- Prioritizes function, method, and class definitions at the top of search rankings over call sites
 - Boosts common string/buffer transformation methods & verbs
 - Highlights call-sites and enclosing scopes where strings/buffers are transformed
 - Automatically expands terse issue keywords to candidate string operations
@@ -120,6 +121,10 @@ class GrepMatch(BaseModel):
     is_call_site: bool = Field(
         default=False, description="Whether line is an active transform call-site"
     )
+    is_definition: bool = Field(
+        default=False,
+        description="Whether line is a function, method, or class definition signature",
+    )
     scope_name: Optional[str] = Field(
         default=None, description="Enclosing function or class name"
     )
@@ -206,6 +211,8 @@ SKIP_DIRS: Set[str] = {
     "doc",
     "htmlcov",
     "site-packages",
+    "embeddings",
+    ".adk_exec",
 }
 
 SKIP_EXTENSIONS: Set[str] = {
@@ -220,8 +227,12 @@ SKIP_EXTENSIONS: Set[str] = {
     ".svg",
     ".ico",
     ".pyc",
+    ".safetensors",
     ".whl",
     ".json",
+    ".jsonl",
+    ".npz",
+    ".npy",
     ".csv",
     ".log",
     ".xml",
@@ -432,15 +443,50 @@ def parse_args(
     is_json = False
     is_help = False
 
-    for a in args:
+    def add_term_or_tokens(term: str) -> None:
+        """Add term, auto-tokenizing multi-word whitespace-separated queries."""
+        cleaned_term = clean_search_term(term)
+        if not cleaned_term:
+            return
+        parts = cleaned_term.split()
+        if len(parts) > 1:
+            for part in parts:
+                p = clean_search_term(part)
+                if p and p not in raw_terms:
+                    raw_terms.append(p)
+        else:
+            if cleaned_term not in raw_terms:
+                raw_terms.append(cleaned_term)
+
+    i = 0
+    while i < len(args):
+        a = args[i]
         cleaned = clean_search_term(a)
         if not cleaned:
+            i += 1
             continue
+
         if cleaned in ("--help", "-h"):
             is_help = True
+            i += 1
             continue
+
         if cleaned == "--json":
             is_json = True
+            i += 1
+            continue
+
+        if cleaned in ("--query", "-q"):
+            if i + 1 < len(args) and args[i + 1] not in ("--help", "-h", "--json"):
+                i += 1
+                add_term_or_tokens(args[i])
+            i += 1
+            continue
+
+        if cleaned.startswith("--query=") or cleaned.startswith("-q="):
+            val = cleaned.split("=", 1)[1]
+            add_term_or_tokens(val)
+            i += 1
             continue
 
         cand = ws / cleaned.lstrip("/")
@@ -452,7 +498,9 @@ def parse_args(
         elif cleaned in (".", "./", "/workspace", "/workspace/"):
             target_path = ws
         else:
-            raw_terms.append(cleaned)
+            add_term_or_tokens(cleaned)
+
+        i += 1
 
     return raw_terms, target_path, is_json, is_help
 
@@ -550,7 +598,13 @@ def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
                 except ValueError:
                     rel = str(target)
             res = subprocess.run(
-                ["git", "ls-files", rel],
+                [
+                    "git",
+                    "ls-files",
+                    rel,
+                    ":(exclude)*.adk_exec*",
+                    ":(exclude)**/.adk_exec*",
+                ],
                 cwd=ws,
                 capture_output=True,
                 text=True,
@@ -558,7 +612,14 @@ def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
                 check=False,
             )
             if res.returncode == 0:
-                files = [f for f in res.stdout.splitlines() if f.strip()]
+                files = [
+                    f
+                    for f in res.stdout.splitlines()
+                    if f.strip()
+                    and not (
+                        ".adk_exec" in f or f.startswith(".adk_exec")
+                    )
+                ]
                 if files:
                     return len(files)
         except Exception:
@@ -570,13 +631,16 @@ def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
             dirs[:] = [
                 d
                 for d in dirs
-                if d not in SKIP_DIRS and not d.startswith(".")
+                if d not in SKIP_DIRS
+                and not d.startswith(".")
+                and not (".adk_exec" in d or d.startswith(".adk_exec"))
             ]
             count += len(
                 [
                     f
                     for f in files
                     if not any(f.endswith(ext) for ext in SKIP_EXTENSIONS)
+                    and not (".adk_exec" in f or f.startswith(".adk_exec"))
                 ]
             )
     except Exception:
@@ -603,10 +667,13 @@ def extract_candidate_symbols(
                 for d in dirs
                 if d not in SKIP_DIRS
                 and not d.startswith(".")
+                and not (".adk_exec" in d or d.startswith(".adk_exec"))
                 and "test" not in d.lower()
-                and "doc" not in d.lower()
+                and ("doc" not in d.lower() or "docs_src" in d.lower())
             ]
             for f in files:
+                if ".adk_exec" in f or f.startswith(".adk_exec"):
+                    continue
                 if not f.endswith(".py"):
                     continue
                 scanned_files += 1
@@ -754,6 +821,8 @@ def run_git_grep(
     for ext in SKIP_EXTENSIONS:
         path_args.append(f":(exclude)*{ext}")
         path_args.append(f":(exclude)**/*{ext}")
+    path_args.append(":(exclude)*.adk_exec*")
+    path_args.append(":(exclude)**/.adk_exec*")
 
     # 1. Try extended regex (-E)
     cmd = ["git", "grep", "-n", "-I"]
@@ -771,7 +840,17 @@ def run_git_grep(
             check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
-            return [line for line in res.stdout.splitlines() if line.strip()]
+            clean_lines = [
+                line
+                for line in res.stdout.splitlines()
+                if line.strip()
+                and not (
+                    ".adk_exec" in line.split(":", 1)[0]
+                    or line.split(":", 1)[0].startswith(".adk_exec")
+                )
+            ]
+            if clean_lines:
+                return clean_lines
     except Exception:
         pass
 
@@ -793,7 +872,15 @@ def run_git_grep(
             )
             if res.returncode == 0 and res.stdout.strip():
                 for line in res.stdout.splitlines():
-                    if line.strip() and line not in all_lines:
+                    if not line.strip():
+                        continue
+                    matched_file = line.split(":", 1)[0]
+                    if (
+                        ".adk_exec" in matched_file
+                        or matched_file.startswith(".adk_exec")
+                    ):
+                        continue
+                    if line not in all_lines:
                         all_lines.append(line)
         except Exception:
             pass
@@ -829,9 +916,13 @@ def python_walk_fallback(
         dirs[:] = [
             d
             for d in dirs
-            if d not in SKIP_DIRS and not d.startswith(".")
+            if d not in SKIP_DIRS
+            and not d.startswith(".")
+            and not (".adk_exec" in d or d.startswith(".adk_exec"))
         ]
         for f in sorted(files):
+            if ".adk_exec" in f or f.startswith(".adk_exec"):
+                continue
             if any(f.endswith(ext) for ext in SKIP_EXTENSIONS):
                 continue
             full_p = pathlib.Path(root) / f
@@ -879,19 +970,51 @@ def score_match(
     elif file_path.endswith((".pyi", ".toml")):
         score += 10
 
-    # Demote tests and docs
+    # Demote tests and docs (exempt executable tutorial code in docs_src/*.py)
     if "test" in p_lower:
         score -= 40
-    if "doc" in p_lower or file_path.endswith((".md", ".rst")):
+    is_docs_src_py = "docs_src" in p_lower and file_path.endswith(".py")
+    if not is_docs_src_py and ("doc" in p_lower or file_path.endswith((".md", ".rst"))):
         score -= 40
     if "bench" in p_lower or "example" in p_lower:
         score -= 50
 
-    # Boost definitions and calls
-    if re.search(r"^\s*(def|class|async\s+def)\s+", content):
-        score += 50
-    elif re.search(r"\b(def|class)\b", content):
-        score += 30
+    # Priority Tier 1: Function, method, and class definitions
+    # Surface definitions prominently at the top over call sites, comments, and docstrings.
+    # In rich_4076 (Run B32), def from_ansi was drowned out by dozens of call sites and comments.
+    is_code = not c.startswith(("#", "//", "/*", "*", '"""', "'''"))
+    if is_code:
+        # Boost lines containing definition keywords or decorators
+        if re.search(r"\b(async\s+def|def|class)\s+", content):
+            score += 60
+        elif "@" in content:
+            score += 30
+
+        # Dedicated top tier for lines starting with function/class signatures
+        if re.search(r"^\s*(async\s+def|def|class)\s+", content):
+            score += 60
+            # Extra boost if the defined symbol name directly matches a search term
+            for t in terms:
+                cleaned_t = t.strip()
+                if cleaned_t:
+                    # Exact symbol match (e.g. def from_ansi with query from_ansi)
+                    if re.search(
+                        rf"^\s*(async\s+def|def|class)\s+{re.escape(cleaned_t)}\b",
+                        content,
+                        re.IGNORECASE,
+                    ):
+                        score += 75
+                        break
+                    # Substring symbol match (e.g. def from_ansi with query ansi)
+                    elif re.search(
+                        rf"^\s*(async\s+def|def|class)\s+\w*{re.escape(cleaned_t)}\w*",
+                        content,
+                        re.IGNORECASE,
+                    ):
+                        score += 50
+                        break
+        elif re.search(r"^\s*@", content):
+            score += 30
 
     if "=" in content and not content.strip().startswith("#"):
         score += 10
@@ -1000,8 +1123,9 @@ Positional arguments:
   path             Optional target directory or file (defaults to /workspace).
 
 Options:
-  --help, -h       Show this help message and exit.
-  --json           Output results as structured JSON conforming to Pydantic v2 FastGrepResult.
+  --help, -h          Show this help message and exit.
+  --query, -q <term>  Search term or phrase (multi-word queries are auto-tokenized).
+  --json              Output results as structured JSON conforming to Pydantic v2 FastGrepResult.
 
 Diagnostics:
   - Zero matches: Deterministically explains file counts, runs case-insensitive search, and suggests top 5 fuzzy candidate symbols from AST.
@@ -1188,19 +1312,6 @@ def main() -> int:
                     )
                 print()
 
-            # Fuzzy symbol suggestions
-            if fuzzy_suggestions:
-                sym_list = ", ".join(
-                    repr(s.symbol) for s in fuzzy_suggestions[:5]
-                )
-                print(f"Did you mean one of these symbols: [{sym_list}]")
-                for s in fuzzy_suggestions[:5]:
-                    loc = f" in {s.source_file}" if s.source_file else ""
-                    print(
-                        f"  - {s.symbol} ({s.kind}{loc}) [similarity: {s.similarity:.2f}]"
-                    )
-                print()
-
             return 0
 
         # 4. Parse and rank MATCHES FOUND
@@ -1224,7 +1335,14 @@ def main() -> int:
                 sc = score_match(
                     fp, lineno, content, expanded_terms, scope_name=scope_name
                 )
-                is_call_site = is_string_transform_line(content)
+                is_def = bool(
+                    not content.strip().startswith(("#", "//", "/*", "*", '"""', "'''"))
+                    and (
+                        re.search(r"^\s*(async\s+def|def|class)\s+", content)
+                        or re.search(r"^\s*@", content)
+                    )
+                )
+                is_call_site = is_string_transform_line(content) and not is_def
                 parsed.append(
                     GrepMatch(
                         file=fp,
@@ -1233,6 +1351,7 @@ def main() -> int:
                         score=sc,
                         scope_name=scope_name or None,
                         is_call_site=is_call_site,
+                        is_definition=is_def,
                     )
                 )
 
@@ -1264,7 +1383,7 @@ def main() -> int:
                             code_snippet="\n".join(scope["lines"]),
                         )
                     )
-                    if len(flashed) >= 3:
+                    if len(flashed) >= 2:
                         break
 
         explanation = MatchExplanation(
@@ -1306,10 +1425,15 @@ def main() -> int:
             lines = sc["lines"]
             target_lineno = m.lineno
             is_call_site = m.is_call_site
+            is_def = m.is_definition
             is_transform_scope = sc.get("is_transform", False)
 
             scope_tag = ""
-            if is_transform_scope and is_call_site:
+            if is_def and is_transform_scope:
+                scope_tag = " [🎯 DEFINITION TARGET & TRANSFORM SCOPE]"
+            elif is_def:
+                scope_tag = " [🎯 DEFINITION TARGET]"
+            elif is_transform_scope and is_call_site:
                 scope_tag = " [⚡ STRING/BUFFER CALL-SITE & TRANSFORM SCOPE]"
             elif is_call_site:
                 scope_tag = " [⚡ STRING/BUFFER CALL-SITE]"
@@ -1324,28 +1448,44 @@ def main() -> int:
 
             def format_line(lineno: int, text: str) -> str:
                 if lineno == target_lineno:
-                    callout = (
-                        "  <-- [CALL-SITE: string/buffer transform]"
-                        if is_call_site
-                        else "  <-- [MATCH]"
-                    )
+                    if is_def:
+                        callout = "  <-- [DEFINITION TARGET]"
+                    elif is_call_site:
+                        callout = (
+                            "  <-- [CALL-SITE: string/buffer transform]"
+                        )
+                    else:
+                        callout = "  <-- [MATCH]"
                     return f"{lineno:4d}: >>> {text}{callout}"
                 return f"{lineno:4d}:     {text}"
 
-            # Middle-fold if over 100 lines
-            if len(lines) > 100:
-                head = lines[:40]
-                tail = lines[-40:]
-                for i, l in enumerate(head, start=s_line):
+            # Target-centered window: always keep target_lineno visible with surrounding context
+            rel_idx = max(0, min(len(lines) - 1, target_lineno - s_line))
+            if len(lines) > 45:
+                w_start = max(0, rel_idx - 15)
+                w_end = min(len(lines), rel_idx + 25)
+                display_lines = lines[w_start:w_end]
+                disp_start_lineno = s_line + w_start
+                if w_start > 0:
+                    print(f"  ... [{w_start} lines before in {s_name} omitted] ...")
+                for i, l in enumerate(display_lines, start=disp_start_lineno):
                     print(format_line(i, l))
-                print(
-                    f" ... [{len(lines) - 80} lines folded for context budget] ..."
-                )
-                for i, l in enumerate(tail, start=s_line + len(lines) - 40):
-                    print(format_line(i, l))
+                if w_end < len(lines):
+                    print(f"  ... [{len(lines) - w_end} lines after in {s_name} omitted] ...")
             else:
+                display_lines = lines
+                w_start = 0
+                w_end = len(lines)
                 for i, l in enumerate(lines, start=s_line):
                     print(format_line(i, l))
+            
+            # For the primary top match, output clean unadorned code block ready for edit_file
+            if idx == 1:
+                clean_snippet = "\n".join(lines[w_start:w_end])
+                print("\n[CLEAN CODE FOR edit_file (EXACT INDENTATION)]:")
+                print("```python")
+                print(clean_snippet)
+                print("```")
             print()
 
         # Summary of other ranked matches
@@ -1353,7 +1493,12 @@ def main() -> int:
         print("📋 TOP MATCH PREVIEWS:")
         for m in parsed[:15]:
             snippet = m.content.strip()[:75]
-            site_tag = " [CALL-SITE]" if m.is_call_site else ""
+            if m.is_definition:
+                site_tag = " [DEF]"
+            elif m.is_call_site:
+                site_tag = " [CALL-SITE]"
+            else:
+                site_tag = ""
             print(f"  [{m.score:+3d}] {m.file}:{m.lineno}{site_tag}: {snippet}")
 
         if len(parsed) > 15:

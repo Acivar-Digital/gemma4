@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
 """repro-check: Omnivorous Defect Reproduction & Verification Engine.
 
-Upgraded with deterministic AST assertion introspection, character-level diffs,
-and plain-English failure explanations.
+V2 Upgrades:
+- Native `--expect-exception <ExceptionType>` support:
+  Deterministically catches missing-validation defects (defect_confirmed=True when not raised,
+  status=PASSED when fix causes the exception to be raised).
+- Base64 decode support via `--b64` / `--base64` to cleanly bypass shell/JSON quote escaping.
+- Input quote and fence sanitization (strips redundant outer quotes, markdown blocks, and JSON escaped quotes).
+- AST pre-parse syntax validation: verifies syntax prior to scratch file generation or execution.
+- Raw multiline script execution via `--file`, `--stdin`, or pipes into isolated `/tmp` cwd,
+  avoiding CLI quote escaping and emoji truncation.
+- Path Containment Guard: Strictly isolates scratch files in `/tmp` and prevents/cleans any
+  accidental `/workspace/tmp/...` files that could pollute git status.
+- Prioritizes /workspace and /workspace/src in PYTHONPATH.
 
-Eats ANY input format:
+Omnivorous core features:
 - Auto-asserts bare comparison expressions: `a == b` -> `assert a == b`
 - Auto-invokes uncalled test functions: `def test_...():`
 - Auto-heals unterminated string literals with raw unescaped newlines in `'...'` and `"..."`
 - Omnivorous assert acceptance: executions without explicit `assert` that exit 0 are accepted as valid passes
 - Bypasses 2-probe circuit breaker when workspace contains modified files (post-edit verification)
 - Strips markdown fences (```py, ```python, etc.) and auto-dedents
-- Guarantees zero workspace git pollution (executes inside isolated /tmp cwd)
-- Prioritizes /workspace and /workspace/src in PYTHONPATH
 - Deterministic failure explanations: introspects failing frame, local variables, actual/expected values, char diffs
 - Structured 100% Pydantic v2 models for all diagnostic outputs
-- Always exits 0 and never crashes.
+- Exits 0 on pass, exits 1 on fail/syntax error.
 """
 
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import difflib
 import inspect
@@ -30,6 +39,7 @@ import linecache
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -124,7 +134,7 @@ class DiagnosticReport(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    status: str = Field(..., description="Status: passed, assertion_error, runtime_exception, syntax_error, probe_budget_reached, probe_run, timeout, error")
+    status: str = Field(..., description="Status: passed, PASSED, missing_exception, assertion_error, runtime_exception, syntax_error, probe_budget_reached, probe_run, timeout, error")
     exit_code: int = Field(default=0, description="Process exit code")
     summary: str = Field(..., description="High-level diagnostic summary")
     assertion_diagnostic: Optional[AssertionDiagnostic] = Field(default=None, description="Details if assertion failed")
@@ -152,9 +162,18 @@ class ReproCheckOutput(BaseModel):
 
     success: bool = Field(..., description="True if verification passed cleanly")
     defect_confirmed: bool = Field(..., description="True if defect was reproduced via assertion or exception")
-    category: str = Field(..., description="Category: passed, assertion_failure, workspace_exception, runtime_exception, syntax_error, probe_budget_reached, probe_run, general_failure")
+    category: str = Field(..., description="Category: passed, assertion_failure, workspace_exception, runtime_exception, syntax_error, probe_budget_reached, probe_run, general_failure, missing_exception")
     report: DiagnosticReport = Field(..., description="Structured diagnostic report")
     rendered_output: str = Field(..., description="Rendered human/agent readable text")
+
+
+VariableInfo.model_rebuild()
+StackFrameInfo.model_rebuild()
+AssertionDiagnostic.model_rebuild()
+ExceptionDiagnostic.model_rebuild()
+DiagnosticReport.model_rebuild()
+ReproCheckInput.model_rebuild()
+ReproCheckOutput.model_rebuild()
 
 
 # =============================================================================
@@ -632,6 +651,45 @@ def explain_exception_operation(
     return f"Operation failed with {exc_type}: {exc_msg}"
 
 
+def matches_expected_exception(exc: BaseException, expect_str: Optional[str]) -> bool:
+    """Check if the raised exception matches the expected exception specification.
+
+    Supports:
+    - Exception class name: 'ValueError', 'KeyError', 'AssertionError'
+    - Fully-qualified name: 'pydantic.ValidationError', 'builtins.ValueError'
+    - Comma-separated list: 'ValueError, TypeError'
+    - Class inheritance / MRO matching: subclass matches parent type name
+    - Case-insensitive fallback
+    """
+    if not expect_str:
+        return False
+
+    targets = [t.strip() for t in expect_str.split(",") if t.strip()]
+    exc_type = type(exc)
+    exc_type_name = exc_type.__name__
+    exc_full_name = f"{exc_type.__module__}.{exc_type_name}"
+    mro_names = {cls.__name__ for cls in inspect.getmro(exc_type)}
+
+    for target in targets:
+        # Direct class name match
+        if target == exc_type_name:
+            return True
+        # Full module.class match or suffix match
+        if target == exc_full_name or exc_full_name.endswith(f".{target}"):
+            return True
+        # MRO / inheritance match (e.g. target is 'Exception', 'ValueError', etc.)
+        if target in mro_names:
+            return True
+        # Special case: ReproAssertionError is an AssertionError
+        if isinstance(exc, ReproAssertionError) and target in ("AssertionError", "ReproAssertionError"):
+            return True
+        # Case-insensitive comparison
+        if target.lower() == exc_type_name.lower() or any(target.lower() == m.lower() for m in mro_names):
+            return True
+
+    return False
+
+
 # =============================================================================
 # Runtime Assertion Interceptors
 # =============================================================================
@@ -820,19 +878,106 @@ def auto_heal_unterminated_strings(code: str) -> str:
     return "".join(out)
 
 
-def clean_and_normalize_code(raw_args: List[str]) -> str:
-    """Extract code from arbitrary CLI arguments, stripping fences and normalizing indentation."""
-    code = "\n".join(raw_args).strip()
+def sanitize_assertion_code(raw: str) -> str:
+    """Sanitize assertion input string against outer quoting artifacts, markdown fences, and JSON escaped quotes."""
+    code = raw.strip()
 
-    # Strip markdown code blocks: ```python ... ``` or ```py ... ``` or ``` ... ```
-    code = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n?", "", code)
-    code = re.sub(r"\n?```\s*$", "", code)
+    # Step 1: Strip markdown code blocks and outer redundant quotes iteratively
+    for _ in range(5):
+        code = code.strip()
 
-    # Handle accidental literal escaped newlines if passed improperly
+        # Check markdown fences: ```python ... ``` or ```py ... ``` or ``` ... ```
+        fence_match = re.match(r"^```[a-zA-Z0-9_-]*\s*\n?(.*?)\n?```$", code, re.DOTALL)
+        if fence_match:
+            code = fence_match.group(1).strip()
+            continue
+
+        # Check escaped outer quotes: \"...\" or \'...\'
+        if len(code) >= 4:
+            if code.startswith('\\"') and code.endswith('\\"'):
+                code = code[2:-2].strip()
+                continue
+            if code.startswith("\\'") and code.endswith("\\'"):
+                code = code[2:-2].strip()
+                continue
+
+        # Check triple quotes: """...""" or '''...'''
+        if len(code) >= 6:
+            if code.startswith('"""') and code.endswith('"""'):
+                code = code[3:-3].strip()
+                continue
+            if code.startswith("'''") and code.endswith("'''"):
+                code = code[3:-3].strip()
+                continue
+
+        # Check single outer quotes: "..." or '...'
+        if len(code) >= 2:
+            if code.startswith('"') and code.endswith('"'):
+                code = code[1:-1].strip()
+                continue
+            if code.startswith("'") and code.endswith("'"):
+                code = code[1:-1].strip()
+                continue
+
+        break
+
+    # Step 2: Normalize escaped quotes if passed literally due to double-escaping in JSON
+    if '\\"' in code or "\\'" in code:
+        needs_norm = False
+        try:
+            tree = ast.parse(code)
+            # If it parsed as a single string constant, it's wrapped in quotes
+            if (
+                len(tree.body) == 1
+                and isinstance(tree.body[0], ast.Expr)
+                and isinstance(tree.body[0].value, ast.Constant)
+                and isinstance(tree.body[0].value.value, str)
+            ):
+                needs_norm = True
+        except SyntaxError:
+            needs_norm = True
+
+        if needs_norm:
+            code = code.replace('\\"', '"').replace("\\'", "'")
+
+    # Step 3: Check if code is a string literal containing python code (e.g. wrapped in quotes that parsed as string)
+    try:
+        tree = ast.parse(code)
+        if len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Constant):
+            if isinstance(tree.body[0].value.value, str):
+                inner_str = tree.body[0].value.value.strip()
+                try:
+                    inner_tree = ast.parse(inner_str)
+                    if inner_tree.body and not (
+                        len(inner_tree.body) == 1
+                        and isinstance(inner_tree.body[0], ast.Expr)
+                        and isinstance(inner_tree.body[0].value, ast.Constant)
+                    ):
+                        code = inner_str
+                except SyntaxError:
+                    pass
+    except SyntaxError:
+        pass
+
+    # Normalize newlines if literal \n was passed improperly
     if "\\n" in code and "\n" not in code:
         code = code.replace("\\n", "\n")
 
     code = textwrap.dedent(code).strip()
+    return code
+
+
+def clean_and_normalize_code(raw_args: Union[List[str], str]) -> str:
+    """Extract code from arbitrary CLI arguments or string, stripping fences, outer quotes, and normalizing indentation."""
+    if isinstance(raw_args, str):
+        code = raw_args.strip()
+    else:
+        if any("\n" in t for t in raw_args):
+            code = "\n".join(raw_args).strip()
+        else:
+            code = " ".join(raw_args).strip()
+
+    code = sanitize_assertion_code(code)
     return auto_heal_unterminated_strings(code)
 
 
@@ -1064,10 +1209,78 @@ def is_probe_circuit_breaker_active(ws: pathlib.Path) -> bool:
 
 
 # =============================================================================
+# Path Containment Guard (Strict /tmp Isolation)
+# =============================================================================
+
+class PathContainmentGuard:
+    """Active containment guard ensuring all scratch files remain strictly in /tmp.
+
+    Prevents and cleans up any accidental /workspace/tmp/... file creation
+    that could pollute git status.
+    """
+
+    def __init__(self, ws: pathlib.Path):
+        self.ws = ws.resolve()
+        self.ws_tmp = self.ws / "tmp"
+        self.pre_existing_files: Set[pathlib.Path] = set()
+        if self.ws_tmp.exists():
+            try:
+                self.pre_existing_files = {p.resolve() for p in self.ws_tmp.rglob("*")}
+            except Exception:
+                pass
+
+    def cleanup_pollution(self) -> List[str]:
+        """Purge any scratch files or directories created inside /workspace/tmp."""
+        cleaned: List[str] = []
+        if not self.ws_tmp.exists():
+            return cleaned
+
+        try:
+            current_files = {p.resolve() for p in self.ws_tmp.rglob("*")}
+            new_files = current_files - self.pre_existing_files
+            for p in sorted(new_files, key=lambda x: len(str(x)), reverse=True):
+                try:
+                    if p.is_file() or p.is_symlink():
+                        p.unlink(missing_ok=True)
+                        cleaned.append(str(p))
+                    elif p.is_dir() and not any(p.iterdir()):
+                        p.rmdir()
+                        cleaned.append(str(p))
+                except Exception:
+                    pass
+
+            if (
+                self.ws_tmp.is_dir()
+                and not any(self.ws_tmp.iterdir())
+                and self.ws_tmp.resolve() not in self.pre_existing_files
+            ):
+                self.ws_tmp.rmdir()
+                cleaned.append(str(self.ws_tmp))
+        except Exception:
+            pass
+
+        return cleaned
+
+
+def assert_scratch_path_contained(path: pathlib.Path, ws: pathlib.Path) -> None:
+    """Guard that scratch files/directories are strictly outside the workspace."""
+    resolved = path.resolve()
+    ws_resolved = ws.resolve()
+    if resolved == ws_resolved or ws_resolved in resolved.parents:
+        raise RuntimeError(
+            f"[repro-check] Path containment violation: Scratch path {resolved} is inside workspace {ws_resolved}!"
+        )
+
+
+# =============================================================================
 # In-Harness Process Execution
 # =============================================================================
 
-def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
+def run_harness(
+    script_path: pathlib.Path,
+    report_path: pathlib.Path,
+    expect_exception: Optional[str] = None,
+) -> None:
     """Internal runner executed inside isolated subprocess with diagnostic recording."""
     source_code = script_path.read_text(encoding="utf-8")
 
@@ -1089,158 +1302,194 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
         with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
             exec(compiled, global_ns)
 
-        report = DiagnosticReport(
-            status="passed",
-            exit_code=0,
-            summary="All assertions and checks passed with 0 errors.",
-            raw_stdout=stdout_capture.getvalue(),
-            raw_stderr=stderr_capture.getvalue(),
-        )
+        if expect_exception:
+            report = DiagnosticReport(
+                status="missing_exception",
+                exit_code=1,
+                summary=f"Expected exception '{expect_exception}' was NOT raised. Execution completed normally.",
+                raw_stdout=stdout_capture.getvalue(),
+                raw_stderr=stderr_capture.getvalue(),
+            )
+        else:
+            report = DiagnosticReport(
+                status="passed",
+                exit_code=0,
+                summary="All assertions and checks passed with 0 errors.",
+                raw_stdout=stdout_capture.getvalue(),
+                raw_stderr=stderr_capture.getvalue(),
+            )
 
     except ReproAssertionError as exc:
         stdout_val = stdout_capture.getvalue()
         stderr_val = stderr_capture.getvalue()
 
-        locals_dict: Dict[str, VariableInfo] = {}
-        if exc.frame:
-            for k, v in exc.frame.f_locals.items():
-                if not k.startswith("__") and k not in ("__repro_assert__", "__repro_assert_truthy__"):
-                    locals_dict[k] = introspect_variable(k, v)
+        if expect_exception and matches_expected_exception(exc, expect_exception):
+            report = DiagnosticReport(
+                status="PASSED",
+                exit_code=0,
+                summary=f"Expected exception '{type(exc).__name__}' was raised as expected: {exc}",
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
+        else:
+            locals_dict: Dict[str, VariableInfo] = {}
+            if exc.frame:
+                for k, v in exc.frame.f_locals.items():
+                    if not k.startswith("__") and k not in ("__repro_assert__", "__repro_assert_truthy__"):
+                        locals_dict[k] = introspect_variable(k, v)
 
-        actual_type = type(exc.actual).__name__
-        actual_repr = format_value_repr(exc.actual)
-        actual_len = get_length(exc.actual)
+            actual_type = type(exc.actual).__name__
+            actual_repr = format_value_repr(exc.actual)
+            actual_len = get_length(exc.actual)
 
-        expected_type = type(exc.expected).__name__
-        expected_repr = format_value_repr(exc.expected)
-        expected_len = get_length(exc.expected)
+            expected_type = type(exc.expected).__name__
+            expected_repr = format_value_repr(exc.expected)
+            expected_len = get_length(exc.expected)
 
-        explanation, diff_str, first_diff_idx = explain_assertion_failure(
-            exc.actual, exc.op, exc.expected, exc.msg
-        )
-        hint = get_string_remediation_hint(exc.actual, exc.expected)
+            explanation, diff_str, first_diff_idx = explain_assertion_failure(
+                exc.actual, exc.op, exc.expected, exc.msg
+            )
+            hint = get_string_remediation_hint(exc.actual, exc.expected)
 
-        assertion_diag = AssertionDiagnostic(
-            assertion_code=exc.code_str,
-            op=exc.op,
-            actual_type=actual_type,
-            actual_repr=actual_repr,
-            actual_length=actual_len,
-            expected_type=expected_type,
-            expected_repr=expected_repr,
-            expected_length=expected_len,
-            char_diff=diff_str,
-            first_diff_index=first_diff_idx,
-            message=exc.msg if exc.msg else None,
-            explanation=explanation,
-            remediation_hint=hint,
-        )
+            assertion_diag = AssertionDiagnostic(
+                assertion_code=exc.code_str,
+                op=exc.op,
+                actual_type=actual_type,
+                actual_repr=actual_repr,
+                actual_length=actual_len,
+                expected_type=expected_type,
+                expected_repr=expected_repr,
+                expected_length=expected_len,
+                char_diff=diff_str,
+                first_diff_index=first_diff_idx,
+                message=exc.msg if exc.msg else None,
+                explanation=explanation,
+                remediation_hint=hint,
+            )
 
-        report = DiagnosticReport(
-            status="assertion_error",
-            exit_code=1,
-            summary=explanation,
-            assertion_diagnostic=assertion_diag,
-            local_variables=locals_dict,
-            raw_stdout=stdout_val,
-            raw_stderr=stderr_val,
-        )
+            report = DiagnosticReport(
+                status="assertion_error",
+                exit_code=1,
+                summary=explanation,
+                assertion_diagnostic=assertion_diag,
+                local_variables=locals_dict,
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
 
     except AssertionError as exc:
         stdout_val = stdout_capture.getvalue()
         stderr_val = stderr_capture.getvalue()
 
-        tb = exc.__traceback__
-        last_tb = tb
-        while last_tb and last_tb.tb_next:
-            last_tb = last_tb.tb_next
+        if expect_exception and matches_expected_exception(exc, expect_exception):
+            report = DiagnosticReport(
+                status="PASSED",
+                exit_code=0,
+                summary=f"Expected exception '{type(exc).__name__}' was raised as expected: {exc}",
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
+        else:
+            tb = exc.__traceback__
+            last_tb = tb
+            while last_tb and last_tb.tb_next:
+                last_tb = last_tb.tb_next
 
-        failing_frame = last_tb.tb_frame if last_tb else None
-        failing_lineno = last_tb.tb_lineno if last_tb else 1
-        failing_file = failing_frame.f_code.co_filename if failing_frame else str(script_path)
+            failing_frame = last_tb.tb_frame if last_tb else None
+            failing_lineno = last_tb.tb_lineno if last_tb else 1
+            failing_file = failing_frame.f_code.co_filename if failing_frame else str(script_path)
 
-        code_line = linecache.getline(failing_file, failing_lineno).strip()
+            code_line = linecache.getline(failing_file, failing_lineno).strip()
 
-        locals_dict = {}
-        if failing_frame:
-            for k, v in failing_frame.f_locals.items():
-                if not k.startswith("__"):
-                    locals_dict[k] = introspect_variable(k, v)
+            locals_dict = {}
+            if failing_frame:
+                for k, v in failing_frame.f_locals.items():
+                    if not k.startswith("__"):
+                        locals_dict[k] = introspect_variable(k, v)
 
-        actual_val = None
-        expected_val = None
-        op_str = "=="
-        explanation = f"Assertion failed: {str(exc) or code_line or 'AssertionError'}"
-        first_diff_idx = None
-        diff_str = None
+            actual_val = None
+            expected_val = None
+            op_str = "=="
+            explanation = f"Assertion failed: {str(exc) or code_line or 'AssertionError'}"
+            first_diff_idx = None
+            diff_str = None
 
-        if code_line:
-            try:
-                tree = ast.parse(code_line)
-                if tree.body and isinstance(tree.body[0], ast.Assert):
-                    assert_node = tree.body[0]
-                    if isinstance(assert_node.test, ast.Compare) and len(assert_node.test.ops) == 1:
-                        op_cls = type(assert_node.test.ops[0])
-                        op_str = OP_MAP.get(op_cls, "==")
-                        if failing_frame:
-                            try:
-                                actual_val = eval(compile(ast.Expression(assert_node.test.left), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
-                                expected_val = eval(compile(ast.Expression(assert_node.test.comparators[0]), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
-                                explanation, diff_str, first_diff_idx = explain_assertion_failure(actual_val, op_str, expected_val, str(exc))
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+            if code_line:
+                try:
+                    tree = ast.parse(code_line)
+                    if tree.body and isinstance(tree.body[0], ast.Assert):
+                        assert_node = tree.body[0]
+                        if isinstance(assert_node.test, ast.Compare) and len(assert_node.test.ops) == 1:
+                            op_cls = type(assert_node.test.ops[0])
+                            op_str = OP_MAP.get(op_cls, "==")
+                            if failing_frame:
+                                try:
+                                    actual_val = eval(compile(ast.Expression(assert_node.test.left), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
+                                    expected_val = eval(compile(ast.Expression(assert_node.test.comparators[0]), "<eval>", "eval"), failing_frame.f_globals, failing_frame.f_locals)
+                                    explanation, diff_str, first_diff_idx = explain_assertion_failure(actual_val, op_str, expected_val, str(exc))
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
 
-        act_type = type(actual_val).__name__ if actual_val is not None else "unknown"
-        act_repr = format_value_repr(actual_val) if actual_val is not None else "unknown"
-        exp_type = type(expected_val).__name__ if expected_val is not None else "unknown"
-        exp_repr = format_value_repr(expected_val) if expected_val is not None else "unknown"
+            act_type = type(actual_val).__name__ if actual_val is not None else "unknown"
+            act_repr = format_value_repr(actual_val) if actual_val is not None else "unknown"
+            exp_type = type(expected_val).__name__ if expected_val is not None else "unknown"
+            exp_repr = format_value_repr(expected_val) if expected_val is not None else "unknown"
 
-        hint = (
-            get_string_remediation_hint(actual_val, expected_val)
-            if actual_val is not None and expected_val is not None
-            else None
-        )
+            hint = (
+                get_string_remediation_hint(actual_val, expected_val)
+                if actual_val is not None and expected_val is not None
+                else None
+            )
 
-        assertion_diag = AssertionDiagnostic(
-            assertion_code=code_line or f"assert {str(exc)}",
-            op=op_str,
-            actual_type=act_type,
-            actual_repr=act_repr,
-            actual_length=get_length(actual_val) if actual_val is not None else None,
-            expected_type=exp_type,
-            expected_repr=exp_repr,
-            expected_length=get_length(expected_val) if expected_val is not None else None,
-            char_diff=diff_str,
-            first_diff_index=first_diff_idx,
-            message=str(exc) if str(exc) else None,
-            explanation=explanation,
-            remediation_hint=hint,
-        )
+            assertion_diag = AssertionDiagnostic(
+                assertion_code=code_line or f"assert {str(exc)}",
+                op=op_str,
+                actual_type=act_type,
+                actual_repr=act_repr,
+                actual_length=get_length(actual_val) if actual_val is not None else None,
+                expected_type=exp_type,
+                expected_repr=exp_repr,
+                expected_length=get_length(expected_val) if expected_val is not None else None,
+                char_diff=diff_str,
+                first_diff_index=first_diff_idx,
+                message=str(exc) if str(exc) else None,
+                explanation=explanation,
+                remediation_hint=hint,
+            )
 
-        report = DiagnosticReport(
-            status="assertion_error",
-            exit_code=1,
-            summary=explanation,
-            assertion_diagnostic=assertion_diag,
-            local_variables=locals_dict,
-            raw_stdout=stdout_val,
-            raw_stderr=stderr_val,
-        )
+            report = DiagnosticReport(
+                status="assertion_error",
+                exit_code=1,
+                summary=explanation,
+                assertion_diagnostic=assertion_diag,
+                local_variables=locals_dict,
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
 
     except SystemExit as exc:
         stdout_val = stdout_capture.getvalue()
         stderr_val = stderr_capture.getvalue()
         exit_code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
         if exit_code == 0:
-            report = DiagnosticReport(
-                status="passed",
-                exit_code=0,
-                summary="Process exited cleanly with code 0.",
-                raw_stdout=stdout_val,
-                raw_stderr=stderr_val,
-            )
+            if expect_exception:
+                report = DiagnosticReport(
+                    status="missing_exception",
+                    exit_code=1,
+                    summary=f"Expected exception '{expect_exception}' was NOT raised. Process exited cleanly with code 0.",
+                    raw_stdout=stdout_val,
+                    raw_stderr=stderr_val,
+                )
+            else:
+                report = DiagnosticReport(
+                    status="passed",
+                    exit_code=0,
+                    summary="Process exited cleanly with code 0.",
+                    raw_stdout=stdout_val,
+                    raw_stderr=stderr_val,
+                )
         else:
             report = DiagnosticReport(
                 status="runtime_exception",
@@ -1253,48 +1502,72 @@ def run_harness(script_path: pathlib.Path, report_path: pathlib.Path) -> None:
     except SyntaxError as exc:
         stdout_val = stdout_capture.getvalue()
         stderr_val = stderr_capture.getvalue()
-        caret_line = f"{' ' * (exc.offset - 1 if exc.offset else 0)}^"
-        report = DiagnosticReport(
-            status="syntax_error",
-            exit_code=1,
-            summary=f"SyntaxError: {exc.msg} at line {exc.lineno}",
-            raw_stdout=stdout_val,
-            raw_stderr=f"  File \"{exc.filename}\", line {exc.lineno}\n    {exc.text.strip() if exc.text else ''}\n    {caret_line}\nSyntaxError: {exc.msg}",
-        )
+        if expect_exception and matches_expected_exception(exc, expect_exception):
+            report = DiagnosticReport(
+                status="PASSED",
+                exit_code=0,
+                summary=f"Expected exception '{type(exc).__name__}' was raised as expected: {exc}",
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
+        else:
+            caret_line = f"{' ' * (exc.offset - 1 if exc.offset else 0)}^"
+            report = DiagnosticReport(
+                status="syntax_error",
+                exit_code=1,
+                summary=f"SyntaxError: {exc.msg} at line {exc.lineno}",
+                raw_stdout=stdout_val,
+                raw_stderr=f"  File \"{exc.filename}\", line {exc.lineno}\n    {exc.text.strip() if exc.text else ''}\n    {caret_line}\nSyntaxError: {exc.msg}",
+            )
 
     except BaseException as exc:
         stdout_val = stdout_capture.getvalue()
         stderr_val = stderr_capture.getvalue()
 
-        call_stack = extract_call_stack(exc)
-        failing_frame_info = call_stack[-1] if call_stack else None
+        if expect_exception and matches_expected_exception(exc, expect_exception):
+            report = DiagnosticReport(
+                status="PASSED",
+                exit_code=0,
+                summary=f"Expected exception '{type(exc).__name__}' was raised as expected: {exc}",
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
+        else:
+            call_stack = extract_call_stack(exc)
+            failing_frame_info = call_stack[-1] if call_stack else None
 
-        failing_file = failing_frame_info.filename if failing_frame_info else str(script_path)
-        failing_line = failing_frame_info.lineno if failing_frame_info else 1
-        failing_code = failing_frame_info.code_context if failing_frame_info else ""
-        failing_locals = failing_frame_info.local_variables if failing_frame_info else {}
+            failing_file = failing_frame_info.filename if failing_frame_info else str(script_path)
+            failing_line = failing_frame_info.lineno if failing_frame_info else 1
+            failing_code = failing_frame_info.code_context if failing_frame_info else ""
+            failing_locals = failing_frame_info.local_variables if failing_frame_info else {}
 
-        operation_desc = explain_exception_operation(exc, failing_code, failing_frame_info)
+            operation_desc = explain_exception_operation(exc, failing_code, failing_frame_info)
 
-        exc_diag = ExceptionDiagnostic(
-            exception_type=type(exc).__name__,
-            exception_message=str(exc),
-            failing_file=failing_file,
-            failing_line=failing_line,
-            failing_code=failing_code,
-            operation_description=operation_desc,
-            call_stack=call_stack,
-        )
+            exc_diag = ExceptionDiagnostic(
+                exception_type=type(exc).__name__,
+                exception_message=str(exc),
+                failing_file=failing_file,
+                failing_line=failing_line,
+                failing_code=failing_code,
+                operation_description=operation_desc,
+                call_stack=call_stack,
+            )
 
-        report = DiagnosticReport(
-            status="runtime_exception",
-            exit_code=1,
-            summary=f"{type(exc).__name__}: {exc}",
-            exception_diagnostic=exc_diag,
-            local_variables=failing_locals,
-            raw_stdout=stdout_val,
-            raw_stderr=stderr_val,
-        )
+            summary_text = (
+                f"{type(exc).__name__}: {exc} (Expected: {expect_exception})"
+                if expect_exception
+                else f"{type(exc).__name__}: {exc}"
+            )
+
+            report = DiagnosticReport(
+                status="runtime_exception",
+                exit_code=1,
+                summary=summary_text,
+                exception_diagnostic=exc_diag,
+                local_variables=failing_locals,
+                raw_stdout=stdout_val,
+                raw_stderr=stderr_val,
+            )
 
     if report is not None:
         report_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
@@ -1308,96 +1581,119 @@ def execute_script(
     code: str,
     ws: pathlib.Path,
     timeout_secs: int = 35,
+    expect_exception: Optional[str] = None,
 ) -> Tuple[int, str, str, DiagnosticReport]:
     """Execute transformed reproduction code inside an isolated /tmp process."""
-    with tempfile.TemporaryDirectory(prefix="swegemma_repro_") as temp_dir:
-        temp_dir_path = pathlib.Path(temp_dir)
-        script_file = temp_dir_path / "repro_test.py"
-        script_file.write_text(code, encoding="utf-8")
-        report_file = temp_dir_path / "diagnostic_report.json"
+    tmp_base = "/tmp" if os.path.isdir("/tmp") else None
+    guard = PathContainmentGuard(ws)
+    try:
+        with tempfile.TemporaryDirectory(dir=tmp_base, prefix="swegemma_repro_") as temp_dir:
+            temp_dir_path = pathlib.Path(temp_dir).resolve()
+            assert_scratch_path_contained(temp_dir_path, ws)
 
-        check_py = pathlib.Path(__file__).resolve()
+            script_file = temp_dir_path / "repro_test.py"
+            script_file.write_text(code, encoding="utf-8")
+            report_file = temp_dir_path / "diagnostic_report.json"
 
-        cmd = [
-            sys.executable,
-            str(check_py),
-            "--runner",
-            str(script_file),
-            str(report_file),
-        ]
+            check_py = pathlib.Path(__file__).resolve()
 
-        env = os.environ.copy()
-        python_paths = []
-        if (ws / "src").is_dir():
-            python_paths.append(str(ws / "src"))
-        if ws.is_dir():
-            python_paths.append(str(ws))
-        existing_pp = env.get("PYTHONPATH", "")
-        if existing_pp:
-            python_paths.append(existing_pp)
+            cmd = [
+                sys.executable,
+                str(check_py),
+                "--runner",
+                str(script_file),
+                str(report_file),
+            ]
+            if expect_exception:
+                cmd.extend(["--expect-exception", expect_exception])
 
-        env["PYTHONPATH"] = ":".join(python_paths)
-        env["SWEGEMMA_WORKSPACE"] = str(ws)
-        env["WORKSPACE_DIR"] = str(ws)
-        env["PYTHONUNBUFFERED"] = "1"
+            env = os.environ.copy()
+            python_paths = []
+            if (ws / "src").is_dir():
+                python_paths.append(str((ws / "src").resolve()))
+            if ws.is_dir():
+                python_paths.append(str(ws.resolve()))
+            for p in ["/workspace", "/workspace/src"]:
+                if p not in python_paths:
+                    python_paths.append(p)
+            existing_pp = env.get("PYTHONPATH", "")
+            if existing_pp:
+                for p in existing_pp.split(":"):
+                    if p and p not in python_paths:
+                        python_paths.append(p)
 
-        try:
-            res = subprocess.run(
-                cmd,
-                cwd=temp_dir_path,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_secs,
-            )
-            exit_code = res.returncode
-            stdout_out = res.stdout.strip()
-            stderr_out = res.stderr.strip()
+            env["PYTHONPATH"] = ":".join(python_paths)
+            env["SWEGEMMA_WORKSPACE"] = str(ws.resolve())
+            env["WORKSPACE_DIR"] = str(ws.resolve())
+            env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            if os.path.isdir("/tmp"):
+                env["TMPDIR"] = "/tmp"
+                env["TEMP"] = "/tmp"
+                env["TMP"] = "/tmp"
 
-            if report_file.exists():
-                try:
-                    report_data = json.loads(report_file.read_text(encoding="utf-8"))
-                    report = DiagnosticReport.model_validate(report_data)
-                    return exit_code, stdout_out, stderr_out, report
-                except Exception:
-                    pass
+            try:
+                res = subprocess.run(
+                    cmd,
+                    cwd=temp_dir_path,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=timeout_secs,
+                )
+                exit_code = res.returncode
+                stdout_out = res.stdout.strip()
+                stderr_out = res.stderr.strip()
 
-            combined_err = f"{stderr_out}\n{stdout_out}".strip()
-            status = "error"
-            if "AssertionError" in combined_err:
-                status = "assertion_error"
-            elif "SyntaxError" in combined_err:
-                status = "syntax_error"
-            elif exit_code == 0:
-                status = "passed"
-            else:
-                status = "runtime_exception"
+                if report_file.exists():
+                    try:
+                        report_data = json.loads(report_file.read_text(encoding="utf-8"))
+                        report = DiagnosticReport.model_validate(report_data)
+                        return exit_code, stdout_out, stderr_out, report
+                    except Exception:
+                        pass
 
-            fallback_report = DiagnosticReport(
-                status=status,
-                exit_code=exit_code,
-                summary=combined_err.splitlines()[-1] if combined_err else "Execution finished",
-                raw_stdout=stdout_out,
-                raw_stderr=stderr_out,
-            )
-            return exit_code, stdout_out, stderr_out, fallback_report
+                combined_err = f"{stderr_out}\n{stdout_out}".strip()
+                status = "error"
+                if expect_exception and expect_exception in combined_err:
+                    status = "PASSED"
+                elif "AssertionError" in combined_err:
+                    status = "assertion_error"
+                elif "SyntaxError" in combined_err:
+                    status = "syntax_error"
+                elif exit_code == 0:
+                    status = "passed"
+                else:
+                    status = "runtime_exception"
 
-        except subprocess.TimeoutExpired:
-            timeout_report = DiagnosticReport(
-                status="timeout",
-                exit_code=124,
-                summary=f"Execution timed out after {timeout_secs} seconds.",
-                raw_stderr=f"Timeout expired ({timeout_secs}s)",
-            )
-            return 124, "", f"Execution timed out after {timeout_secs} seconds.", timeout_report
-        except Exception as e:
-            err_report = DiagnosticReport(
-                status="error",
-                exit_code=1,
-                summary=f"Failed to execute process: {e}",
-                raw_stderr=str(e),
-            )
-            return 1, "", f"Failed to execute process: {e}", err_report
+                fallback_report = DiagnosticReport(
+                    status=status,
+                    exit_code=exit_code,
+                    summary=combined_err.splitlines()[-1] if combined_err else "Execution finished",
+                    raw_stdout=stdout_out,
+                    raw_stderr=stderr_out,
+                )
+                return exit_code, stdout_out, stderr_out, fallback_report
+
+            except subprocess.TimeoutExpired:
+                timeout_report = DiagnosticReport(
+                    status="timeout",
+                    exit_code=124,
+                    summary=f"Execution timed out after {timeout_secs} seconds.",
+                    raw_stderr=f"Timeout expired ({timeout_secs}s)",
+                )
+                return 124, "", f"Execution timed out after {timeout_secs} seconds.", timeout_report
+            except Exception as e:
+                err_report = DiagnosticReport(
+                    status="error",
+                    exit_code=1,
+                    summary=f"Failed to execute process: {e}",
+                    raw_stderr=str(e),
+                )
+                return 1, "", f"Failed to execute process: {e}", err_report
+    finally:
+        guard.cleanup_pollution()
 
 
 def _format_assertion_failure(
@@ -1479,7 +1775,12 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
     """Render structured report into deterministic human and LLM-friendly diagnostic output."""
     lines: List[str] = []
 
-    if report.status == "passed":
+    if report.status.lower() == "passed":
+        if "Expected exception" in report.summary:
+            lines.append(f"[repro-check] ✅ PASSED: {report.summary}")
+            if report.raw_stdout:
+                lines.append(report.raw_stdout)
+            return "\n".join(lines)
         if has_checks:
             lines.append("[repro-check] ✅ PASSED: All assertions and checks passed with 0 errors.")
             if report.raw_stdout:
@@ -1499,6 +1800,18 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
                 )
                 if report.raw_stdout:
                     lines.append(report.raw_stdout)
+        return "\n".join(lines)
+
+    if report.status == "missing_exception":
+        lines.append("[repro-check] 🎯 DEFECT CONFIRMED (Expected Exception Not Raised):")
+        lines.append(f"  {report.summary}")
+        lines.append("")
+        lines.append("  🔍 DIAGNOSTIC SUMMARY:")
+        lines.append("    The target code executed silently without raising the expected exception.")
+        lines.append("    This confirms a missing validation or unhandled condition defect.")
+        if report.raw_stdout:
+            lines.append("")
+            lines.append(f"  Standard Output:\n    {report.raw_stdout.strip()}")
         return "\n".join(lines)
 
     if report.status == "assertion_error":
@@ -1581,27 +1894,204 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
 # Main CLI Entrypoint
 # =============================================================================
 
+def print_help() -> None:
+    """Print comprehensive help and usage guide."""
+    help_text = """repro-check: Omnivorous Defect Reproduction & Verification Engine.
+
+Usage:
+  python3 check.py [options] [<code>]
+  python3 check.py --b64 <base64_code> [options]
+  python3 check.py --file <script.py> [options]
+  cat <script.py> | python3 check.py [options]
+  run_skill_script('repro-check', 'check.py', args=['[options]', '<code>'])
+
+Options:
+  --expect-exception, -e <EXC>  Expect a specific exception type (e.g. ValueError, KeyError, AssertionError).
+                                If baseline code fails to raise it, defect_confirmed=True.
+                                When the fix causes the exception to be raised, status=PASSED.
+  --b64, --base64 <B64>         Execute base64-encoded Python assertion code (avoids shell/JSON quote escaping).
+  --file, -f <FILE>             Execute raw Python script from the specified file path.
+  --stdin, -                    Execute raw Python script read from standard input.
+  --help, -h                    Show this help message and exit (exit code 0).
+
+Positional Arguments:
+  code                          Python reproduction code snippet to execute.
+                                If a single argument is an existing file, it is executed as a script.
+
+Guarantees:
+  - Omnivorous: auto-asserts comparisons, auto-invokes uncalled test functions, strips fences and redundant outer quotes.
+  - Quote sanitization: automatically strips outer quotes and normalizes escaped quotes from JSON.
+  - AST pre-parse: validates syntax before writing to /tmp or executing, cleanly reporting SYNTAX_ERROR.
+  - Zero git pollution: strictly executes inside isolated /tmp process with Path Containment Guard.
+  - Workspace import priority: PYTHONPATH=/workspace:/workspace/src.
+  - Deterministic AST diagnostics: plain-English explanations and char diffs.
+  - Probe budget limiter: 2-probe cap on exploratory runs; auto-resets on defect or fix.
+  - Exit code: exits 0 on pass, exits 1 on fail or syntax error.
+"""
+    print(help_text.strip())
+
+
 def main() -> int:
-    """Main execution function. Always exits with code 0."""
+    """Main execution function. Exits 0 on pass, exits 1 on fail/syntax error."""
     try:
         raw_args = sys.argv[1:]
 
+        # Check for help flag
+        if any(arg in ("--help", "-h") for arg in raw_args):
+            print_help()
+            return 0
+
         # Internal runner mode invoked by execute_script
-        if len(raw_args) == 3 and raw_args[0] == "--runner":
+        if len(raw_args) >= 3 and raw_args[0] == "--runner":
             script_path = pathlib.Path(raw_args[1])
             report_path = pathlib.Path(raw_args[2])
-            run_harness(script_path, report_path)
+            expect_exc = None
+            i = 3
+            while i < len(raw_args):
+                arg = raw_args[i]
+                if arg in ("--expect-exception", "-e") and i + 1 < len(raw_args):
+                    expect_exc = raw_args[i + 1]
+                    i += 2
+                elif arg.startswith(("--expect-exception=", "-e=")):
+                    expect_exc = arg.split("=", 1)[1]
+                    i += 1
+                else:
+                    i += 1
+            run_harness(script_path, report_path, expect_exception=expect_exc)
             return 0
 
-        # Normal Agent / CLI mode
-        if not raw_args:
-            print("[repro-check] No code provided. Usage: run_skill_script('repro-check', 'check.py', args=['<code>'])")
-            return 0
+        # Parse general arguments
+        expect_exception: Optional[str] = None
+        file_path: Optional[pathlib.Path] = None
+        use_stdin = False
+        use_b64 = False
+        b64_arg: Optional[str] = None
+        code_tokens: List[str] = []
 
-        code = clean_and_normalize_code(raw_args)
-        if not code:
-            print("[repro-check] Empty code provided.")
-            return 0
+        i = 0
+        while i < len(raw_args):
+            arg = raw_args[i]
+            if arg in ("--expect-exception", "-e") and i + 1 < len(raw_args):
+                expect_exception = raw_args[i + 1]
+                i += 2
+            elif arg.startswith(("--expect-exception=", "-e=")):
+                expect_exception = arg.split("=", 1)[1]
+                i += 1
+            elif arg in ("--file", "-f") and i + 1 < len(raw_args):
+                file_path = pathlib.Path(raw_args[i + 1])
+                i += 2
+            elif arg.startswith(("--file=", "-f=")):
+                file_path = pathlib.Path(arg.split("=", 1)[1])
+                i += 1
+            elif arg in ("--stdin", "-"):
+                use_stdin = True
+                i += 1
+            elif arg in ("--b64", "--base64"):
+                use_b64 = True
+                if i + 1 < len(raw_args) and not raw_args[i + 1].startswith("-"):
+                    b64_arg = raw_args[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            elif arg.startswith(("--b64=", "--base64=")):
+                use_b64 = True
+                b64_arg = arg.split("=", 1)[1]
+                i += 1
+            else:
+                code_tokens.append(arg)
+                i += 1
+
+        # Determine code source
+        code = ""
+        if use_b64:
+            if not b64_arg and code_tokens:
+                b64_arg = " ".join(code_tokens).strip()
+                code_tokens = []
+            elif not b64_arg and (use_stdin or not sys.stdin.isatty()):
+                b64_arg = sys.stdin.read().strip()
+
+            if not b64_arg:
+                print("[repro-check] ⚠️ TEST SCRIPT SYNTAX_ERROR:\n  SYNTAX_ERROR: No base64 payload provided to --b64")
+                return 1
+
+            # Sanitize b64_arg of redundant outer quotes
+            b64_clean = b64_arg.strip()
+            for _ in range(3):
+                if (b64_clean.startswith('"') and b64_clean.endswith('"')) or (b64_clean.startswith("'") and b64_clean.endswith("'")):
+                    b64_clean = b64_clean[1:-1].strip()
+                elif (b64_clean.startswith('\\"') and b64_clean.endswith('\\"')) or (b64_clean.startswith("\\'") and b64_clean.endswith("\\'")):
+                    b64_clean = b64_clean[2:-2].strip()
+
+            try:
+                pad = len(b64_clean) % 4
+                if pad:
+                    b64_clean += "=" * (4 - pad)
+                code = base64.b64decode(b64_clean).decode("utf-8")
+            except Exception as exc:
+                print(f"[repro-check] ⚠️ TEST SCRIPT SYNTAX_ERROR:\n  SYNTAX_ERROR: Invalid base64 payload: {exc}")
+                return 1
+        elif file_path is not None:
+            if not file_path.exists():
+                print(f"[repro-check] Error: Script file not found: {file_path}")
+                return 1
+            code = file_path.read_text(encoding="utf-8")
+        elif use_stdin:
+            code = sys.stdin.read()
+        elif code_tokens:
+            # Check if single token is a path to an existing .py file
+            if len(code_tokens) == 1 and (code_tokens[0].endswith(".py") or "\n" not in code_tokens[0]):
+                candidate_path = pathlib.Path(code_tokens[0])
+                if candidate_path.is_file():
+                    code = candidate_path.read_text(encoding="utf-8")
+                else:
+                    code = code_tokens[0]
+            else:
+                if any("\n" in t for t in code_tokens):
+                    code = "\n".join(code_tokens)
+                else:
+                    code = " ".join(code_tokens)
+        elif not sys.stdin.isatty():
+            piped = sys.stdin.read()
+            if piped.strip():
+                code = piped
+
+        code = clean_and_normalize_code(code)
+
+        if not code or not code.strip():
+            print("[repro-check] No code provided. Usage: check.py [options] [<code>]")
+            return 1
+
+        # AST pre-parse syntax validation before writing to /tmp and executing
+        try:
+            ast.parse(code)
+        except SyntaxError as exc:
+            if expect_exception and matches_expected_exception(exc, expect_exception):
+                report = DiagnosticReport(
+                    status="PASSED",
+                    exit_code=0,
+                    summary=f"Expected exception '{type(exc).__name__}' was raised as expected: {exc}",
+                )
+                print(f"[repro-check] ✅ PASSED: {report.summary}")
+                return 0
+
+            caret_line = f"{' ' * (exc.offset - 1 if exc.offset else 0)}^"
+            err_line = exc.text.strip() if exc.text else ""
+            summary = f"SYNTAX_ERROR: {exc.msg} at line {exc.lineno}"
+            raw_err = f"  File \"<assertion>\", line {exc.lineno}\n    {err_line}\n    {caret_line}\nSyntaxError: {exc.msg}"
+            report = DiagnosticReport(
+                status="syntax_error",
+                exit_code=1,
+                summary=summary,
+                raw_stderr=raw_err,
+            )
+            print(
+                f"[repro-check] ⚠️ TEST SCRIPT SYNTAX_ERROR:\n"
+                f"  {summary}\n"
+                f"    {err_line}\n"
+                f"    {caret_line}\n"
+                f"  SyntaxError: {exc.msg}"
+            )
+            return 1
 
         ws = get_workspace_dir()
 
@@ -1610,6 +2100,10 @@ def main() -> int:
             reset_probe_count()
 
         transformed_code, has_checks, check_count = prepare_executable_code(code)
+
+        # If expecting exception, it is an active check
+        if expect_exception:
+            has_checks = True
 
         # Check circuit breaker before running pure probes
         if not has_checks and is_probe_circuit_breaker_active(ws):
@@ -1624,19 +2118,21 @@ def main() -> int:
                 category="probe_budget_reached",
                 report=DiagnosticReport(
                     status="probe_budget_reached",
-                    exit_code=0,
+                    exit_code=1,
                     summary="Probe budget reached",
                 ),
                 rendered_output=rendered,
             )
             print(output.rendered_output)
-            return 0
+            return 1
 
-        exit_code, stdout, stderr, report = execute_script(transformed_code, ws)
+        exit_code, stdout, stderr, report = execute_script(
+            transformed_code, ws, expect_exception=expect_exception
+        )
 
         # Handle probe count updates
-        if report.status == "passed":
-            if has_checks:
+        if report.status.lower() == "passed":
+            if has_checks or expect_exception:
                 reset_probe_count()
                 category = "passed"
                 defect_confirmed = False
@@ -1645,10 +2141,17 @@ def main() -> int:
                 increment_probe_count()
                 if is_probe_circuit_breaker_active(ws):
                     category = "probe_budget_reached"
+                    defect_confirmed = False
+                    success = False
                 else:
                     category = "probe_run"
-                defect_confirmed = False
-                success = True
+                    defect_confirmed = False
+                    success = True
+        elif report.status == "missing_exception":
+            reset_probe_count()
+            category = "missing_exception"
+            defect_confirmed = True
+            success = False
         elif report.status == "assertion_error":
             reset_probe_count()
             category = "assertion_failure"
@@ -1680,11 +2183,11 @@ def main() -> int:
         )
 
         print(final_output.rendered_output)
-        return 0
+        return 0 if success else 1
 
     except Exception as e:
         print(f"[repro-check] Runner error: {e}")
-        return 0
+        return 1
 
 
 if __name__ == "__main__":

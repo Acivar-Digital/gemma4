@@ -13,6 +13,8 @@ trap 'echo -e "\n🛑 Exited by Ctrl+C."; exit 0' INT
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-30}"
+
 PYTHON_BIN="/tmp/brun/venv/bin/python"
 
 if [ ! -x "$PYTHON_BIN" ]; then
