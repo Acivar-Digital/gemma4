@@ -219,6 +219,10 @@ def is_scratch_file(path_str: str) -> bool:
     p = pathlib.Path(path_str)
     name = p.name.lower()
 
+    # Ignore ADK execution wrapper files completely
+    if ".adk_exec" in name or name.startswith(".adk_exec"):
+        return False
+
     # Scratch extensions
     if name.endswith((".tmp", ".temp", ".log", ".bak", ".swp", "~")):
         return True
@@ -387,7 +391,21 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
     warnings: list[DiffWarning] = []
 
     # 1. Parse git status --porcelain -uall
-    code, status_out = run_git_cmd(["status", "--porcelain", "-uall"], cwd=ws, timeout_secs=10)
+    code, status_out = run_git_cmd(
+        [
+            "status",
+            "--porcelain",
+            "-uall",
+            "--",
+            ".",
+            ":(exclude)*.adk_exec*",
+            ":(exclude)**/.adk_exec*",
+        ],
+        cwd=ws,
+        timeout_secs=10,
+    )
+    if code != 0:
+        code, status_out = run_git_cmd(["status", "--porcelain", "-uall"], cwd=ws, timeout_secs=10)
     if code != 0:
         code, status_out = run_git_cmd(["status", "--porcelain"], cwd=ws, timeout_secs=10)
 
@@ -403,6 +421,9 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
         rel_path = line[3:].strip().strip('"')
         if " -> " in rel_path:
             rel_path = rel_path.split(" -> ")[-1].strip().strip('"')
+
+        if ".adk_exec" in rel_path or pathlib.Path(rel_path).name.startswith(".adk_exec"):
+            continue
 
         if line.startswith("??"):
             untracked_files.append(rel_path)
@@ -455,8 +476,16 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
         numstat_cmd.append(base_ref)
     if extra_args:
         numstat_cmd.extend(extra_args)
+    numstat_cmd.extend(["--", ".", ":(exclude)*.adk_exec*", ":(exclude)**/.adk_exec*"])
 
-    _, numstat_out = run_git_cmd(numstat_cmd, cwd=ws, timeout_secs=10)
+    code, numstat_out = run_git_cmd(numstat_cmd, cwd=ws, timeout_secs=10)
+    if code != 0:
+        numstat_cmd_fb = ["diff", "--numstat"]
+        if base_ref:
+            numstat_cmd_fb.append(base_ref)
+        if extra_args:
+            numstat_cmd_fb.extend(extra_args)
+        _, numstat_out = run_git_cmd(numstat_cmd_fb, cwd=ws, timeout_secs=10)
 
     file_stats: list[FileDiffStat] = []
     forbidden_files_modified: list[str] = []
@@ -473,8 +502,6 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
             is_binary = (add_str == "-" and del_str == "-")
             adds = int(add_str) if not is_binary and add_str.isdigit() else 0
             dels = int(del_str) if not is_binary and del_str.isdigit() else 0
-            total_additions += adds
-            total_deletions += dels
 
             # Normalize renames
             clean_path = raw_path
@@ -482,6 +509,12 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
                 clean_path = re.sub(r"\{.*? => (.*?)\}", r"\1", clean_path)
                 if " => " in clean_path:
                     clean_path = clean_path.split(" => ")[-1].strip()
+
+            if ".adk_exec" in clean_path or pathlib.Path(clean_path).name.startswith(".adk_exec"):
+                continue
+
+            total_additions += adds
+            total_deletions += dels
 
             is_forbidden = is_forbidden_harness_file(clean_path)
             is_test = is_test_file(clean_path)
@@ -542,8 +575,16 @@ def inspect_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Di
         diff_cmd.append(base_ref)
     if extra_args:
         diff_cmd.extend(extra_args)
+    diff_cmd.extend(["--", ".", ":(exclude)*.adk_exec*", ":(exclude)**/.adk_exec*"])
 
-    _, diff_out = run_git_cmd(diff_cmd, cwd=ws, timeout_secs=15)
+    code, diff_out = run_git_cmd(diff_cmd, cwd=ws, timeout_secs=15)
+    if code != 0:
+        diff_cmd_fb = ["diff"]
+        if base_ref:
+            diff_cmd_fb.append(base_ref)
+        if extra_args:
+            diff_cmd_fb.extend(extra_args)
+        _, diff_out = run_git_cmd(diff_cmd_fb, cwd=ws, timeout_secs=15)
     diff_lines = diff_out.splitlines() if diff_out else []
     max_diff_lines = 100
     diff_lines_truncated = 0

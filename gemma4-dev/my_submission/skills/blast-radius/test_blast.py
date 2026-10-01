@@ -37,10 +37,9 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 SKIP_DIRS = {"build", "dist", ".git", "__pycache__", "venv", ".venv", "node_modules", "wheels", ".pytest_cache"}
 
 PREFIX_CONFLICT_ADVISORY = (
-    "💡 PRE-FIX TEST CONFLICT ADVISORY: The failing test is in the direct unit test for the modified component. "
-    "If the issue report specifically requested altering this behavior or output, "
-    "the baseline test in Container A may still be asserting the pre-fix buggy behavior. In SWE-bench, the evaluation harness updates tests in Container B. "
-    "DO NOT add ad-hoc suppression filters or revert if distance-1 consumer tests pass and this difference directly implements the issue requirements!"
+    "[blast-radius] ⚠️ DIRECT UNIT TESTS FAILED: Pre-fix assertion baseline conflict suspected, "
+    "but verification CANNOT pass while direct tests fail. "
+    "If this file was intentionally altered, verify that this is indeed the target file requested by the issue, not a secondary file!"
 )
 
 
@@ -101,8 +100,14 @@ class BlastRadiusResult(BaseModel):
     modified_files: List[str] = Field(default_factory=list, description="Modified files detected in repo")
     distance1_consumers: List[str] = Field(default_factory=list, description="Direct consumer files importing targets")
     test_files: List[str] = Field(default_factory=list, description="Test files executed")
+    direct_test_files: List[str] = Field(default_factory=list, description="Direct test files for targets")
+    consumer_test_files: List[str] = Field(default_factory=list, description="Distance-1 consumer test files")
     exit_code: int = Field(default=0, description="Pytest exit code")
     passed: bool = Field(default=True, description="Whether all tests passed")
+    status: str = Field(
+        default="PASSED",
+        description="Overall execution status: PASSED, FAILED, UNVERIFIED_NO_TESTS, FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT",
+    )
     summary: str = Field(default="", description="Execution summary line")
     multi_file_warning: Optional[str] = Field(default=None, description="Warning if multiple modified files detected in workspace")
     total_passed: int = Field(default=0, description="Number of passed tests")
@@ -300,17 +305,270 @@ def _get_modified_files(ws: Optional[pathlib.Path] = None) -> List[pathlib.Path]
 get_modified_files = _get_modified_files
 
 
-def format_multi_file_warning(modified_files: List[Any], target_file: str) -> str:
-    """Format the multi-file diff detection warning."""
+def format_multi_file_warning(modified_files: List[Any], target_file: str) -> Optional[str]:
+    """Format an informative notice for multi-file changes without alarmist revert warnings."""
     mod_list = [
         m.as_posix() if isinstance(m, pathlib.Path) else str(m)
         for m in modified_files
     ]
+    if len(mod_list) <= 1:
+        return None
     return (
-        f"⚠️ MULTI-FILE DIFF DETECTED: {len(mod_list)} files modified ({mod_list}). "
-        f"Running tests on {target_file}. "
-        f"If regressions occur, revert secondary files first before debugging further!"
+        f"ℹ️ MULTI-FILE TARGET: {len(mod_list)} repository files modified ({mod_list}). "
+        f"Testing blast radius across target(s)."
     )
+
+
+def resolve_docs_src_test_path(path_str: str) -> Optional[str]:
+    """Framework-aware path mapping for FastAPI doc tutorials.
+
+    Maps docs_src/<category>/tutorial<N>[_<variant>].py to
+    tests/test_tutorial/test_<category>/test_tutorial<N>.py (stripping _py310, _py39, _an_py310, etc.).
+    """
+    clean_p = path_str.replace("\\", "/").strip().lstrip("/")
+    parts = clean_p.split("/")
+    if "docs_src" not in parts:
+        return None
+    idx = parts.index("docs_src")
+    subparts = parts[idx + 1:]
+    if len(subparts) < 2:
+        return None
+
+    category_parts = subparts[:-1]
+    filename = subparts[-1]
+    stem = filename[:-3] if filename.endswith(".py") else filename
+
+    m = re.match(r"^(tutorial\d+[a-z]?)(?:_.*)?$", stem)
+    if m:
+        base_stem = m.group(1)
+    else:
+        base_stem = re.sub(r"(_(?:an|py3\d+|py\d+|pv\d+|non_annotated|annotated))+$", "", stem)
+
+    category = "_".join(category_parts)
+    clean_category = category[5:] if category.startswith("test_") else category
+    return f"tests/test_tutorial/test_{clean_category}/test_{base_stem}.py"
+
+
+def get_modified_lines_from_git(file_path: pathlib.Path, ws: pathlib.Path) -> Set[int]:
+    """Extract line numbers added or modified in file_path via git diff."""
+    modified_lines: Set[int] = set()
+    try:
+        rel_p = file_path.relative_to(ws)
+    except ValueError:
+        rel_p = file_path
+
+    for git_cmd in [
+        ["git", "diff", "-U0", "HEAD", "--", str(rel_p)],
+        ["git", "diff", "-U0", "--", str(rel_p)],
+    ]:
+        try:
+            res = subprocess.run(git_cmd, cwd=ws, capture_output=True, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                for line in res.stdout.splitlines():
+                    if line.startswith("@@"):
+                        m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+                        if m:
+                            start = int(m.group(1))
+                            count = int(m.group(2)) if m.group(2) is not None else 1
+                            if count == 0:
+                                modified_lines.add(start)
+                            else:
+                                for lno in range(start, start + count):
+                                    modified_lines.add(lno)
+                if modified_lines:
+                    return modified_lines
+        except Exception:
+            pass
+    return modified_lines
+
+
+def extract_all_ast_symbols(file_path: pathlib.Path) -> Set[str]:
+    """Extract top-level classes, methods, functions, and module-level variables from a Python file."""
+    symbols: Set[str] = set()
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content, filename=str(file_path))
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                symbols.add(node.name)
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if not item.name.startswith("__"):
+                            symbols.add(item.name)
+                            symbols.add(f"{node.name}.{item.name}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not node.name.startswith("__"):
+                    symbols.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        symbols.add(target.id)
+            elif isinstance(node, ast.AnnAssign):
+                if isinstance(node.target, ast.Name):
+                    symbols.add(node.target.id)
+    except Exception:
+        pass
+    return {s for s in symbols if len(s) > 1}
+
+
+def get_target_symbols(target_path: pathlib.Path, ws: pathlib.Path) -> Set[str]:
+    """Extract AST symbols modified in target_path (falling back to all top-level symbols)."""
+    if not target_path.exists() or target_path.suffix != ".py":
+        return set()
+
+    modified_lines = get_modified_lines_from_git(target_path, ws)
+    symbols: Set[str] = set()
+    try:
+        content = target_path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(content, filename=str(target_path))
+
+        if modified_lines:
+            for node in tree.body:
+                node_start = getattr(node, "lineno", 0)
+                node_end = getattr(node, "end_lineno", node_start)
+                node_lines = set(range(node_start, node_end + 1))
+                if node_lines & modified_lines:
+                    if isinstance(node, ast.ClassDef):
+                        symbols.add(node.name)
+                        for item in node.body:
+                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                item_start = getattr(item, "lineno", 0)
+                                item_end = getattr(item, "end_lineno", item_start)
+                                if set(range(item_start, item_end + 1)) & modified_lines:
+                                    symbols.add(item.name)
+                                    symbols.add(f"{node.name}.{item.name}")
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        symbols.add(node.name)
+                    elif isinstance(node, ast.Assign):
+                        for tgt in node.targets:
+                            if isinstance(tgt, ast.Name):
+                                symbols.add(tgt.id)
+                    elif isinstance(node, ast.AnnAssign):
+                        if isinstance(node.target, ast.Name):
+                            symbols.add(node.target.id)
+
+        if not symbols:
+            symbols = extract_all_ast_symbols(target_path)
+    except Exception:
+        pass
+
+    return {s for s in symbols if s and not s.startswith("__") and len(s) > 1}
+
+
+def find_tests_for_symbols(
+    symbols: Set[str],
+    ws: pathlib.Path,
+    exclude_paths: Optional[Set[pathlib.Path]] = None,
+    max_test_files: int = 6,
+) -> List[str]:
+    """Scan test files across workspace for imports or call-sites of target AST symbols."""
+    if not symbols:
+        return []
+
+    exclude = exclude_paths or set()
+    scan_names = set()
+    for s in symbols:
+        if "." in s:
+            scan_names.add(s.split(".")[-1])
+            scan_names.add(s.split(".")[0])
+        else:
+            scan_names.add(s)
+    scan_names = {s for s in scan_names if len(s) > 1 and s not in {"self", "cls", "None", "True", "False"}}
+    if not scan_names:
+        return []
+
+    matched_tests: List[str] = []
+    cand_files: List[pathlib.Path] = []
+    try:
+        for p in ws.rglob("*.py"):
+            if any(part in SKIP_DIRS for part in p.parts):
+                continue
+            if p in exclude:
+                continue
+            if "tests" in p.parts or "test" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py"):
+                cand_files.append(p)
+    except Exception:
+        pass
+
+    for tf in cand_files:
+        try:
+            rel_tf = str(tf.relative_to(ws))
+        except ValueError:
+            rel_tf = str(tf)
+
+        try:
+            content = tf.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        found_in_text = {s for s in scan_names if s in content}
+        if not found_in_text:
+            continue
+
+        has_symbol_ref = False
+        try:
+            tree = ast.parse(content, filename=rel_tf)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name in found_in_text or alias.asname in found_in_text:
+                            has_symbol_ref = True
+                            break
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in found_in_text or alias.asname in found_in_text:
+                            has_symbol_ref = True
+                            break
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id in found_in_text:
+                        has_symbol_ref = True
+                        break
+                    elif isinstance(node.func, ast.Attribute) and node.func.attr in found_in_text:
+                        has_symbol_ref = True
+                        break
+                elif isinstance(node, ast.Name) and node.id in found_in_text:
+                    if isinstance(getattr(node, "ctx", None), ast.Load):
+                        has_symbol_ref = True
+                        break
+                if has_symbol_ref:
+                    break
+        except Exception:
+            has_symbol_ref = True
+
+        if has_symbol_ref and rel_tf not in matched_tests:
+            matched_tests.append(rel_tf)
+            if len(matched_tests) >= max_test_files:
+                break
+
+    return matched_tests
+
+
+class BlastRadiusScope(tuple):
+    """2-tuple (test_files, consumers) with attribute access for rich dependency metadata."""
+
+    def __new__(
+        cls,
+        test_files: List[str],
+        consumers: List[str],
+        direct_tests: Optional[List[str]] = None,
+        consumer_tests: Optional[List[str]] = None,
+        symbols: Optional[Set[str]] = None,
+    ):
+        return super().__new__(cls, (test_files, consumers))
+
+    def __init__(
+        self,
+        test_files: List[str],
+        consumers: List[str],
+        direct_tests: Optional[List[str]] = None,
+        consumer_tests: Optional[List[str]] = None,
+        symbols: Optional[Set[str]] = None,
+    ):
+        self.test_files = test_files
+        self.consumers = consumers
+        self.direct_tests = direct_tests or []
+        self.consumer_tests = consumer_tests or []
+        self.symbols = symbols or set()
 
 
 def extract_repo_symbols(file_path: pathlib.Path) -> Dict[str, Any]:
@@ -330,8 +588,8 @@ def extract_repo_symbols(file_path: pathlib.Path) -> Dict[str, Any]:
     return symbols
 
 
-def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List[str], List[str]]:
-    """Determine distance-1 consumers and relevant test files using AST analysis."""
+def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> BlastRadiusScope:
+    """Determine distance-1 consumers and relevant test files using AST analysis and symbol resolution."""
     try:
         rel_target = target_path.relative_to(ws)
     except ValueError:
@@ -344,8 +602,20 @@ def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List
         target_mod_parts[-1] = target_mod_parts[-1][:-3]
     full_mod_name = ".".join(target_mod_parts)
 
-    # 1. Direct test file heuristics
+    # 1. Direct test file heuristics & framework-aware path mapping
     direct_tests: List[str] = []
+    consumer_tests: List[str] = []
+    consumers: List[str] = []
+
+    # Framework-aware mapping for docs_src tutorial files
+    docs_cand = resolve_docs_src_test_path(str(rel_target))
+    if docs_cand:
+        cand_p = ws / docs_cand
+        if cand_p.exists():
+            rel_docs = str(cand_p.relative_to(ws))
+            if rel_docs not in direct_tests:
+                direct_tests.append(rel_docs)
+
     if "test" in target_path.name:
         direct_tests.append(str(rel_target))
     else:
@@ -364,7 +634,7 @@ def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List
             if cand_p.exists() and str(cand_p.relative_to(ws)) not in direct_tests:
                 direct_tests.append(str(cand_p.relative_to(ws)))
 
-        if not direct_tests:
+        if not direct_tests and not docs_cand:
             try:
                 for match in ws.rglob(f"test_{stem}.py"):
                     if not any(part in SKIP_DIRS for part in match.parts):
@@ -373,10 +643,20 @@ def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List
             except Exception:
                 pass
 
-    # 2. Find distance-1 consumers (files importing target)
-    consumers: List[str] = []
-    consumer_tests: List[str] = []
+    # Symbol-level test resolution: scan test files for imports or call-sites of modified AST symbols
+    target_symbols = get_target_symbols(target_path, ws)
+    if target_symbols:
+        sym_tests = find_tests_for_symbols(
+            symbols=target_symbols,
+            ws=ws,
+            exclude_paths={target_path, ws / rel_target},
+            max_test_files=6,
+        )
+        for st in sym_tests:
+            if st not in direct_tests and st not in consumer_tests:
+                direct_tests.append(st)
 
+    # 2. Find distance-1 consumers (files importing target)
     try:
         for p in ws.rglob("*.py"):
             if any(part in SKIP_DIRS for part in p.parts):
@@ -417,7 +697,7 @@ def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List
                     break
 
             if imports_target:
-                if "tests" in p.parts or "test" in p.parts or p.name.startswith("test_"):
+                if "tests" in p.parts or "test" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py"):
                     if rel_f not in direct_tests and rel_f not in consumer_tests:
                         consumer_tests.append(rel_f)
                 else:
@@ -441,8 +721,14 @@ def find_blast_radius(target_path: pathlib.Path, ws: pathlib.Path) -> Tuple[List
         if t not in all_tests:
             all_tests.append(t)
 
-    # Cap to max 6 test files to guarantee fast (<5s) execution
-    return all_tests[:6], consumers
+    # Return BlastRadiusScope (subclass of tuple, capped to max 8 files)
+    return BlastRadiusScope(
+        all_tests[:8],
+        consumers,
+        direct_tests=direct_tests,
+        consumer_tests=consumer_tests,
+        symbols=target_symbols,
+    )
 
 
 def find_pytest_command(ws: pathlib.Path) -> List[str]:
@@ -782,6 +1068,7 @@ def is_direct_unit_test(
     test_ref: str | pathlib.Path,
     modified_files: List[pathlib.Path],
     targets: List[pathlib.Path],
+    direct_test_files: Optional[List[str]] = None,
 ) -> bool:
     """Check if test_ref directly tests one of the modified repo components."""
     if not test_ref:
@@ -794,14 +1081,43 @@ def is_direct_unit_test(
     t_name = p.name.lower()
     t_posix = p.as_posix().lower()
 
+    # 1. Direct match with direct_test_files resolved during blast discovery
+    if direct_test_files:
+        for dt in direct_test_files:
+            clean_dt = str(dt).strip()
+            if "::" in clean_dt:
+                clean_dt = clean_dt.split("::", 1)[0]
+            if raw_str == clean_dt or raw_str.endswith(clean_dt) or clean_dt.endswith(raw_str):
+                return True
+            if pathlib.Path(clean_dt).stem.lower() == t_stem:
+                return True
+
     all_mods = list(targets or []) + list(modified_files or [])
     for mod_p in all_mods:
         if not mod_p:
             continue
         m_p = pathlib.Path(mod_p)
+        m_str = str(m_p)
+
+        # Check docs_src framework mapping
+        docs_test = resolve_docs_src_test_path(m_str)
+        if docs_test:
+            if docs_test.lower() == raw_str.lower() or raw_str.lower().endswith(docs_test.lower()) or docs_test.lower().endswith(raw_str.lower()):
+                return True
+            if pathlib.Path(docs_test).stem.lower() == t_stem:
+                return True
+
         m_stem = m_p.stem.lower()
         if not m_stem or m_stem in ("__init__", "conftest", "test", "tests"):
             continue
+
+        # Check tutorial variant stem (e.g. tutorial001_py310 -> tutorial001)
+        m_tut = re.match(r"^(tutorial\d+[a-z]?)(?:_.*)?$", m_stem)
+        if m_tut:
+            tut_base = m_tut.group(1)
+            if t_stem in (f"test_{tut_base}", f"{tut_base}_test", tut_base):
+                return True
+
         m_clean = m_stem.lstrip("_")
 
         # Direct matching heuristics (e.g. tests/test_ansi.py testing rich/ansi.py)
@@ -923,6 +1239,8 @@ def parse_pytest_output(
     targets: List[pathlib.Path],
     test_files: List[str],
     exit_code: int,
+    consumer_test_files: Optional[List[str]] = None,
+    direct_test_files: Optional[List[str]] = None,
 ) -> BlastRadiusResult:
     """Parse pytest failure blocks into rich Pydantic v2 diagnostic schemas."""
     clean_out = strip_ansi(raw_output)
@@ -1104,7 +1422,7 @@ def parse_pytest_output(
             if "test" in loc_f.lower():
                 candidate_test_refs.append(loc_f)
 
-        is_direct = any(is_direct_unit_test(t_ref, modified_files, targets) for t_ref in candidate_test_refs if t_ref)
+        is_direct = any(is_direct_unit_test(t_ref, modified_files, targets, direct_test_files=direct_test_files) for t_ref in candidate_test_refs if t_ref)
         is_mismatch = is_assertion_mismatch(error_type, actual_val, expected_val, diff_str, expl, statement, error_msg)
         prefix_advisory: Optional[str] = PREFIX_CONFLICT_ADVISORY if (is_direct and is_mismatch) else None
 
@@ -1217,27 +1535,109 @@ def parse_pytest_output(
             m_strs.append(m.as_posix() if hasattr(m, "as_posix") else str(m))
 
     target_file = t_strs[0] if len(t_strs) == 1 else (", ".join(t_strs) if t_strs else (m_strs[0] if m_strs else "target"))
-    multi_file_warning: Optional[str] = None
-    if len(m_strs) > 1:
-        multi_file_warning = (
-            f"⚠️ MULTI-FILE DIFF DETECTED: {len(m_strs)} files modified ({m_strs}). "
-            f"Running tests on {target_file}. "
-            f"If regressions occur, revert secondary files first before debugging further!"
-        )
+    multi_file_info = format_multi_file_warning(modified_files, target_file)
 
-    base_summary = summary_line or ("All tests passed." if exit_code == 0 else f"{len(failures)} test(s) failed.")
-    final_summary = f"{multi_file_warning} | {base_summary}" if multi_file_warning else base_summary
-    overall_prefix_advisory = next((d.prefix_conflict_advisory for d in diagnoses if d.prefix_conflict_advisory), None)
+    # Evaluate smart verdict: pre-fix baseline conflicts vs real regressions
+    all_failures_in_direct_tests = True
+    all_failures_assertion_mismatches = True
+    consumer_failures: List[TestFailureDetail] = []
+
+    non_conflict_errors = {
+        "AttributeError",
+        "TypeError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "KeyError",
+        "IndexError",
+        "NameError",
+        "SyntaxError",
+        "IndentationError",
+        "ZeroDivisionError",
+        "FileNotFoundError",
+        "PermissionError",
+        "TimeoutError",
+        "RuntimeError",
+        "RecursionError",
+        "UnboundLocalError",
+        "NotImplementedError",
+        "PytestError",
+    }
+
+    for f in failures:
+        in_direct = is_direct_unit_test(
+            f.test_file or f.test_id,
+            modified_files,
+            targets,
+            direct_test_files=direct_test_files,
+        )
+        if not in_direct:
+            all_failures_in_direct_tests = False
+            consumer_failures.append(f)
+
+        is_mismatch = is_assertion_mismatch(
+            f.error_type,
+            f.actual,
+            f.expected,
+            f.diff,
+            f.explanation,
+            f.failing_statement,
+            f.error_message,
+        ) or bool(f.prefix_conflict_advisory)
+
+        if f.error_type in non_conflict_errors or not is_mismatch:
+            all_failures_assertion_mismatches = False
+
+    if exit_code == 0:
+        if total_passed == 0 and total_failed == 0 and total_errors == 0:
+            status = "UNVERIFIED_NO_TESTS"
+            passed = False
+            base_summary = (
+                f"UNVERIFIED_NO_TESTS: 0 tests executed across {test_files}. "
+                f"Verification required before submission."
+            )
+        else:
+            status = "PASSED"
+            passed = True
+            base_summary = summary_line or "All tests passed."
+    elif (
+        failures
+        and all_failures_in_direct_tests
+        and len(consumer_failures) == 0
+    ):
+        status = "FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT"
+        passed = False
+        base_summary = (
+            f"FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT: "
+            f"Direct unit tests failed ({len(failures)} mismatch(es)/failure(s)), "
+            f"while distance-1 consumer tests passed. Verification CANNOT pass while direct tests fail."
+        )
+    else:
+        status = "FAILED"
+        passed = False
+        base_summary = summary_line or f"{len(failures)} test(s) failed."
+
+    final_summary = f"{multi_file_info} | {base_summary}" if multi_file_info else base_summary
+    if status == "FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT":
+        overall_prefix_advisory = (
+            "[blast-radius] ⚠️ DIRECT UNIT TESTS FAILED: Pre-fix assertion baseline conflict suspected, "
+            "but verification CANNOT pass while direct tests fail. "
+            "If this file was intentionally altered, verify that this is indeed the target file requested by the issue, not a secondary file!"
+        )
+    else:
+        overall_prefix_advisory = next((d.prefix_conflict_advisory for d in diagnoses if d.prefix_conflict_advisory), None)
 
     return BlastRadiusResult(
         targets=t_strs,
         modified_files=m_strs,
         distance1_consumers=[],
         test_files=test_files,
+        direct_test_files=direct_test_files or [],
+        consumer_test_files=consumer_test_files or [],
         exit_code=exit_code,
-        passed=(exit_code == 0),
+        passed=passed,
+        status=status,
         summary=final_summary,
-        multi_file_warning=multi_file_warning,
+        multi_file_warning=multi_file_info,
         total_passed=total_passed,
         total_failed=total_failed or (len(failures) if exit_code != 0 else 0),
         total_errors=total_errors,
@@ -1250,16 +1650,15 @@ def parse_pytest_output(
 def format_failure_report(result: BlastRadiusResult, max_lines: int = 40) -> str:
     """Format a clean, deterministic, context-capped triage report."""
     out_lines: List[str] = []
-    out_lines.append(f"[blast-radius] 💥 REGRESSION DETECTED IN BLAST RADIUS (Exit code: {result.exit_code}):")
-    out_lines.append("=" * 80)
+    if result.status == "FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT":
+        out_lines.append(f"[blast-radius] ⚠️ DIRECT UNIT TESTS FAILED (Exit code: {result.exit_code}):")
+        out_lines.append("=" * 80)
+    else:
+        out_lines.append(f"[blast-radius] 💥 REGRESSION DETECTED IN BLAST RADIUS (Exit code: {result.exit_code}):")
+        out_lines.append("=" * 80)
 
     if len(result.modified_files) > 1:
-        target_name = result.targets[0] if result.targets else "target"
-        out_lines.append(
-            f"⚠️ MULTI-FILE DIFF DETECTED: {len(result.modified_files)} files modified ({result.modified_files}). "
-            f"Running tests on {target_name}. "
-            f"If regressions occur, revert secondary files first before debugging further!"
-        )
+        out_lines.append(f"ℹ️ Modified files under test: {', '.join(result.modified_files)}")
         out_lines.append("-" * 80)
 
     for diag in result.diagnoses[:3]:
@@ -1306,8 +1705,22 @@ def format_failure_report(result: BlastRadiusResult, max_lines: int = 40) -> str
         remaining = len(result.diagnoses) - 3
         out_lines.append(f"  ... (+{remaining} additional failure group(s) truncated for clarity)")
 
-    out_lines.append("[blast-radius] ⚠️ FIX OR REVERT: Changes broke the tests listed above!")
-    return "\n".join(out_lines[:max_lines])
+    footer_lines: List[str] = []
+    if result.status == "FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT":
+        footer_lines.append("=" * 80)
+        footer_lines.append(
+            "[blast-radius] ⚠️ DIRECT UNIT TESTS FAILED: Pre-fix assertion baseline conflict suspected, "
+            "but verification CANNOT pass while direct tests fail. "
+            "If this file was intentionally altered, verify that this is indeed the target file requested by the issue, not a secondary file!"
+        )
+    else:
+        footer_lines.append("[blast-radius] ⚠️ FIX OR REVERT: Changes broke the tests listed above!")
+
+    if len(out_lines) + len(footer_lines) > max_lines:
+        allowed = max(1, max_lines - len(footer_lines) - 1)
+        out_lines = out_lines[:allowed] + ["  ... (+ additional failure details truncated for length)"]
+
+    return "\n".join(out_lines + footer_lines)
 
 
 def main() -> int:
@@ -1343,15 +1756,27 @@ def main() -> int:
 
         all_test_files: List[str] = []
         all_consumers: List[str] = []
+        all_direct_tests: List[str] = []
+        all_consumer_tests: List[str] = []
 
         for t in targets:
-            tests, consumers = find_blast_radius(t, ws)
+            scope = find_blast_radius(t, ws)
+            tests, consumers = scope[:2]
+            directs = getattr(scope, "direct_tests", [])
+            cons_tests = getattr(scope, "consumer_tests", [])
+
             for tst in tests:
                 if tst not in all_test_files:
                     all_test_files.append(tst)
             for c in consumers:
                 if c not in all_consumers:
                     all_consumers.append(c)
+            for dt in directs:
+                if dt not in all_direct_tests:
+                    all_direct_tests.append(dt)
+            for ct in cons_tests:
+                if ct not in all_consumer_tests:
+                    all_consumer_tests.append(ct)
 
         # Format target names
         def format_target_name(t: pathlib.Path) -> str:
@@ -1365,12 +1790,7 @@ def main() -> int:
             all_repo_modified = _get_modified_files(ws)
             if len(all_repo_modified) > 1:
                 all_mod_names = [format_target_name(m) for m in all_repo_modified]
-                warn_msg = (
-                    f"⚠️ MULTI-FILE DIFF DETECTED: {len(all_repo_modified)} files modified ({all_mod_names}). "
-                    f"Running tests on {target_names}. "
-                    f"If regressions occur, revert secondary files first before debugging further!"
-                )
-                print(f"[blast-radius] {warn_msg}")
+                print(f"[blast-radius] ℹ️ MULTI-FILE TARGET: {len(all_repo_modified)} files modified ({all_mod_names}).")
             print(f"[blast-radius] TARGET(S): {target_names}")
             if all_consumers:
                 consumer_preview = ", ".join(all_consumers[:5])
@@ -1382,29 +1802,31 @@ def main() -> int:
         if not all_test_files:
             target_str = format_target_name(targets[0]) if targets else "target"
             mod_names = [format_target_name(t) for t in targets]
-            empty_summary = "No matching test files found."
-            multi_file_warn = None
-            if len(mod_names) > 1:
-                multi_file_warn = (
-                    f"⚠️ MULTI-FILE DIFF DETECTED: {len(mod_names)} files modified ({mod_names}). "
-                    f"Running tests on {target_str}. "
-                    f"If regressions occur, revert secondary files first before debugging further!"
-                )
-                empty_summary = f"{multi_file_warn} | {empty_summary}"
+            empty_summary = (
+                f"UNVERIFIED_NO_TESTS: 0 matching test files found for modified target(s) ({target_names}). "
+                f"Verification required before submission."
+            )
+            multi_file_info = format_multi_file_warning(targets, target_str)
 
             if not json_mode:
-                if multi_file_warn:
-                    print(f"[blast-radius] {multi_file_warn}")
+                if multi_file_info:
+                    print(f"[blast-radius] {multi_file_info}")
+                print(f"[blast-radius] ⚠️ STATUS: UNVERIFIED_NO_TESTS")
                 print(f"[blast-radius] ⚠️ No matching test files found for {target_names}.")
+                print(f"[blast-radius] ⚠️ VERIFICATION REQUIRED: 0 tests were executed. Do NOT submit patch without running or writing verification tests!")
             else:
                 empty_res = BlastRadiusResult(
                     targets=[format_target_name(t) for t in targets],
                     modified_files=[format_target_name(t) for t in targets],
                     distance1_consumers=all_consumers,
                     test_files=[],
-                    passed=True,
+                    direct_test_files=[],
+                    consumer_test_files=[],
+                    exit_code=0,
+                    passed=False,
+                    status="UNVERIFIED_NO_TESTS",
                     summary=empty_summary,
-                    multi_file_warning=multi_file_warn,
+                    multi_file_warning=multi_file_info,
                 )
                 print(empty_res.model_dump_json(indent=2))
             return 0
@@ -1423,12 +1845,22 @@ def main() -> int:
             targets=targets,
             test_files=all_test_files,
             exit_code=exit_code,
+            consumer_test_files=all_consumer_tests,
+            direct_test_files=all_direct_tests,
         )
         result.distance1_consumers = all_consumers
+        result.direct_test_files = all_direct_tests
+        result.consumer_test_files = all_consumer_tests
 
         if json_mode:
             print(result.model_dump_json(indent=2))
-        elif exit_code == 0:
+        elif result.status == "FAILED_DIRECT_TESTS_SUSPECTED_CONFLICT":
+            print(format_failure_report(result, max_lines=40))
+        elif result.status == "UNVERIFIED_NO_TESTS":
+            print(f"[blast-radius] ⚠️ STATUS: UNVERIFIED_NO_TESTS")
+            print(f"[blast-radius] {result.summary}")
+            print(f"[blast-radius] ⚠️ VERIFICATION REQUIRED: 0 tests were executed. Do NOT submit patch without verification!")
+        elif exit_code == 0 and result.passed:
             print(f"[blast-radius] ✅ PASSED: {result.summary}")
         else:
             print(format_failure_report(result, max_lines=40))
