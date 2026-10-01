@@ -2,7 +2,23 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01 (Monolithic Toolset Streamline & Run B37 Hardening)
+## [Unreleased] - 2026-10-01 (Omnivorous & Forgiving Skill Audit & Hardening)
+
+### Omnivorous & Forgiving Skill Hardening (projects-1ff, projects-7yz)
+- **`skills/fast-grep` Hardened & Restored (`projects-1ff`)**:
+  - *Restored AST Fuzzy Suggestions*: Restored fuzzy symbol suggestions (`FuzzySuggestion`) during 0-match events with AST kind, file location, and similarity score, so the LLM immediately knows valid symbols when exact match fails.
+  - *Smart Compound Queries & Stopword Filtering*: Preserves exact compound phrases for primary search; falls back to non-stopword tokens if the full phrase fails (preventing runaway keyword OR explosion).
+  - *Regex & Metacharacter Resilience*: Automatically sanitizes unescaped regex metacharacters (`()[]{}\\$^*+?|.`), using extended regex (`-E`) -> fixed strings (`-F`) -> pure Python scanner fallback.
+  - *Path Tolerance & LLM Guidance*: If a non-existent target path is provided, warns the LLM with `⚠️ TARGET PATH NOT FOUND`, suggests closest matching files, and gracefully falls back to `/workspace` search instead of aborting.
+  - *Zero Crash Loops & Backtracking Elimination*: Added `followlinks=False`, 50K file limit, 500KB file size skips, and replaced greedy nested regexes in `score_match` with token extraction to prevent catastrophic backtracking.
+- **`skills/code-map` Hardened & Forgiving Auto-Detection (`projects-7yz`)**:
+  - *Forgiving Positional Argument Auto-Detection*: Seamlessly infers whether a positional argument is a symbol name (`args=["APIRouter"]`), a file path (`args=["fastapi/routing.py"]` or extensionless `args=["routing"]`), or a directory (`args=["fastapi"]`), without crashing if `--symbol` or `--file` flags are omitted.
+  - *Zero-Crash Overview Mode*: Calling `map.py` with no arguments, `.`, or `/workspace` executes Repository Overview Mode (exit code 0), displaying top-level structure, discovered packages, and actionable copy-pasteable example commands tailored to the repo.
+  - *Restored Class Hierarchies*: Recovers base classes (`bases`) and subclass relationships (`subclasses`) in AST reference tracing.
+  - *Loop-Safe & Cycle-Free Traversal*: Implemented `safe_walk()` with `followlinks=False`, depth bounding (max 15), and inode/device tracking `(st_dev, st_ino)` to eliminate symlink cycles. Guarded AST recursive extraction with depth limit (max 8) and `RecursionError` handlers.
+  - *Actionable LLM Diagnostics*: Unknown symbols trigger fuzzy matching + workspace top-level public symbol lists; unknown files trigger closest existing path recommendations.
+
+## [2026-10-01] - (Monolithic Toolset Streamline & Run B37 Hardening)
 
 ### Lean Tool Consolidation & Dual-Modality Elimination
 - **Killed `search_similar_code`**: Dropped from `my_submission/agent.yaml` tools to resolve Turn 1 search hesitation and split-brain tool competition. Established `fast-grep` as the authoritative single search tool.

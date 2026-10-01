@@ -2,20 +2,23 @@
 """fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents.
 
 Eats ANY input format:
-- Single terms, multiple terms (searched as OR/union)
+- Single terms, compound phrases, multiple terms (searched as OR/union)
 - Unescaped regex or literal code snippets
 - Dotted symbols, function calls, or raw keywords
 - Automatically skips benchmarks, lockfiles, docs, and non-code spam
 - Deterministically explains zero matches with file count and case-insensitive check
 - Suggests candidate symbols from AST and repository identifiers via fuzzy matching
+- Tokenizes compound phrases on failure and checks for sub-term presence
 - Explains regex syntax errors in plain English and suggests escaped patterns
 - 100% Pydantic v2 structured schemas (FastGrepResult, MatchExplanation, FuzzySuggestion, etc.)
-- Flashes top 3 enclosing functions with complete decorators via AST
+- Flashes top 2 enclosing functions with complete decorators via AST
 - Prioritizes function, method, and class definitions at the top of search rankings over call sites
 - Boosts common string/buffer transformation methods & verbs
 - Highlights call-sites and enclosing scopes where strings/buffers are transformed
 - Automatically expands terse issue keywords to candidate string operations
-- Always exits 0 and never crashes.
+- Detects non-existent paths, warns the LLM, suggests similar files, and falls back to workspace search
+- Context-safe: Sliding context window centered on target line, clean code block for edit_file
+- Always exits 0 and never crashes or hangs in runaway loops.
 """
 
 from __future__ import annotations
@@ -45,7 +48,7 @@ class MatchExplanation(BaseModel):
 
     status: str = Field(
         ...,
-        description="Outcome status: MATCHES_FOUND, ZERO_MATCHES, or REGEX_ERROR",
+        description="Outcome status: MATCHES_FOUND, ZERO_MATCHES, REGEX_ERROR, or PATH_NOT_FOUND",
     )
     summary: str = Field(
         ..., description="Human-readable summary of search result"
@@ -58,6 +61,12 @@ class MatchExplanation(BaseModel):
     )
     details: Optional[str] = Field(
         default=None, description="Additional context or diagnostics"
+    )
+    skipped_extensions: List[str] = Field(
+        default_factory=list, description="Extensions excluded from search"
+    )
+    skipped_dirs: List[str] = Field(
+        default_factory=list, description="Directories excluded from search"
     )
 
 
@@ -78,6 +87,21 @@ class FuzzySuggestion(BaseModel):
     source_file: Optional[str] = Field(
         default=None,
         description="Workspace-relative file path containing symbol",
+    )
+
+
+class SubtermMatchSummary(BaseModel):
+    """Match summary for individual sub-terms of a failed compound query."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    subterm: str = Field(..., description="Subterm token extracted from query")
+    match_count: int = Field(..., description="Count of matches found for subterm")
+    sample_file: Optional[str] = Field(
+        default=None, description="Sample file containing subterm"
+    )
+    sample_lineno: Optional[int] = Field(
+        default=None, description="Sample line number containing subterm"
     )
 
 
@@ -178,6 +202,19 @@ class FastGrepResult(BaseModel):
     )
     fuzzy_suggestions: List[FuzzySuggestion] = Field(
         default_factory=list, description="Candidate symbol suggestions"
+    )
+    subterm_matches: List[SubtermMatchSummary] = Field(
+        default_factory=list,
+        description="Matches found for tokenized sub-terms of compound query",
+    )
+    similar_files: List[str] = Field(
+        default_factory=list, description="Relevant workspace files"
+    )
+    suggestions: List[str] = Field(
+        default_factory=list, description="Actionable query reformulation suggestions"
+    )
+    path_warning: Optional[str] = Field(
+        default=None, description="Warning if target path was missing or corrected"
     )
     ranked_matches: List[GrepMatch] = Field(
         default_factory=list, description="Ranked match items"
@@ -296,6 +333,51 @@ PYTHON_KEYWORDS: Set[str] = {
     "yield",
 }
 
+COMMON_STOPWORDS: Set[str] = {
+    "the",
+    "a",
+    "an",
+    "in",
+    "on",
+    "of",
+    "to",
+    "for",
+    "with",
+    "at",
+    "by",
+    "from",
+    "into",
+    "is",
+    "are",
+    "was",
+    "were",
+    "it",
+    "this",
+    "that",
+    "these",
+    "those",
+    "be",
+    "been",
+    "has",
+    "have",
+    "had",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "not",
+    "no",
+    "but",
+    "and",
+    "or",
+    "as",
+    "if",
+}
+
 # Heuristic expansion for terse issue keywords to prevent flooding by doc/comment matches
 TERSE_ISSUE_EXPANSIONS: Dict[str, List[str]] = {
     "newline": ["splitlines", "rstrip", "strip", "replace"],
@@ -318,11 +400,15 @@ _AST_CACHE: Dict[str, Tuple[Optional[ast.AST], List[str]]] = {}
 def get_ast_and_lines(
     full_path: pathlib.Path,
 ) -> Tuple[Optional[ast.AST], List[str]]:
-    """Parse and cache AST and source lines for a python file."""
+    """Parse and cache AST and source lines for a python file, skipping gigantic files."""
     key = str(full_path.resolve())
     if key in _AST_CACHE:
         return _AST_CACHE[key]
     try:
+        # Protect against runaway memory on giant generated files (>500KB)
+        if full_path.stat().st_size > 500_000:
+            _AST_CACHE[key] = (None, [])
+            return (None, [])
         text = full_path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
         tree = ast.parse(text, filename=key)
@@ -385,7 +471,7 @@ def is_string_transform_scope(scope_name: str, lines: List[str]) -> bool:
         for w in ("ansi", "text", "buffer", "decode", "encode", "line", "codec")
     ):
         return True
-    for line in lines:
+    for line in lines[:200]:
         if is_string_transform_line(line):
             return True
     return False
@@ -434,31 +520,152 @@ def clean_search_term(raw: str) -> str:
     return cleaned
 
 
+def extract_subterms(phrase: str) -> List[str]:
+    """Extract significant non-stopword identifier tokens from a compound query."""
+    # Find all identifier-like chunks or words
+    words = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", phrase)
+    subterms: List[str] = []
+    for w in words:
+        w_clean = w.strip()
+        w_lower = w_clean.lower()
+        if (
+            len(w_clean) >= 3
+            and w_lower not in PYTHON_KEYWORDS
+            and w_lower not in COMMON_STOPWORDS
+            and w_clean not in subterms
+        ):
+            subterms.append(w_clean)
+    return subterms
+
+
+def find_similar_workspace_files(
+    query_str: str, ws: pathlib.Path, max_results: int = 5
+) -> List[str]:
+    """Find repository files matching or closely resembling query identifiers."""
+    all_files: List[str] = []
+    try:
+        if (ws / ".git").exists():
+            res = subprocess.run(
+                ["git", "ls-files", ":(exclude)*.adk_exec*"],
+                cwd=ws,
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if res.returncode == 0:
+                all_files = [
+                    f
+                    for f in res.stdout.splitlines()
+                    if f.endswith(".py")
+                    and not any(d in f for d in SKIP_DIRS)
+                ]
+    except Exception:
+        pass
+
+    if not all_files:
+        try:
+            for root, dirs, files in os.walk(ws, followlinks=False):
+                dirs[:] = [
+                    d
+                    for d in dirs
+                    if d not in SKIP_DIRS
+                    and not d.startswith(".")
+                    and not (".adk_exec" in d or d.startswith(".adk_exec"))
+                ]
+                for f in files:
+                    if f.endswith(".py"):
+                        full_p = pathlib.Path(root) / f
+                        try:
+                            all_files.append(str(full_p.relative_to(ws)))
+                        except ValueError:
+                            all_files.append(str(full_p))
+                if len(all_files) > 1000:
+                    break
+        except Exception:
+            pass
+
+    if not all_files:
+        return []
+
+    # 1. Exact stem matches (e.g. ansi -> rich/ansi.py)
+    matches: List[str] = []
+    tokens = [t.lower() for t in extract_subterms(query_str)]
+    if not tokens:
+        tokens = [query_str.lower()]
+
+    for f in all_files:
+        f_lower = f.lower()
+        stem = pathlib.Path(f).stem.lower()
+        if any(t == stem for t in tokens):
+            if f not in matches:
+                matches.append(f)
+        elif any(t in f_lower for t in tokens if len(t) >= 4):
+            if f not in matches:
+                matches.append(f)
+        if len(matches) >= max_results:
+            return matches
+
+    # 2. Fuzzy close matches on filename
+    filenames = [pathlib.Path(f).name for f in all_files]
+    for tok in tokens:
+        close = difflib.get_close_matches(tok, filenames, n=3, cutoff=0.5)
+        for c in close:
+            for f in all_files:
+                if pathlib.Path(f).name == c and f not in matches:
+                    matches.append(f)
+                    if len(matches) >= max_results:
+                        return matches
+
+    return matches[:max_results]
+
+
 def parse_args(
     args: List[str], ws: pathlib.Path
-) -> Tuple[List[str], pathlib.Path, bool, bool]:
-    """Extract search terms, target directory/file, and flags."""
+) -> Tuple[List[str], pathlib.Path, bool, bool, Optional[str], Optional[str]]:
+    """Extract search terms, target directory/file, and flags.
+
+    Returns:
+        (terms, target_path, is_json, is_help, invalid_target, raw_phrase)
+    """
     target_path = ws
     raw_terms: List[str] = []
     is_json = False
     is_help = False
+    invalid_target: Optional[str] = None
+    raw_phrase: Optional[str] = None
 
-    def add_term_or_tokens(term: str) -> None:
-        """Add term, auto-tokenizing multi-word whitespace-separated queries."""
-        cleaned_term = clean_search_term(term)
-        if not cleaned_term:
-            return
-        parts = cleaned_term.split()
-        if len(parts) > 1:
-            for part in parts:
-                p = clean_search_term(part)
-                if p and p not in raw_terms:
-                    raw_terms.append(p)
-        else:
-            if cleaned_term not in raw_terms:
-                raw_terms.append(cleaned_term)
+    def looks_like_path(val: str) -> bool:
+        """Heuristic to check if an argument was meant as a path."""
+        if val in (".", "./", "/workspace", "/workspace/"):
+            return True
+        if val.startswith(("/", "./", "../", "~/")):
+            return True
+        if "/" in val or "\\" in val:
+            return True
+        # Common file extensions
+        if any(
+            val.endswith(ext)
+            for ext in (
+                ".py",
+                ".pyi",
+                ".toml",
+                ".json",
+                ".md",
+                ".txt",
+                ".yaml",
+                ".yml",
+                ".rst",
+                ".html",
+                ".sh",
+            )
+        ):
+            return True
+        return False
 
     i = 0
+    positional_args: List[str] = []
+
     while i < len(args):
         a = args[i]
         cleaned = clean_search_term(a)
@@ -479,30 +686,61 @@ def parse_args(
         if cleaned in ("--query", "-q"):
             if i + 1 < len(args) and args[i + 1] not in ("--help", "-h", "--json"):
                 i += 1
-                add_term_or_tokens(args[i])
+                q_val = clean_search_term(args[i])
+                if q_val:
+                    raw_phrase = q_val
+                    raw_terms.append(q_val)
             i += 1
             continue
 
         if cleaned.startswith("--query=") or cleaned.startswith("-q="):
-            val = cleaned.split("=", 1)[1]
-            add_term_or_tokens(val)
+            val = clean_search_term(cleaned.split("=", 1)[1])
+            if val:
+                raw_phrase = val
+                raw_terms.append(val)
             i += 1
             continue
 
-        cand = ws / cleaned.lstrip("/")
-        cand_direct = pathlib.Path(cleaned).resolve()
-        if cand.exists() and cand != ws:
-            target_path = cand
-        elif cand_direct.exists() and cand_direct.is_dir() and cand_direct != ws:
-            target_path = cand_direct
-        elif cleaned in (".", "./", "/workspace", "/workspace/"):
-            target_path = ws
-        else:
-            add_term_or_tokens(cleaned)
-
+        positional_args.append(cleaned)
         i += 1
 
-    return raw_terms, target_path, is_json, is_help
+    # Resolve positional arguments
+    # If the last argument looks like a path, or exists, check if it's the target path
+    if positional_args:
+        # Check if the last positional argument is a path
+        last_arg = positional_args[-1]
+        is_path_cand = False
+
+        cand = ws / last_arg.lstrip("/")
+        cand_direct = pathlib.Path(last_arg).resolve()
+
+        if cand.exists() and cand != ws:
+            is_path_cand = True
+            target_path = cand
+            positional_args.pop()
+        elif cand_direct.exists() and cand_direct != ws:
+            is_path_cand = True
+            target_path = cand_direct
+            positional_args.pop()
+        elif last_arg in (".", "./", "/workspace", "/workspace/"):
+            is_path_cand = True
+            target_path = ws
+            positional_args.pop()
+        elif len(positional_args) >= 2 and looks_like_path(last_arg):
+            # Target path was explicitly specified but does not exist on disk
+            invalid_target = last_arg
+            positional_args.pop()
+
+        # Remaining positional arguments are query terms
+        for p in positional_args:
+            if not p:
+                continue
+            if not raw_phrase:
+                raw_phrase = p
+            if p not in raw_terms:
+                raw_terms.append(p)
+
+    return raw_terms, target_path, is_json, is_help, invalid_target, raw_phrase
 
 
 # ==============================================================================
@@ -588,7 +826,7 @@ def check_regex_syntax(pattern: str) -> Optional[RegexErrorDiagnostic]:
 
 
 def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
-    """Accurately count searchable files in target directory."""
+    """Accurately count searchable files in target directory with loop safeguards."""
     if (ws / ".git").exists():
         try:
             rel = "."
@@ -627,7 +865,7 @@ def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
 
     count = 0
     try:
-        for root, dirs, files in os.walk(target):
+        for root, dirs, files in os.walk(target, followlinks=False):
             dirs[:] = [
                 d
                 for d in dirs
@@ -643,6 +881,9 @@ def count_files_in_target(target: pathlib.Path, ws: pathlib.Path) -> int:
                     and not (".adk_exec" in f or f.startswith(".adk_exec"))
                 ]
             )
+            # Circuit breaker to prevent runaway file counting on enormous repos
+            if count >= 50000:
+                break
     except Exception:
         pass
     return max(count, 1)
@@ -661,7 +902,7 @@ def extract_candidate_symbols(
     scanned_files = 0
 
     try:
-        for root, dirs, files in os.walk(search_root):
+        for root, dirs, files in os.walk(search_root, followlinks=False):
             dirs[:] = [
                 d
                 for d in dirs
@@ -685,6 +926,13 @@ def extract_candidate_symbols(
                 except ValueError:
                     rel_p = str(full_p)
 
+                # Skip files > 500KB to protect memory and runtime
+                try:
+                    if full_p.stat().st_size > 500_000:
+                        continue
+                except OSError:
+                    continue
+
                 tree, lines = get_ast_and_lines(full_p)
                 if tree:
                     for node in ast.walk(tree):
@@ -706,16 +954,19 @@ def extract_candidate_symbols(
                             ):
                                 symbols[node.id] = ("variable", rel_p)
 
-                # Extract common identifiers from lines
+                # Extract common identifiers from lines (bounded to first 300 lines, 200 chars/line)
                 for line in lines[:300]:
                     tokens = re.findall(
-                        r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", line
+                        r"\b[A-Za-z_][A-Za-z0-9_]{2,}\b", line[:200]
                     )
                     for tok in tokens:
                         if tok not in symbols and tok not in PYTHON_KEYWORDS:
                             symbols[tok] = ("identifier", rel_p)
 
-            if scanned_files > max_files:
+                if len(symbols) >= 1000:
+                    break
+
+            if scanned_files > max_files or len(symbols) >= 1000:
                 break
     except Exception:
         pass
@@ -740,6 +991,8 @@ def get_fuzzy_suggestions(
             for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", term)
             if len(w) > 2 and w.lower() not in PYTHON_KEYWORDS
         ]
+        if not words:
+            words = [term]
 
         for cand, (kind, fpath) in candidate_symbols.items():
             s1 = difflib.SequenceMatcher(None, term, cand).ratio()
@@ -799,7 +1052,7 @@ def run_git_grep(
     safe_terms = []
     for t in terms:
         if re.search(r"[()\[\]{}*+?|^$\\.]", t):
-            safe_terms.append(re.escape(t))
+            safe_terms.append(escape_regex_metachars(t))
         else:
             safe_terms.append(t)
 
@@ -840,15 +1093,19 @@ def run_git_grep(
             check=False,
         )
         if res.returncode == 0 and res.stdout.strip():
-            clean_lines = [
-                line
-                for line in res.stdout.splitlines()
-                if line.strip()
-                and not (
-                    ".adk_exec" in line.split(":", 1)[0]
-                    or line.split(":", 1)[0].startswith(".adk_exec")
-                )
-            ]
+            clean_lines = []
+            for line in res.stdout.splitlines():
+                if not line.strip():
+                    continue
+                matched_file = line.split(":", 1)[0]
+                if (
+                    ".adk_exec" in matched_file
+                    or matched_file.startswith(".adk_exec")
+                ):
+                    continue
+                clean_lines.append(line)
+                if len(clean_lines) >= 500:
+                    break
             if clean_lines:
                 return clean_lines
     except Exception:
@@ -882,8 +1139,12 @@ def run_git_grep(
                         continue
                     if line not in all_lines:
                         all_lines.append(line)
+                    if len(all_lines) >= 500:
+                        break
         except Exception:
             pass
+        if len(all_lines) >= 500:
+            break
 
     if all_lines:
         return all_lines
@@ -900,19 +1161,22 @@ def python_walk_fallback(
     ws: pathlib.Path,
     case_insensitive: bool = False,
 ) -> List[str]:
-    """Pure-python fallback scanner when git grep is unavailable."""
+    """Pure-python fallback scanner when git grep is unavailable with ReDoS safeguards."""
     matches: List[str] = []
     flags = re.IGNORECASE if case_insensitive else 0
     compiled: List[re.Pattern] = []
+    raw_substrings: List[str] = []
+
     for t in terms:
         try:
-            compiled.append(re.compile(t, flags))
+            compiled.append(re.compile(escape_regex_metachars(t), flags))
         except re.error:
-            compiled.append(re.compile(re.escape(t), flags))
+            pass
+        raw_substrings.append(t.lower() if case_insensitive else t)
 
     search_root = target if target.is_dir() else ws
 
-    for root, dirs, files in os.walk(search_root):
+    for root, dirs, files in os.walk(search_root, followlinks=False):
         dirs[:] = [
             d
             for d in dirs
@@ -931,22 +1195,42 @@ def python_walk_fallback(
             except ValueError:
                 rel_p = str(full_p)
 
+            # Skip giant files > 500KB
+            try:
+                if full_p.stat().st_size > 500_000:
+                    continue
+            except OSError:
+                continue
+
             try:
                 with open(full_p, "r", encoding="utf-8", errors="replace") as fh:
                     for lineno, line in enumerate(fh, start=1):
+                        matched = False
+                        # 1. Regex check
                         for pattern in compiled:
                             if pattern.search(line):
-                                matches.append(
-                                    f"{rel_p}:{lineno}:{line.rstrip()}"
-                                )
+                                matched = True
                                 break
-                        if len(matches) > 300:
+                        # 2. Literal substring check
+                        if not matched:
+                            check_line = (
+                                line.lower() if case_insensitive else line
+                            )
+                            for sub in raw_substrings:
+                                if sub in check_line:
+                                    matched = True
+                                    break
+                        if matched:
+                            matches.append(
+                                f"{rel_p}:{lineno}:{line.rstrip()[:400]}"
+                            )
+                        if len(matches) >= 300:
                             break
             except Exception:
                 continue
-            if len(matches) > 300:
+            if len(matches) >= 300:
                 break
-        if len(matches) > 300:
+        if len(matches) >= 300:
             break
 
     return matches
@@ -981,7 +1265,6 @@ def score_match(
 
     # Priority Tier 1: Function, method, and class definitions
     # Surface definitions prominently at the top over call sites, comments, and docstrings.
-    # In rich_4076 (Run B32), def from_ansi was drowned out by dozens of call sites and comments.
     is_code = not c.startswith(("#", "//", "/*", "*", '"""', "'''"))
     if is_code:
         # Boost lines containing definition keywords or decorators
@@ -991,28 +1274,23 @@ def score_match(
             score += 30
 
         # Dedicated top tier for lines starting with function/class signatures
-        if re.search(r"^\s*(async\s+def|def|class)\s+", content):
+        sig_match = re.search(
+            r"^\s*(async\s+def|def|class)\s+([A-Za-z0-9_]+)", content
+        )
+        if sig_match:
             score += 60
+            sym_name = sig_match.group(2).lower()
             # Extra boost if the defined symbol name directly matches a search term
             for t in terms:
-                cleaned_t = t.strip()
-                if cleaned_t:
-                    # Exact symbol match (e.g. def from_ansi with query from_ansi)
-                    if re.search(
-                        rf"^\s*(async\s+def|def|class)\s+{re.escape(cleaned_t)}\b",
-                        content,
-                        re.IGNORECASE,
-                    ):
-                        score += 75
-                        break
-                    # Substring symbol match (e.g. def from_ansi with query ansi)
-                    elif re.search(
-                        rf"^\s*(async\s+def|def|class)\s+\w*{re.escape(cleaned_t)}\w*",
-                        content,
-                        re.IGNORECASE,
-                    ):
-                        score += 50
-                        break
+                cleaned_t = t.strip().lower()
+                if not cleaned_t:
+                    continue
+                if cleaned_t == sym_name:
+                    score += 75
+                    break
+                elif cleaned_t in sym_name:
+                    score += 50
+                    break
         elif re.search(r"^\s*@", content):
             score += 30
 
@@ -1060,10 +1338,17 @@ def score_match(
         ):
             score += 20
 
-    # Prefer terms matching whole words
+    # Prefer terms matching whole words or exact substrings
     for t in terms:
-        if re.search(rf"\b{re.escape(t)}\b", content, re.IGNORECASE):
-            score += 15
+        cleaned_t = t.strip()
+        if not cleaned_t:
+            continue
+        if re.match(r"^[A-Za-z0-9_]+$", cleaned_t):
+            if re.search(rf"\b{re.escape(cleaned_t)}\b", content, re.IGNORECASE):
+                score += 15
+        else:
+            if cleaned_t.lower() in content.lower():
+                score += 15
 
     return score
 
@@ -1119,17 +1404,18 @@ def print_help() -> None:
 fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents.
 
 Positional arguments:
-  pattern...       Search term(s) or regex pattern(s). Multiple terms are searched as OR/union.
-  path             Optional target directory or file (defaults to /workspace).
+  pattern...          Search term(s), phrase, or regex. Multiple terms are searched as OR/union.
+  path                Optional target directory or file (defaults to /workspace).
 
 Options:
   --help, -h          Show this help message and exit.
-  --query, -q <term>  Search term or phrase (multi-word queries are auto-tokenized).
+  --query, -q <term>  Search term or phrase (multi-word queries are preserved and sub-tokenized).
   --json              Output results as structured JSON conforming to Pydantic v2 FastGrepResult.
 
 Diagnostics:
-  - Zero matches: Deterministically explains file counts, runs case-insensitive search, and suggests top 5 fuzzy candidate symbols from AST.
+  - Zero matches: Deterministically explains file counts, runs case-insensitive check, tests sub-terms, and suggests candidate symbols from AST.
   - Regex errors: Catches re.error and provides plain-English syntax diagnostics with suggested escaped patterns.
+  - Missing path: Detects missing files/directories, suggests close matches, and falls back to workspace.
 """
     )
 
@@ -1144,12 +1430,24 @@ def main() -> int:
         raw_args = sys.argv[1:]
         if not raw_args:
             print(
-                "[fast-grep] No search term provided. Usage: run_skill_script('fast-grep', 'grep.py', args=['<term>'])"
+                "[fast-grep] ⚠️ No search term provided.\n"
+                "Usage: run_skill_script('fast-grep', 'grep.py', args=['<term>']) or python grep.py '<term>'\n"
+                "Examples:\n"
+                "  python grep.py from_ansi\n"
+                "  python grep.py 'def calculate_tax' src/\n"
+                "  python grep.py --query 'preserve newlines'"
             )
             return 0
 
         ws = get_workspace_dir()
-        terms, target, is_json, is_help = parse_args(raw_args, ws)
+        (
+            terms,
+            target,
+            is_json,
+            is_help,
+            invalid_target,
+            raw_phrase,
+        ) = parse_args(raw_args, ws)
 
         if is_help:
             print_help()
@@ -1163,8 +1461,28 @@ def main() -> int:
         ):
             ws = target
 
+        # Handle missing/invalid target path
+        path_warning_msg = None
+        if invalid_target:
+            similar_paths = find_similar_workspace_files(invalid_target, ws, max_results=3)
+            path_warning_msg = (
+                f"Target path '{invalid_target}' does not exist in workspace ({ws}). "
+                f"Falling back to searching entire workspace."
+            )
+            if not is_json:
+                print(f"[fast-grep] ⚠️ TARGET PATH NOT FOUND: '{invalid_target}' does not exist!")
+                if similar_paths:
+                    print("  Did you mean one of these files?")
+                    for sp in similar_paths:
+                        print(f"    - {sp}")
+                print(f"  [fast-grep] 🔄 Falling back to searching entire workspace (/workspace)...\n")
+
         if not terms:
-            print("[fast-grep] No valid search terms provided.")
+            print(
+                "[fast-grep] ⚠️ No valid search terms provided after parsing arguments.\n"
+                "Usage: python grep.py [options] <pattern...> [path]\n"
+                "Example: python grep.py 'def score_match' ."
+            )
             return 0
 
         # Workspace display name
@@ -1252,10 +1570,66 @@ def main() -> int:
                         )
                     )
 
-            # b) Extract candidate symbols from AST & repository identifiers
+            # b) Test tokenized sub-terms if compound query failed
+            subterm_summaries: List[SubtermMatchSummary] = []
+            candidate_subterms = []
+            if raw_phrase:
+                candidate_subterms = extract_subterms(raw_phrase)
+            for t in terms:
+                for sub in extract_subterms(t):
+                    if sub not in candidate_subterms:
+                        candidate_subterms.append(sub)
+
+            for sub in candidate_subterms[:6]:
+                sub_res = run_git_grep([sub], target, ws, case_insensitive=True)
+                if sub_res:
+                    first_p = sub_res[0].split(":", 2)
+                    sf = first_p[0]
+                    sl = int(first_p[1]) if len(first_p) > 1 and first_p[1].isdigit() else None
+                    subterm_summaries.append(
+                        SubtermMatchSummary(
+                            subterm=sub,
+                            match_count=len(sub_res),
+                            sample_file=sf,
+                            sample_lineno=sl,
+                        )
+                    )
+
+            # c) Extract candidate symbols from AST & repository identifiers
             symbols = extract_candidate_symbols(target, ws)
             fuzzy_suggestions = get_fuzzy_suggestions(
                 terms, symbols, top_n=5, cutoff=0.40
+            )
+
+            # d) Find similar repository files
+            similar_files = find_similar_workspace_files(
+                raw_phrase or " ".join(terms), ws, max_results=4
+            )
+
+            # Formulate concrete reformulation suggestions for LLM
+            suggestions_list: List[str] = []
+            if ci_matches:
+                sample_file = ci_matches[0].file
+                suggestions_list.append(
+                    f"Match case: Search with actual case found in {sample_file}"
+                )
+            if subterm_summaries:
+                top_sub = subterm_summaries[0]
+                suggestions_list.append(
+                    f"Narrow query: Search for individual token '{top_sub.subterm}' (found in {top_sub.sample_file}:{top_sub.sample_lineno})"
+                )
+            if fuzzy_suggestions:
+                sym = fuzzy_suggestions[0]
+                loc = f" in {sym.source_file}" if sym.source_file else ""
+                suggestions_list.append(
+                    f"Check related symbol: '{sym.symbol}' ({sym.kind}{loc})"
+                )
+            if similar_files:
+                suggestions_list.append(
+                    f"Inspect related file: read_file('{similar_files[0]}')"
+                )
+            suggestions_list.append(
+                "Broaden search: If searching for tests or docs, pass directory explicitly: fast-grep '<term>' tests/"
             )
 
             # Formulate structured explanation & result
@@ -1268,10 +1642,11 @@ def main() -> int:
                 case_insensitive_count=len(ci_matches),
                 details=(
                     f"Found {len(ci_matches)} case-insensitive matches. "
-                    f"Generated {len(fuzzy_suggestions)} fuzzy symbol suggestions."
-                )
-                if (ci_matches or fuzzy_suggestions)
-                else None,
+                    f"Generated {len(fuzzy_suggestions)} fuzzy symbol suggestions. "
+                    f"Tested {len(subterm_summaries)} subterm matches."
+                ),
+                skipped_extensions=sorted(list(SKIP_EXTENSIONS)),
+                skipped_dirs=sorted(list(SKIP_DIRS)),
             )
 
             result = FastGrepResult(
@@ -1283,6 +1658,10 @@ def main() -> int:
                 regex_diagnostics=regex_diagnostics,
                 case_insensitive_matches=ci_matches,
                 fuzzy_suggestions=fuzzy_suggestions,
+                subterm_matches=subterm_summaries,
+                similar_files=similar_files,
+                suggestions=suggestions_list,
+                path_warning=path_warning_msg,
                 ranked_matches=[],
                 top_ast_nodes=[],
             )
@@ -1293,6 +1672,12 @@ def main() -> int:
 
             # Deterministic zero matches explanation
             print(f"[fast-grep] {summary_msg}\n")
+            print(
+                f"ℹ️ SEARCH CONSTRAINTS & DIAGNOSTICS:\n"
+                f"  - Scanned: {total_files} files in {target_display}\n"
+                f"  - Skipped non-code extensions: {', '.join(sorted(list(SKIP_EXTENSIONS))[:12])} ...\n"
+                f"  - Skipped noise directories: {', '.join(sorted(list(SKIP_DIRS))[:10])} ...\n"
+            )
 
             # Case-insensitive report
             if ci_matches:
@@ -1302,15 +1687,51 @@ def main() -> int:
                 if len(ci_matches) > 5:
                     ci_list_preview += f", ... (+{len(ci_matches) - 5} more)"
                 print(
-                    f"Found {len(ci_matches)} matches when ignoring case: [{ci_list_preview}]"
+                    f"💡 CASE MISMATCH DETECTED ({len(ci_matches)} matches when ignoring case):"
                 )
-                for m in ci_matches[:10]:
+                for m in ci_matches[:8]:
                     print(f"  - {m.file}:{m.lineno}: {m.content.strip()[:80]}")
-                if len(ci_matches) > 10:
+                if len(ci_matches) > 8:
                     print(
-                        f"  ... ({len(ci_matches) - 10} additional case-insensitive matches truncated)"
+                        f"  ... ({len(ci_matches) - 8} additional case-insensitive matches truncated)"
                     )
                 print()
+
+            # Tokenized sub-terms report
+            if subterm_summaries:
+                print("💡 COMPOUND QUERY FAILED — TOKENIZED SUB-TERM MATCHES:")
+                print(
+                    f"  The full query '{pattern_display}' had 0 exact matches, but sub-terms exist:"
+                )
+                for st in subterm_summaries:
+                    loc = f" in {st.sample_file}:{st.sample_lineno}" if st.sample_file else ""
+                    print(
+                        f"  - '{st.subterm}': {st.match_count} match(es){loc}"
+                    )
+                print()
+
+            # Fuzzy symbol suggestions
+            if fuzzy_suggestions:
+                print("🔍 SIMILAR SYMBOLS IN WORKSPACE (from AST):")
+                for s in fuzzy_suggestions[:5]:
+                    loc = f" in {s.source_file}" if s.source_file else ""
+                    print(
+                        f"  - {s.symbol} ({s.kind}{loc}) [similarity: {s.similarity:.2f}]"
+                    )
+                print()
+
+            # Similar repository files
+            if similar_files:
+                print("📁 RELEVANT REPOSITORY FILES:")
+                for rf in similar_files:
+                    print(f"  - {rf}")
+                print()
+
+            # Actionable suggestions for the LLM
+            print("🚀 ACTIONABLE NEXT STEPS FOR LLM:")
+            for idx, sug in enumerate(suggestions_list, start=1):
+                print(f"  {idx}. {sug}")
+            print()
 
             return 0
 
@@ -1357,7 +1778,7 @@ def main() -> int:
 
         parsed.sort(key=lambda m: m.score, reverse=True)
 
-        # Extract top 3 unique function scopes
+        # Extract top 2 unique function scopes
         flashed: List[Tuple[GrepMatch, Dict[str, Any]]] = []
         seen = set()
         top_ast_nodes: List[ASTNodePreview] = []
@@ -1392,6 +1813,8 @@ def main() -> int:
             case_sensitive=True,
             case_insensitive_count=0,
             details=f"Top {len(flashed)} enclosing AST scopes flashed.",
+            skipped_extensions=sorted(list(SKIP_EXTENSIONS)),
+            skipped_dirs=sorted(list(SKIP_DIRS)),
         )
 
         result = FastGrepResult(
@@ -1403,6 +1826,10 @@ def main() -> int:
             regex_diagnostics=regex_diagnostics,
             case_insensitive_matches=[],
             fuzzy_suggestions=[],
+            subterm_matches=[],
+            similar_files=[],
+            suggestions=[],
+            path_warning=path_warning_msg,
             ranked_matches=parsed,
             top_ast_nodes=top_ast_nodes,
         )
@@ -1447,6 +1874,7 @@ def main() -> int:
             print("=" * 80)
 
             def format_line(lineno: int, text: str) -> str:
+                truncated_text = text[:300]
                 if lineno == target_lineno:
                     if is_def:
                         callout = "  <-- [DEFINITION TARGET]"
@@ -1456,8 +1884,8 @@ def main() -> int:
                         )
                     else:
                         callout = "  <-- [MATCH]"
-                    return f"{lineno:4d}: >>> {text}{callout}"
-                return f"{lineno:4d}:     {text}"
+                    return f"{lineno:4d}: >>> {truncated_text}{callout}"
+                return f"{lineno:4d}:     {truncated_text}"
 
             # Target-centered window: always keep target_lineno visible with surrounding context
             rel_idx = max(0, min(len(lines) - 1, target_lineno - s_line))
@@ -1478,7 +1906,7 @@ def main() -> int:
                 w_end = len(lines)
                 for i, l in enumerate(lines, start=s_line):
                     print(format_line(i, l))
-            
+
             # For the primary top match, output clean unadorned code block ready for edit_file
             if idx == 1:
                 clean_snippet = "\n".join(lines[w_start:w_end])

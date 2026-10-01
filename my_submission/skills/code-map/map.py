@@ -4,18 +4,26 @@
 Unified skill combining:
 1. Symbol call-graph and reference reachability tracer (--symbol <name>):
    - Traces definitions, imports, calls, attribute accesses, callers, and callees across repo.
+   - Detects class hierarchies: base classes and subclasses inheriting from the queried symbol.
    - Omnivorous: queries precomputed codebase graphs (NetworkX node-link JSON) when available,
      and falls back to / combines with live AST analysis.
    - Provides fuzzy matching suggestions and diagnostics when symbols are missing or private.
-2. Compact AST file skeleton generator (--file <path>):
+   - When a symbol is not found, displays available top-level symbols in the repo and copy-pasteable next steps.
+2. Compact AST file and directory skeleton generator (--file <path>):
    - Extracts classes, base classes, functions, arguments, return type annotations, docstrings,
-     and line ranges [start-end] for a target Python file.
+     and line ranges [start-end] for a target Python file or directory.
+   - For directories, extracts skeletons across modules up to max_lines budget.
    - Diagnoses syntax errors with exact line, column, snippet, and caret pointer.
    - Output-capped to prevent context flooding in 32K token windows.
-3. Positional fallback:
-   - If argument ends in .py, treated as --file.
+3. Forgiving positional fallback:
+   - If argument is an existing directory or ends in .py, treated as --file.
+   - If argument matches an existing file with .py appended, treated as --file.
+   - If argument contains path separators (/ or \\), treated as --file.
    - Otherwise, treated as --symbol.
-4. Strictly forbids empty args or whole-repository dumping (exits 1 with usage).
+4. Omnivorous workspace overview on empty args or '.' / '/workspace':
+   - Explains the workspace structure, discovered packages, and key modules.
+   - Provides tailored, copy-pasteable example invocations for the current repository.
+   - Never crashes or exits 1 on empty calls.
 
 100% Pydantic v2 schemas for all structured outputs.
 """
@@ -70,10 +78,14 @@ class ReferenceDetail(BaseModel):
 
     file_path: str = Field(description="Relative file path where the reference occurs")
     line_number: int = Field(description="1-based line number of the reference")
-    kind: str = Field(description="Reference kind: 'class', 'function', 'method', 'import', 'call', 'attribute', or 'text'")
+    kind: str = Field(
+        description="Reference kind: 'class', 'function', 'method', 'import', 'call', 'attribute', 'subclass', or 'text'"
+    )
     context: str = Field(default="", description="Source preview, import statement, or call context")
     caller: Optional[str] = Field(default=None, description="Enclosing caller function/method if applicable")
     callee: Optional[str] = Field(default=None, description="Target callee symbol if applicable")
+    bases: Optional[List[str]] = Field(default=None, description="Base classes if symbol is a class definition")
+    subclasses: Optional[List[str]] = Field(default=None, description="Subclasses inheriting from this symbol")
 
 
 class SymbolSuggestion(BaseModel):
@@ -116,16 +128,21 @@ class CodeGraphResult(BaseModel):
     definitions: List[ReferenceDetail] = Field(default_factory=list, description="Symbol definitions")
     imports: List[ReferenceDetail] = Field(default_factory=list, description="Symbol imports")
     calls: List[ReferenceDetail] = Field(default_factory=list, description="Direct call sites and attribute accesses")
+    subclasses: List[ReferenceDetail] = Field(default_factory=list, description="Classes inheriting from this symbol")
     text_occurrences: List[ReferenceDetail] = Field(default_factory=list, description="Textual matches across files")
     callers: List[str] = Field(default_factory=list, description="Inbound callers invoking this symbol")
     callees: List[str] = Field(default_factory=list, description="Outbound callees invoked by this symbol")
     caller_callee_summary: Optional[str] = Field(default=None, description="Summary of call graph reachability")
     suggestions: List[SymbolSuggestion] = Field(default_factory=list, description="Closest matching candidates")
     did_you_mean: List[str] = Field(default_factory=list, description="List of top suggested symbol names")
+    available_top_symbols: List[str] = Field(
+        default_factory=list, description="Available top-level public symbols in the repository"
+    )
+    next_steps: List[str] = Field(default_factory=list, description="Actionable next commands for the LLM")
 
 
 # ==============================================================================
-# Pydantic v2 Models: File Skeleton (--file)
+# Pydantic v2 Models: File Skeleton (--file) & Repository Overview
 # ==============================================================================
 
 
@@ -186,7 +203,7 @@ class FileSkeletonResult(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     mode: str = Field(default="file", description="Analysis mode: 'file'")
-    target: str = Field(..., description="Target file path requested by the agent")
+    target: str = Field(..., description="Target file or directory path requested by the agent")
     workspace_root: str = Field(..., description="Absolute workspace root path")
     success: bool = Field(default=True, description="Whether mapping completed successfully without path resolution failures")
     modules: List[ModuleSummary] = Field(default_factory=list, description="List of mapped module summaries")
@@ -196,10 +213,27 @@ class FileSkeletonResult(BaseModel):
     top_level_layout: List[RepoLayoutItem] = Field(default_factory=list, description="Top-level repository structure")
     is_truncated: bool = Field(default=False, description="True if output was truncated to honor max_lines cap")
     rendered_text: str = Field(default="", description="Human/LLM-readable text output")
+    next_steps: List[str] = Field(default_factory=list, description="Actionable next commands for the LLM")
+
+
+class WorkspaceOverviewResult(BaseModel):
+    """Complete structured output for workspace repository overview and usage guide."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str = Field(default="overview", description="Analysis mode: 'overview'")
+    workspace_root: str = Field(..., description="Absolute workspace root path")
+    success: bool = Field(default=True, description="Whether overview was generated successfully")
+    top_level_layout: List[RepoLayoutItem] = Field(default_factory=list, description="Top-level repository structure")
+    discovered_packages: List[str] = Field(default_factory=list, description="Discovered Python packages/subdirectories")
+    key_modules: List[str] = Field(default_factory=list, description="Key Python module files in workspace")
+    sample_symbols: List[str] = Field(default_factory=list, description="Sample discovered public classes and functions")
+    copy_pasteable_commands: List[str] = Field(default_factory=list, description="Copy-pasteable invocations tailored to this repo")
+    rendered_text: str = Field(default="", description="Human/LLM-readable text output")
 
 
 # ==============================================================================
-# Workspace & Target Resolution
+# Workspace & Target Resolution (Loop-Safe & Symlink-Safe)
 # ==============================================================================
 
 
@@ -227,6 +261,47 @@ def should_skip_path(p: pathlib.Path, ws: pathlib.Path) -> bool:
         if should_skip_dir(part) or ".adk_exec" in part or part.startswith(".adk_exec"):
             return True
     return False
+
+
+def safe_walk(
+    root_path: pathlib.Path,
+    ws_root: pathlib.Path,
+    max_depth: int = 15,
+) -> Any:
+    """Cycle-safe and symlink-safe generator over directory tree.
+
+    Prevents infinite loops from symlinks, directory junctions, and runaway depth.
+    """
+    visited_inodes: Set[Tuple[int, int]] = set()
+
+    for dirpath, dirnames, filenames in os.walk(str(root_path), followlinks=False):
+        curr_p = pathlib.Path(dirpath)
+        try:
+            stat_res = curr_p.stat()
+            inode_key = (stat_res.st_dev, stat_res.st_ino)
+            if inode_key in visited_inodes:
+                dirnames.clear()
+                continue
+            visited_inodes.add(inode_key)
+        except OSError:
+            dirnames.clear()
+            continue
+
+        try:
+            rel = curr_p.relative_to(ws_root)
+            if len(rel.parts) > max_depth:
+                dirnames.clear()
+                continue
+        except ValueError:
+            pass
+
+        # In-place directory filtering
+        dirnames[:] = [
+            d for d in dirnames
+            if not should_skip_dir(d)
+        ]
+
+        yield dirpath, dirnames, filenames
 
 
 def get_workspace_dir() -> pathlib.Path:
@@ -282,26 +357,38 @@ def get_workspace_dir() -> pathlib.Path:
 def resolve_target(target_arg: str, ws: pathlib.Path) -> Tuple[Optional[pathlib.Path], str]:
     """Resolve target path safely against workspace."""
     clean = target_arg.strip()
-    if not clean or clean == ".":
-        return ws, "."
+    if not clean or clean in (".", "/", "/workspace"):
+        return ws, clean or "."
 
-    p_abs = pathlib.Path(clean).resolve()
+    # Check direct relative to workspace
+    cand = ws / clean.lstrip("/")
+    if cand.exists():
+        return cand, clean
+
+    # Check absolute
     try:
+        p_abs = pathlib.Path(clean).resolve()
         if p_abs.exists() and (p_abs == ws or ws in p_abs.parents):
             return p_abs, clean
     except Exception:
         pass
 
-    # Relative to workspace
-    cand = ws / clean.lstrip("/")
-    if cand.exists():
-        return cand, clean
+    # Check with .py appended if not already present
+    if not clean.endswith(".py"):
+        cand_py = ws / f"{clean.lstrip('/')}.py"
+        if cand_py.is_file():
+            return cand_py, f"{clean}.py"
 
     # Check for glob match inside workspace
     try:
-        matches = [m for m in ws.glob(f"**/{clean}") if not should_skip_path(m, ws)]
+        pattern = f"**/{clean}" if clean.endswith(".py") else f"**/{clean}.py"
+        matches = [m for m in ws.glob(pattern) if not should_skip_path(m, ws)]
         if matches:
             return matches[0], clean
+        if not clean.endswith(".py"):
+            dir_matches = [m for m in ws.glob(f"**/{clean}") if m.is_dir() and not should_skip_path(m, ws)]
+            if dir_matches:
+                return dir_matches[0], clean
     except Exception:
         pass
 
@@ -314,7 +401,7 @@ def find_closest_paths(clean_target: str, ws: pathlib.Path) -> List[str]:
     all_files: List[str] = []
 
     try:
-        for root, dirs, files in os.walk(ws):
+        for root, dirs, files in safe_walk(ws, ws, max_depth=8):
             dirs[:] = sorted([d for d in dirs if not should_skip_dir(d)])
             rel_dir = os.path.relpath(root, ws)
             if rel_dir != ".":
@@ -375,7 +462,7 @@ def get_top_level_layout(ws: pathlib.Path) -> List[RepoLayoutItem]:
             py_count = 0
             subdirs = 0
             try:
-                for _, d_list, f_list in os.walk(entry):
+                for _, d_list, f_list in safe_walk(entry, ws, max_depth=5):
                     d_list[:] = [d for d in d_list if not should_skip_dir(d)]
                     subdirs += len(d_list)
                     for f in f_list:
@@ -395,6 +482,56 @@ def get_top_level_layout(ws: pathlib.Path) -> List[RepoLayoutItem]:
         else:
             items.append(RepoLayoutItem(name=entry.name, rel_path=rel, is_dir=False, summary=f"📄 {entry.name}"))
     return items
+
+
+def collect_py_files(target_path: pathlib.Path, ws: pathlib.Path, max_files: int = 150) -> List[pathlib.Path]:
+    """Collect Python files from target path in deterministic order."""
+    if target_path.is_file():
+        if target_path.name.endswith(".py") or target_path.suffix == ".py":
+            return [target_path]
+        return []
+
+    py_files: List[pathlib.Path] = []
+    for root, dirs, files in safe_walk(target_path, ws, max_depth=10):
+        dirs[:] = sorted([d for d in dirs if not should_skip_dir(d)])
+        for f in sorted(files):
+            if f.endswith(".py") and not f.startswith("."):
+                py_files.append(pathlib.Path(root) / f)
+                if len(py_files) >= max_files:
+                    return py_files
+    return py_files
+
+
+def get_top_repo_symbols(ws: pathlib.Path, max_symbols: int = 12) -> List[str]:
+    """Extract top-level public classes and functions across key workspace modules."""
+    symbols: List[str] = []
+    seen: Set[str] = set()
+
+    # Prioritize non-test core modules
+    py_files = collect_py_files(ws, ws, max_files=40)
+    core_files = [p for p in py_files if "test" not in p.name.lower() and "test" not in str(p).lower()]
+    target_files = core_files if core_files else py_files
+
+    for fpath in target_files[:20]:
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            tree = ast.parse(content, filename=str(fpath))
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                    if node.name not in seen:
+                        seen.add(node.name)
+                        symbols.append(f"class {node.name}")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not node.name.startswith("_"):
+                    if node.name not in seen:
+                        seen.add(node.name)
+                        symbols.append(f"def {node.name}()")
+                if len(symbols) >= max_symbols:
+                    return symbols
+        except Exception:
+            continue
+
+    return symbols
 
 
 # ==============================================================================
@@ -495,8 +632,7 @@ def discover_graph_file(
                     if prefix not in families:
                         families[prefix] = f
 
-                # Check if query_symbol exists in any family representative graph
-                for repo_name, rep_path in families.items():
+                for _, rep_path in families.items():
                     try:
                         with open(rep_path, "r", encoding="utf-8", errors="replace") as jf:
                             data = json.load(jf)
@@ -506,7 +642,6 @@ def discover_graph_file(
                     except Exception:
                         continue
 
-            # Fallback to first graph file
             if json_files:
                 return json_files[0]
 
@@ -650,12 +785,12 @@ def compute_fuzzy_suggestions(
 
 
 # ==============================================================================
-# AST Reference & Reachability Collector (--symbol mode)
+# AST Reference, Reachability & Hierarchy Collector (--symbol mode)
 # ==============================================================================
 
 
 class AstReferenceCollector(ast.NodeVisitor):
-    """Parses Python AST to extract definitions, imports, calls, callers, callees, and symbol catalog."""
+    """Parses Python AST to extract definitions, base classes, subclasses, imports, calls, callers, callees."""
 
     def __init__(self, rel_path: str, clean_symbol: str):
         self.rel_path = rel_path
@@ -665,6 +800,7 @@ class AstReferenceCollector(ast.NodeVisitor):
         self.defs: List[ReferenceDetail] = []
         self.imports: List[ReferenceDetail] = []
         self.calls: List[ReferenceDetail] = []
+        self.subclasses: List[ReferenceDetail] = []
         self.ast_callers: Set[str] = set()
         self.ast_callees: Set[str] = set()
         self.catalog_symbols: List[Tuple[str, Optional[str], str]] = []
@@ -672,15 +808,40 @@ class AstReferenceCollector(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef):
         loc = f"{self.rel_path}:{node.lineno}"
         self.catalog_symbols.append((node.name, "class", loc))
+
+        base_names: List[str] = []
+        for b in node.bases:
+            try:
+                base_names.append(ast.unparse(b))
+            except Exception:
+                if isinstance(b, ast.Name):
+                    base_names.append(b.id)
+
+        bases_str = f"({', '.join(base_names)})" if base_names else ""
+
         if node.name == self.clean_symbol:
             self.defs.append(
                 ReferenceDetail(
                     file_path=self.rel_path,
                     line_number=node.lineno,
                     kind="class",
-                    context=f"class {node.name}",
+                    context=f"class {node.name}{bases_str}:",
+                    bases=base_names if base_names else None,
                 )
             )
+
+        # Check if this class inherits from clean_symbol (class hierarchy)
+        if any(self.clean_symbol == b or b.endswith(f".{self.clean_symbol}") for b in base_names):
+            self.subclasses.append(
+                ReferenceDetail(
+                    file_path=self.rel_path,
+                    line_number=node.lineno,
+                    kind="subclass",
+                    context=f"class {node.name}{bases_str} inherits from {self.clean_symbol}",
+                    bases=base_names,
+                )
+            )
+
         self.scope_stack.append(node.name)
         self.generic_visit(node)
         self.scope_stack.pop()
@@ -699,12 +860,19 @@ class AstReferenceCollector(ast.NodeVisitor):
         self.catalog_symbols.append((full_scope, kind, loc))
 
         if node.name == self.clean_symbol or full_scope == self.clean_symbol:
+            ret_str = ""
+            if getattr(node, "returns", None):
+                try:
+                    ret_str = f" -> {ast.unparse(node.returns)}"
+                except Exception:
+                    pass
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
             self.defs.append(
                 ReferenceDetail(
                     file_path=self.rel_path,
                     line_number=node.lineno,
                     kind=kind,
-                    context=f"def {node.name}(...)",
+                    context=f"{prefix} {node.name}(...){ret_str}",
                 )
             )
 
@@ -814,7 +982,7 @@ def analyze_symbol(
     ws_root: pathlib.Path,
     explicit_graph_path: Optional[str] = None,
 ) -> CodeGraphResult:
-    """Analyze symbol references, graph reachability, and definitions."""
+    """Analyze symbol references, graph reachability, definitions, and class hierarchy."""
     clean_symbol = symbol_name.strip()
     is_valid_ident = clean_symbol.isidentifier()
 
@@ -858,21 +1026,14 @@ def analyze_symbol(
             ),
         )
 
-    # 2. Collect files to scan
-    if target_path.is_file():
-        file_list = [target_path] if target_path.suffix == ".py" and not should_skip_path(target_path, ws_root) else []
-    else:
-        file_list = []
-        for dirpath, dirnames, filenames in os.walk(target_path):
-            dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
-            for fname in sorted(filenames):
-                if fname.endswith(".py") and not fname.startswith("."):
-                    file_list.append(pathlib.Path(dirpath) / fname)
+    # 2. Collect files to scan (capped at 400 files to guarantee zero hangs)
+    file_list = collect_py_files(target_path, ws_root, max_files=400)
 
     # 3. Perform live AST scanning & text search
     defs: List[ReferenceDetail] = []
     imports: List[ReferenceDetail] = []
     calls: List[ReferenceDetail] = []
+    subclasses: List[ReferenceDetail] = []
     text_matches: List[ReferenceDetail] = []
     ast_callers: Set[str] = set()
     ast_callees: Set[str] = set()
@@ -881,6 +1042,7 @@ def analyze_symbol(
     seen_defs: Set[Tuple[str, int]] = set()
     seen_imports: Set[Tuple[str, int]] = set()
     seen_calls: Set[Tuple[str, int, str]] = set()
+    seen_subclasses: Set[Tuple[str, int]] = set()
     seen_text: Set[Tuple[str, int]] = set()
 
     for full_path in file_list:
@@ -919,6 +1081,12 @@ def analyze_symbol(
                         seen_calls.add(key)
                         calls.append(c)
 
+                for sub in collector.subclasses:
+                    key = (sub.file_path, sub.line_number)
+                    if key not in seen_subclasses:
+                        seen_subclasses.add(key)
+                        subclasses.append(sub)
+
                 ast_callers.update(collector.ast_callers)
                 ast_callees.update(collector.ast_callees)
                 ast_symbol_catalog.extend(collector.catalog_symbols)
@@ -942,8 +1110,10 @@ def analyze_symbol(
                                 context=clean_line,
                             )
                         )
-                    if len(text_matches) >= 50:
+                    if len(text_matches) >= 30:
                         break
+            if len(text_matches) >= 30:
+                pass
 
     # 4. Resolve node in graph if loaded
     resolved_symbol: Optional[str] = None
@@ -966,8 +1136,7 @@ def analyze_symbol(
                 if nid.startswith(class_prefix):
                     graph_callees.extend(callees_list)
 
-            # If AST definitions were not found (e.g. running outside repo container),
-            # synthesize definitions directly from graph node content!
+            # If AST definitions were not found, synthesize from graph node content
             if not defs:
                 node = graph_indexes.get("node_map", {}).get(resolved_symbol, {})
                 node_text = node.get("text", "") or ""
@@ -985,7 +1154,6 @@ def analyze_symbol(
                     )
                 )
 
-                # Also surface child methods from graph if any
                 for child_nid, child_node in graph_indexes.get("node_map", {}).items():
                     if child_nid.startswith(class_prefix) and "." not in child_nid[len(class_prefix):]:
                         child_name = child_nid[len(class_prefix):]
@@ -1013,14 +1181,16 @@ def analyze_symbol(
         if c not in all_callees:
             all_callees.append(c)
 
-    found = bool(resolved_symbol or defs or imports or calls)
+    found = bool(resolved_symbol or defs or imports or calls or subclasses)
     if not found and not is_valid_ident and text_matches:
         found = True
 
-    # 6. Explanations & Suggestions
+    # 6. Explanations, Suggestions, and Top-Level Symbols
     inspection_hint: Optional[str] = None
     suggestions: List[SymbolSuggestion] = []
     did_you_mean: List[str] = []
+    top_repo_symbols: List[str] = []
+    next_steps: List[str] = []
 
     if clean_symbol.startswith("_"):
         inspection_hint = (
@@ -1058,6 +1228,10 @@ def analyze_symbol(
             f"Symbol '{active_name}' has {len(all_callers)} inbound caller(s) "
             f"and {len(all_callees)} outbound callee(s)."
         )
+        if defs:
+            first_def = defs[0]
+            next_steps.append(f"Inspect defining module: python3 map.py --file {first_def.file_path}")
+        next_steps.append(f"Search direct calls across repo: grep.py '{clean_symbol}'")
     else:
         if graph_loaded:
             explanation = (
@@ -1081,9 +1255,17 @@ def analyze_symbol(
         for sym, kind, loc in ast_symbol_catalog:
             candidates.append((sym, kind, loc))
 
-        suggestions = compute_fuzzy_suggestions(clean_symbol, candidates, top_n=5, cutoff=0.35)
+        suggestions = compute_fuzzy_suggestions(clean_symbol, candidates, top_n=6, cutoff=0.32)
         did_you_mean = [s.symbol for s in suggestions]
         caller_callee_summary = f"Symbol '{clean_symbol}' was not found in the codebase graph."
+
+        # Collect available top-level public symbols from the workspace to guide the LLM
+        top_repo_symbols = get_top_repo_symbols(ws_root, max_symbols=12)
+
+        if did_you_mean:
+            next_steps.append(f"Try closest suggested symbol: python3 map.py --symbol {did_you_mean[0]}")
+        next_steps.append(f"Search codebase text with fast-grep: grep.py '{clean_symbol}'")
+        next_steps.append("View repository structure and modules: python3 map.py")
 
     return CodeGraphResult(
         mode="symbol",
@@ -1096,12 +1278,15 @@ def analyze_symbol(
         definitions=defs,
         imports=imports,
         calls=calls,
+        subclasses=subclasses,
         text_occurrences=text_matches,
         callers=all_callers,
         callees=all_callees,
         caller_callee_summary=caller_callee_summary,
         suggestions=suggestions,
         did_you_mean=did_you_mean,
+        available_top_symbols=top_repo_symbols,
+        next_steps=next_steps,
     )
 
 
@@ -1135,10 +1320,17 @@ def format_symbol_report(result: CodeGraphResult) -> str:
         lines.append(f"DEFINITIONS ({len(result.definitions)}):")
         if result.definitions:
             for d in result.definitions[:20]:
-                lines.append(f"  - {d.file_path}:{d.line_number} ({d.kind}): {d.context}")
+                bases_info = f" [bases: {', '.join(d.bases)}]" if d.bases else ""
+                lines.append(f"  - {d.file_path}:{d.line_number} ({d.kind}): {d.context}{bases_info}")
         else:
             lines.append("  (none found in AST)")
         lines.append("")
+
+        if result.subclasses:
+            lines.append(f"CLASS HIERARCHY / SUBCLASSES ({len(result.subclasses)}):")
+            for sub in result.subclasses[:15]:
+                lines.append(f"  - {sub.file_path}:{sub.line_number}: {sub.context}")
+            lines.append("")
 
         lines.append(f"IMPORTS ({len(result.imports)}):")
         if result.imports:
@@ -1192,10 +1384,22 @@ def format_symbol_report(result: CodeGraphResult) -> str:
             lines.append("  No close fuzzy matches found in codebase graph or repository AST.")
         lines.append("")
 
+        if result.available_top_symbols:
+            lines.append("TOP-LEVEL PUBLIC SYMBOLS IN REPOSITORY:")
+            for sym in result.available_top_symbols:
+                lines.append(f"  • {sym}")
+            lines.append("")
+
     if result.inspection_hint:
         lines.append("INSPECTION HINT:")
         for hint_line in result.inspection_hint.splitlines():
             lines.append(f"  {hint_line}")
+        lines.append("")
+
+    if result.next_steps:
+        lines.append("ACTIONABLE NEXT STEPS:")
+        for step in result.next_steps:
+            lines.append(f"  👉 {step}")
         lines.append("")
 
     lines.append("=" * 80)
@@ -1264,42 +1468,50 @@ def format_docstring(node: ast.AST, indent: str = "    ") -> Optional[str]:
 def get_symbols(
     body: List[ast.stmt],
     is_class: bool = False,
+    current_depth: int = 0,
+    max_depth: int = 8,
 ) -> List[Tuple[str, str, str, int, int, Optional[str]]]:
-    """Extract symbol items from AST statements.
+    """Extract symbol items from AST statements with recursion bounds.
 
     Returns list of tuples: (kind, name, signature, start_line, end_line, docstring).
     """
+    if current_depth >= max_depth:
+        return []
+
     items: List[Tuple[str, str, str, int, int, Optional[str]]] = []
     for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-            args_str = format_args(node.args)
-            ret_str = format_return(getattr(node, "returns", None))
-            start = getattr(node, "lineno", 1)
-            end = getattr(node, "end_lineno", start)
-            indent = "    " if is_class else "  "
-            sig = f"{indent}{prefix} {node.name}({args_str}){ret_str} [{start}-{end}]"
-            doc = format_docstring(node, indent=indent + "  ")
-            items.append((prefix, node.name, sig, start, end, doc))
-        elif isinstance(node, ast.ClassDef):
-            bases_str = ""
-            if node.bases:
-                base_names: List[str] = []
-                for b in node.bases:
-                    try:
-                        base_names.append(ast.unparse(b))
-                    except Exception:
-                        if isinstance(b, ast.Name):
-                            base_names.append(b.id)
-                if base_names:
-                    bases_str = f"({', '.join(base_names)})"
-            start = getattr(node, "lineno", 1)
-            end = getattr(node, "end_lineno", start)
-            sig = f"  class {node.name}{bases_str} [{start}-{end}]"
-            doc = format_docstring(node, indent="    ")
-            items.append(("class", node.name, sig, start, end, doc))
-            methods = get_symbols(node.body, is_class=True)
-            items.extend(methods)
+        try:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                args_str = format_args(node.args)
+                ret_str = format_return(getattr(node, "returns", None))
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                indent = "    " if is_class else "  "
+                sig = f"{indent}{prefix} {node.name}({args_str}){ret_str} [{start}-{end}]"
+                doc = format_docstring(node, indent=indent + "  ")
+                items.append((prefix, node.name, sig, start, end, doc))
+            elif isinstance(node, ast.ClassDef):
+                bases_str = ""
+                if node.bases:
+                    base_names: List[str] = []
+                    for b in node.bases:
+                        try:
+                            base_names.append(ast.unparse(b))
+                        except Exception:
+                            if isinstance(b, ast.Name):
+                                base_names.append(b.id)
+                    if base_names:
+                        bases_str = f"({', '.join(base_names)})"
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                sig = f"  class {node.name}{bases_str} [{start}-{end}]"
+                doc = format_docstring(node, indent="    ")
+                items.append(("class", node.name, sig, start, end, doc))
+                methods = get_symbols(node.body, is_class=True, current_depth=current_depth + 1, max_depth=max_depth)
+                items.extend(methods)
+        except (RecursionError, MemoryError):
+            continue
     return items
 
 
@@ -1399,11 +1611,11 @@ def parse_and_map_file(
 
 
 def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeletonResult:
-    """Generate compact AST skeleton for a single target file."""
+    """Generate compact AST skeleton for a target file or directory up to max_lines budget."""
     ws = get_workspace_dir()
     target_path, clean_target = resolve_target(target_str, ws)
 
-    # 1. Target does not exist
+    # 1. Target does not exist: Provide actionable diagnostics & suggestions
     if target_path is None or not target_path.exists():
         diag_msg = f"Path '{target_str}' does not exist in /workspace."
         suggestions = find_closest_paths(clean_target, ws)
@@ -1437,6 +1649,19 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             for item in layout_items:
                 lines.append(f"  {item.summary}")
             lines.append("")
+
+        next_steps: List[str] = []
+        if suggestions:
+            best = suggestions[0].replace("📁 ", "").replace("📄 ", "").rstrip("/")
+            next_steps.append(f"Inspect closest match: python3 map.py --file {best}")
+        next_steps.append("View repository overview and packages: python3 map.py")
+
+        if next_steps:
+            lines.append("👉 Actionable next steps:")
+            for step in next_steps:
+                lines.append(f"  • {step}")
+            lines.append("")
+
         rendered = "\n".join(lines)
         return FileSkeletonResult(
             mode="file",
@@ -1450,33 +1675,51 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             top_level_layout=layout_items,
             is_truncated=False,
             rendered_text=rendered,
+            next_steps=next_steps,
         )
 
-    # 2. Target exists but is a directory or non-python file
-    if target_path.is_dir():
-        diag_msg = (
-            f"Target '{target_str}' is a directory, not a single Python file. "
-            "code-map requires a specific file target (--file <path.py>) to prevent full-repository token flooding."
-        )
-        suggestions = find_closest_paths(clean_target, ws)
-        layout_items = get_top_level_layout(ws)
+    # 2. Target exists: Collect .py files (single file or directory)
+    py_files = collect_py_files(target_path, ws, max_files=100)
+
+    # Directory has no .py files: Forgivingly list directory contents and point to python code
+    if not py_files:
+        items_in_dir: List[str] = []
+        try:
+            if target_path.is_dir():
+                for item in sorted(target_path.iterdir()):
+                    if not item.name.startswith("."):
+                        icon = "📁" if item.is_dir() else "📄"
+                        items_in_dir.append(f"{icon} {item.name}")
+        except Exception:
+            pass
+
+        diag_msg = f"No Python source files (.py) found in target '{target_str}'."
         diag = MapDiagnostic(
-            level="error",
-            category="directory_target",
+            level="warning",
+            category="empty_target",
             message=diag_msg,
             target_path=target_str,
-            suggestions=suggestions,
-            guidance="Specify a single target Python file path ending in .py.",
+            suggestions=items_in_dir[:6],
+            guidance="Specify a directory or file that contains Python source code.",
         )
         lines = [
             f"[code-map] {diag_msg}",
             "",
-            "💡 Specify an exact Python file to inspect its structure:",
         ]
-        if suggestions:
-            for s in suggestions[:6]:
-                lines.append(f"  • {s}")
-        lines.append("")
+        if items_in_dir:
+            lines.append("Contents of target directory:")
+            for itm in items_in_dir[:10]:
+                lines.append(f"  {itm}")
+            lines.append("")
+
+        layout_items = get_top_level_layout(ws)
+        if layout_items:
+            lines.append("📂 Directories with Python code (/workspace):")
+            for item in layout_items:
+                if item.is_dir and ".py" in item.summary:
+                    lines.append(f"  {item.summary}")
+            lines.append("")
+
         rendered = "\n".join(lines)
         return FileSkeletonResult(
             mode="file",
@@ -1490,69 +1733,269 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             top_level_layout=layout_items,
             is_truncated=False,
             rendered_text=rendered,
+            next_steps=["Run 'python3 map.py' to see packages with Python code"],
         )
 
-    # 3. Parse target Python file
-    mod_summary, diag = parse_and_map_file(target_path, ws)
-    all_diagnostics = [diag] if diag else []
+    # 3. Target is a single file with syntax error: Special detailed diagnostic
+    if len(py_files) == 1:
+        mod_summary, diag = parse_and_map_file(py_files[0], ws)
+        if diag and diag.category == "syntax_error":
+            single_file_lines = [
+                f"[code-map: SyntaxError in {mod_summary.path}]",
+                f"  Location: Line {diag.line}, Column {diag.column}",
+                f"  Error: {diag.message}",
+                "",
+                "  Code Snippet:",
+            ]
+            if diag.snippet:
+                single_file_lines.extend(diag.snippet.splitlines())
+            if diag.guidance:
+                single_file_lines.append("")
+                single_file_lines.append(f"  Guidance: {diag.guidance}")
 
-    if diag and diag.category == "syntax_error":
-        single_file_lines = [
-            f"[code-map: SyntaxError in {mod_summary.path}]",
-            f"  Location: Line {diag.line}, Column {diag.column}",
-            f"  Error: {diag.message}",
-            "",
-            "  Code Snippet:",
-        ]
-        if diag.snippet:
-            single_file_lines.extend(diag.snippet.splitlines())
-        if diag.guidance:
-            single_file_lines.append("")
-            single_file_lines.append(f"  Guidance: {diag.guidance}")
+            rendered = "\n".join(single_file_lines)
+            return FileSkeletonResult(
+                mode="file",
+                target=target_str,
+                workspace_root=str(ws),
+                success=True,
+                modules=[mod_summary],
+                total_files=1,
+                total_symbols=0,
+                diagnostics=[diag],
+                top_level_layout=[],
+                is_truncated=False,
+                rendered_text=rendered,
+                next_steps=[f"Fix syntax error at line {diag.line} using edit_file"],
+            )
 
-        rendered = "\n".join(single_file_lines)
-        return FileSkeletonResult(
-            mode="file",
-            target=target_str,
-            workspace_root=str(ws),
-            success=True,
-            modules=[mod_summary],
-            total_files=1,
-            total_symbols=0,
-            diagnostics=all_diagnostics,
-            top_level_layout=[],
-            is_truncated=False,
-            rendered_text=rendered,
-        )
-
-    file_lines: List[str] = [f"{mod_summary.path}:"]
-    for sym in mod_summary.symbols:
-        file_lines.append(sym.signature)
-        if sym.docstring:
-            file_lines.append(sym.docstring)
-
+    # 4. Multi-file or single file AST outline generation with strict max_lines budget
+    output_lines: List[str] = []
+    modules: List[ModuleSummary] = []
+    all_diagnostics: List[MapDiagnostic] = []
+    total_symbols = 0
+    total_files_parsed = 0
     is_truncated = False
-    if len(file_lines) > max_lines:
-        file_lines = file_lines[:max_lines]
-        file_lines.append(f"... [Truncated at {max_lines} lines]")
-        is_truncated = True
 
-    file_lines.append(f"[code-map: {mod_summary.symbol_count} symbols in 1 file]")
-    rendered = "\n".join(file_lines)
+    for py_file in py_files:
+        mod_summary, diag = parse_and_map_file(py_file, ws)
+        modules.append(mod_summary)
+        if diag:
+            all_diagnostics.append(diag)
+
+        file_lines: List[str] = [f"{mod_summary.path}:"]
+        if mod_summary.syntax_error:
+            err = mod_summary.syntax_error
+            file_lines.append(f"  ⚠️  [SyntaxError at line {err.line}, col {err.column}: {err.message}]")
+            if err.snippet:
+                file_lines.extend(err.snippet.splitlines())
+        else:
+            if not mod_summary.symbols:
+                continue
+            for sym in mod_summary.symbols:
+                file_lines.append(sym.signature)
+                if sym.docstring:
+                    file_lines.append(sym.docstring)
+
+        if len(output_lines) + len(file_lines) > max_lines:
+            remaining = len(py_files) - total_files_parsed
+            output_lines.append(f"... [Truncated at {max_lines} lines; {remaining} more file(s)]")
+            is_truncated = True
+            break
+
+        output_lines.extend(file_lines)
+        total_symbols += mod_summary.symbol_count
+        total_files_parsed += 1
+
+    syntax_err_count = sum(1 for m in modules if m.syntax_error)
+    summary_parts = [f"[code-map: {total_symbols} symbols across {total_files_parsed} file(s)"]
+    if syntax_err_count > 0:
+        summary_parts.append(f" ({syntax_err_count} file(s) had syntax errors)")
+    summary_parts.append("]")
+    output_lines.append("".join(summary_parts))
+
+    rendered = "\n".join(output_lines)
+
+    next_steps: List[str] = []
+    if modules and modules[0].symbols:
+        first_sym = modules[0].symbols[0].name
+        next_steps.append(f"Trace symbol call-graph: python3 map.py --symbol {first_sym}")
+    if len(py_files) > 1 and is_truncated:
+        first_mod = modules[0].path
+        next_steps.append(f"Inspect single module outline: python3 map.py --file {first_mod}")
 
     return FileSkeletonResult(
         mode="file",
         target=target_str,
         workspace_root=str(ws),
         success=True,
-        modules=[mod_summary],
-        total_files=1,
-        total_symbols=mod_summary.symbol_count,
+        modules=modules,
+        total_files=total_files_parsed,
+        total_symbols=total_symbols,
         diagnostics=all_diagnostics,
         top_level_layout=[],
         is_truncated=is_truncated,
         rendered_text=rendered,
+        next_steps=next_steps,
     )
+
+
+# ==============================================================================
+# Workspace Repository Overview & Usage Guide (Empty Calls & '.' / '/workspace')
+# ==============================================================================
+
+
+def generate_workspace_overview(ws: pathlib.Path) -> WorkspaceOverviewResult:
+    """Generate forgiving repository overview and copy-pasteable usage guide tailored to current workspace."""
+    layout_items = get_top_level_layout(ws)
+
+    # Discovered packages: top-level dirs with .py files
+    discovered_packages: List[str] = []
+    for item in layout_items:
+        if item.is_dir and ".py" in item.summary:
+            discovered_packages.append(item.name)
+
+    # Discovered sample files
+    sample_files = collect_py_files(ws, ws, max_files=15)
+    core_files = [p for p in sample_files if "test" not in p.name.lower() and "test" not in str(p).lower()]
+    chosen_files = core_files if core_files else sample_files
+    key_modules: List[str] = []
+    for p in chosen_files[:3]:
+        try:
+            rel = str(p.relative_to(ws))
+            key_modules.append(rel)
+        except Exception:
+            pass
+
+    # Sample symbols
+    sample_symbols = get_top_repo_symbols(ws, max_symbols=6)
+    clean_sample_symbols = [
+        s.replace("class ", "").replace("def ", "").replace("()", "")
+        for s in sample_symbols
+    ]
+
+    # Generate tailored copy-pasteable commands
+    example_mod = key_modules[0] if key_modules else "example.py"
+    example_pkg = discovered_packages[0] if discovered_packages else "."
+    example_sym = clean_sample_symbols[0] if clean_sample_symbols else "main"
+
+    commands = [
+        f"python3 map.py --file {example_mod}           # Compact AST outline of a key module",
+        f"python3 map.py --file {example_pkg}                 # Map package directory structure",
+        f"python3 map.py --symbol {example_sym}             # Trace call-graph, callers, callees, definitions",
+        f"python3 map.py {example_mod}                  # Positional shorthand (auto-detects file)",
+        f"python3 map.py {example_sym}                  # Positional shorthand (auto-detects symbol)",
+    ]
+
+    lines: List[str] = [
+        "=" * 80,
+        "CODE-MAP: WORKSPACE OVERVIEW & ACTIONABLE USAGE GUIDE",
+        "=" * 80,
+        f"Workspace Root: {ws}",
+        "",
+        "📂 TOP-LEVEL REPOSITORY LAYOUT:",
+    ]
+    if layout_items:
+        for item in layout_items:
+            lines.append(f"  {item.summary}")
+    else:
+        lines.append("  (empty or inaccessible workspace)")
+    lines.append("")
+
+    if discovered_packages:
+        lines.append(f"📦 DISCOVERED PACKAGES: {', '.join(discovered_packages)}")
+        lines.append("")
+
+    if key_modules:
+        lines.append("📄 KEY MODULES:")
+        for m in key_modules:
+            lines.append(f"  • {m}")
+        lines.append("")
+
+    if clean_sample_symbols:
+        lines.append("🔍 SAMPLE PUBLIC SYMBOLS:")
+        for sym in clean_sample_symbols:
+            lines.append(f"  • {sym}")
+        lines.append("")
+
+    lines.append("💡 TAILORED COPY-PASTEABLE COMMANDS:")
+    for cmd in commands:
+        lines.append(f"  {cmd}")
+    lines.append("")
+    lines.append("=" * 80)
+
+    rendered = "\n".join(lines)
+
+    return WorkspaceOverviewResult(
+        mode="overview",
+        workspace_root=str(ws),
+        success=True,
+        top_level_layout=layout_items,
+        discovered_packages=discovered_packages,
+        key_modules=key_modules,
+        sample_symbols=clean_sample_symbols,
+        copy_pasteable_commands=commands,
+        rendered_text=rendered,
+    )
+
+
+# ==============================================================================
+# Forgiving CLI Argument Auto-Detection
+# ==============================================================================
+
+
+def determine_mode_and_target(
+    symbol_arg: Optional[str],
+    file_arg: Optional[str],
+    target_arg: Optional[str],
+    ws: pathlib.Path,
+) -> Tuple[str, str]:
+    """Deterministically and forgivingly resolve analysis mode ('overview', 'file', 'symbol') and target."""
+    raw_symbol = (symbol_arg or "").strip()
+    raw_file = (file_arg or "").strip()
+    raw_target = (target_arg or "").strip()
+
+    # Explicit --symbol
+    if raw_symbol:
+        return "symbol", raw_symbol
+
+    # Explicit --file
+    if raw_file:
+        if raw_file in (".", "/", "/workspace"):
+            return "overview", "."
+        return "file", raw_file
+
+    # Positional target argument
+    if raw_target:
+        if raw_target in (".", "/", "/workspace"):
+            return "overview", "."
+
+        # Clearly a file extension
+        if raw_target.endswith(".py") or raw_target.endswith(".pyi"):
+            return "file", raw_target
+
+        # Contains directory separators: clearly intended as a path
+        if "/" in raw_target or "\\" in raw_target:
+            return "file", raw_target
+
+        # Check if matches an existing file or directory directly in workspace
+        cand_file = ws / raw_target
+        if cand_file.is_file():
+            return "file", raw_target
+
+        cand_dir = ws / raw_target
+        if cand_dir.is_dir():
+            return "file", raw_target
+
+        cand_py = ws / f"{raw_target}.py"
+        if cand_py.is_file():
+            return "file", f"{raw_target}.py"
+
+        # Otherwise treated as a symbol
+        return "symbol", raw_target
+
+    # No arguments passed at all -> overview mode
+    return "overview", "."
 
 
 # ==============================================================================
@@ -1567,16 +2010,19 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Modes:
-  --symbol <name>   Trace callers, callees, and definitions across repository (AST + graph).
-  --file <path.py>  Generate compact AST skeleton for a single Python file.
-  <target>          Positional fallback: ends in .py -> --file, otherwise -> --symbol.
+  --symbol <name>   Trace callers, callees, definitions, and class hierarchy across repository.
+  --file <path>     Generate compact AST skeleton for a Python file or directory.
+  <target>          Positional fallback (auto-detects file/dir vs symbol).
+  (empty)           Displays workspace overview, discovered packages, and tailored commands.
 
 Examples:
-  python3 map.py --symbol APIRouter
-  python3 map.py --file fastapi/routing.py
-  python3 map.py APIRouter
-  python3 map.py fastapi/routing.py
-  python3 map.py --symbol APIRouter --json
+  python3 map.py                                # Repository overview & tailored usage guide
+  python3 map.py --symbol APIRouter             # Trace symbol callers/callees/definitions
+  python3 map.py --file fastapi/routing.py      # Compact AST outline of a single file
+  python3 map.py --file fastapi                 # Map directory modules up to max_lines budget
+  python3 map.py APIRouter                      # Auto-detected symbol mode
+  python3 map.py fastapi/routing.py             # Auto-detected file mode
+  python3 map.py --symbol APIRouter --json      # Output structured JSON schema
 """,
     )
     parser.add_argument(
@@ -1589,13 +2035,13 @@ Examples:
         "--file",
         dest="file",
         default=None,
-        help="Target Python file path to generate compact AST skeleton (classes, methods, line ranges).",
+        help="Target Python file or directory path to generate compact AST skeleton.",
     )
     parser.add_argument(
         "target",
         nargs="?",
         default=None,
-        help="Positional fallback: if ends in .py, treated as --file; otherwise treated as --symbol.",
+        help="Positional argument: auto-detects file/directory vs symbol.",
     )
     parser.add_argument(
         "--json",
@@ -1615,49 +2061,25 @@ Examples:
     )
 
     args = parser.parse_args()
-
-    raw_symbol = (args.symbol or "").strip()
-    raw_file = (args.file or "").strip()
-    raw_target = (args.target or "").strip()
-
-    # CRITICAL: Empty args or whole repo dump forbidden
-    if not raw_symbol and not raw_file and not raw_target:
-        sys.stderr.write(
-            "Error: Missing required target argument.\n"
-            "Usage:\n"
-            "  python3 map.py --symbol <name>   # Trace callers, callees, definitions\n"
-            "  python3 map.py --file <path.py>  # Compact AST skeleton for a single file\n"
-            "  python3 map.py <symbol_or_file>  # Positional: .py -> --file, other -> --symbol\n\n"
-            "Full repository dumping without a target is strictly forbidden to protect context budget.\n"
-        )
-        return 1
-
-    if (raw_target in (".", "/", "/workspace") and not raw_symbol and not raw_file) or (
-        raw_file in (".", "/", "/workspace")
-    ):
-        sys.stderr.write(
-            "Error: Whole repository dumping is strictly disabled to protect context budget.\n"
-            "Please specify a specific target file with --file <path.py> or a symbol with --symbol <name>.\n"
-        )
-        return 1
-
-    # Resolve mode and target
-    if raw_symbol:
-        mode = "symbol"
-        target_name = raw_symbol
-    elif raw_file:
-        mode = "file"
-        target_name = raw_file
-    else:
-        if raw_target.endswith(".py"):
-            mode = "file"
-            target_name = raw_target
-        else:
-            mode = "symbol"
-            target_name = raw_target
-
     ws_root = get_workspace_dir()
 
+    mode, target_name = determine_mode_and_target(
+        symbol_arg=args.symbol,
+        file_arg=args.file,
+        target_arg=args.target,
+        ws=ws_root,
+    )
+
+    # 1. Overview Mode (empty args, '.', '/workspace')
+    if mode == "overview":
+        res_overview = generate_workspace_overview(ws_root)
+        if args.json:
+            print(res_overview.model_dump_json(indent=2))
+        else:
+            print(res_overview.rendered_text)
+        return 0
+
+    # 2. File / Directory Skeleton Mode
     if mode == "file":
         res_file = generate_file_skeleton(target_name, max_lines=args.max_lines)
         if args.json:
@@ -1666,7 +2088,7 @@ Examples:
             print(res_file.rendered_text)
         return 0
 
-    # mode == "symbol"
+    # 3. Symbol Mode
     target_path, _ = resolve_target(".", ws_root)
     res_symbol = analyze_symbol(
         symbol_name=target_name,
