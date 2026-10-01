@@ -22,6 +22,10 @@ import subprocess
 import sys
 import tempfile
 
+# Prevent Python from writing bytecode cache files (.pyc) that ADK compiler strictly forbids
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 GREP_PATH = REPO_ROOT / "my_submission" / "skills" / "fast-grep" / "grep.py"
 SCRIPTS_GREP_PATH = (
@@ -39,8 +43,9 @@ def run_grep(
     timeout: int = 15,
 ) -> subprocess.CompletedProcess:
     """Run grep.py with given arguments and return CompletedProcess."""
-    cmd = [sys.executable, str(GREP_PATH)] + list(args)
+    cmd = [sys.executable, "-B", str(GREP_PATH)] + list(args)
     environ = os.environ.copy()
+    environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if env:
         environ.update(env)
     return subprocess.run(
@@ -64,20 +69,9 @@ def test_syntax_and_sync():
         content2 = f2.read()
         assert content1 == content2, "grep.py and scripts/grep.py are NOT byte-identical!"
 
-    # Compile check
-    res1 = subprocess.run(
-        [sys.executable, "-m", "py_compile", str(GREP_PATH)],
-        capture_output=True,
-        text=True,
-    )
-    assert res1.returncode == 0, f"Compilation failed for grep.py: {res1.stderr}"
-
-    res2 = subprocess.run(
-        [sys.executable, "-m", "py_compile", str(SCRIPTS_GREP_PATH)],
-        capture_output=True,
-        text=True,
-    )
-    assert res2.returncode == 0, f"Compilation failed for scripts/grep.py: {res2.stderr}"
+    # Compile check (in-memory without writing disallowed .pyc files to submission directory)
+    compile(GREP_PATH.read_text(encoding="utf-8"), str(GREP_PATH), "exec")
+    compile(SCRIPTS_GREP_PATH.read_text(encoding="utf-8"), str(SCRIPTS_GREP_PATH), "exec")
     print("  ✓ Syntax & byte-level synchronization verified.")
 
 

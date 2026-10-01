@@ -13,7 +13,12 @@ trap 'echo -e "\n🛑 Exited by Ctrl+C."; exit 0' INT
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+export PYTHONDONTWRITEBYTECODE=1
 export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-30}"
+
+# Clean any stray bytecode cache in submission directory before ADK compilation
+find "$PROJECT_DIR/my_submission" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "$PROJECT_DIR/my_submission" -name "*.pyc" -delete 2>/dev/null || true
 
 PYTHON_BIN="/tmp/brun/venv/bin/python"
 

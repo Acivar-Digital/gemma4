@@ -27,6 +27,10 @@ import sys
 import tempfile
 import time
 
+# Prevent Python from writing bytecode cache files (.pyc) that ADK compiler strictly forbids
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "oracle.py"
 SCRIPTS_ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "scripts" / "oracle.py"
@@ -34,8 +38,9 @@ SCRIPTS_ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "
 
 def run_oracle(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
     """Run oracle.py with arguments and return CompletedProcess."""
-    cmd = [sys.executable, str(ORACLE_PATH)] + list(args)
+    cmd = [sys.executable, "-B", str(ORACLE_PATH)] + list(args)
     environ = os.environ.copy()
+    environ["PYTHONDONTWRITEBYTECODE"] = "1"
     if env:
         environ.update(env)
     return subprocess.run(
@@ -58,11 +63,9 @@ def test_syntax_and_byte_identity():
         b1, b2 = f1.read(), f2.read()
         assert b1 == b2, f"oracle.py ({len(b1)} bytes) and scripts/oracle.py ({len(b2)} bytes) are not byte-identical!"
 
-    # Compile check
-    res1 = subprocess.run([sys.executable, "-m", "py_compile", str(ORACLE_PATH)], capture_output=True, text=True)
-    assert res1.returncode == 0, f"Compilation failed for oracle.py: {res1.stderr}"
-    res2 = subprocess.run([sys.executable, "-m", "py_compile", str(SCRIPTS_ORACLE_PATH)], capture_output=True, text=True)
-    assert res2.returncode == 0, f"Compilation failed for scripts/oracle.py: {res2.stderr}"
+    # Compile check (in-memory without writing disallowed .pyc files to submission directory)
+    compile(ORACLE_PATH.read_text(encoding="utf-8"), str(ORACLE_PATH), "exec")
+    compile(SCRIPTS_ORACLE_PATH.read_text(encoding="utf-8"), str(SCRIPTS_ORACLE_PATH), "exec")
     print("  ✓ Syntax & byte identity verified.")
 
 
@@ -396,7 +399,15 @@ def test_positional_auto_detection():
         data_expr = json.loads(res_expr.stdout)
         assert data_expr["mode"] == "eval"
         assert data_expr["formatted"] == "11"
-    print("  ✓ Positional auto-detection handles .py, .json, .html, ANSI, HTML snippets, schema strings, and expressions.")
+
+        # 8. Positional existing .txt file -> hex
+        txt_file = tmp_path / "notes.txt"
+        txt_file.write_text("plain text notes with \r\n")
+        res_txt = run_oracle(str(txt_file), "--json")
+        assert res_txt.returncode == 0
+        data_txt = json.loads(res_txt.stdout)
+        assert data_txt["mode"] == "hex"
+    print("  ✓ Positional auto-detection handles .py, .json, .html, .txt, ANSI, HTML snippets, schema strings, and expressions.")
 
 
 def test_forgiving_cli_and_unquoted_inputs():
@@ -441,7 +452,29 @@ def test_forgiving_cli_and_unquoted_inputs():
     res_unknown = run_oracle("--verbose", "--eval", "'safe'")
     assert res_unknown.returncode == 0
     assert "Formatted  : safe" in res_unknown.stdout
-    print("  ✓ Forgiving CLI flags (-e, -eval, ---eval) and unquoted multi-token expressions work cleanly.")
+
+    # 6. Flag synonyms & aliases
+    res_syn_w = run_oracle("--cellwidth", "abc", "-j")
+    assert res_syn_w.returncode == 0
+    assert json.loads(res_syn_w.stdout)["mode"] == "width"
+
+    res_syn_x = run_oracle("--hexdump", "abc", "-j")
+    assert res_syn_x.returncode == 0
+    assert json.loads(res_syn_x.stdout)["mode"] == "hex"
+
+    res_syn_s = run_oracle("--openapi", '{"type": "object"}', "-j")
+    assert res_syn_s.returncode == 0
+    assert json.loads(res_syn_s.stdout)["mode"] == "schema"
+
+    # 7. Fuzzy flag typo tolerance
+    res_fuzzy_w = run_oracle("--wdith", "hello", "-j")
+    assert res_fuzzy_w.returncode == 0
+    assert json.loads(res_fuzzy_w.stdout)["mode"] == "width"
+
+    res_fuzzy_e = run_oracle("--evall", "12 + 34", "-j")
+    assert res_fuzzy_e.returncode == 0
+    assert json.loads(res_fuzzy_e.stdout)["formatted"] == "46"
+    print("  ✓ Forgiving CLI flags (-e, -eval, ---eval), synonyms (--hexdump, --cellwidth), fuzzy typos (--wdith, --evall), and unquoted multi-token expressions work cleanly.")
 
 
 def test_crash_and_infinite_loop_immunity():
@@ -484,7 +517,15 @@ def test_crash_and_infinite_loop_immunity():
     assert res_mem.returncode == 1
     data_mem = json.loads(res_mem.stdout)
     assert data_mem["status"] == "error"
-    print("  ✓ Infinite loops (while True / generators) time out in <3s, RecursionError and SystemExit caught cleanly.")
+
+    # 6. ValueError / runtime exception immunity
+    res_val = run_oracle("--eval", "int('invalid_number_123')", "--json")
+    assert res_val.returncode == 1
+    data_val = json.loads(res_val.stdout)
+    assert data_val["error_type"] == "ValueError"
+    assert "invalid literal" in data_val["message"]
+    assert "ValueError:" in data_val["diagnostic"]
+    print("  ✓ Infinite loops (while True / generators) time out in <3s, RecursionError, SystemExit, and ValueErrors caught cleanly.")
 
 
 def test_schema_resilience_and_recursion_cycle():
@@ -526,7 +567,16 @@ def test_schema_resilience_and_recursion_cycle():
     data_rec = json.loads(res_rec.stdout)
     assert data_rec["status"] == "passed"
     assert len(data_rec["dangling_refs"]) == 0
-    print("  ✓ Non-dict schemas, boolean schemas, and recursive $ref cycles handled without crash or RecursionError.")
+
+    # 4. Deeply nested schema (300 levels deep) iterative traversal test
+    deep_schema = {"type": "string"}
+    for _ in range(300):
+        deep_schema = {"type": "object", "properties": {"child": deep_schema}}
+    res_deep = run_oracle("--schema", json.dumps(deep_schema), "--json")
+    assert res_deep.returncode == 0
+    data_deep = json.loads(res_deep.stdout)
+    assert data_deep["status"] == "passed"
+    print("  ✓ Non-dict schemas, boolean schemas, recursive $ref cycles, and 300-level deep schemas handled without crash or RecursionError.")
 
 
 def test_actionable_diagnostics():
@@ -568,7 +618,21 @@ def test_actionable_diagnostics():
     data_name = json.loads(res_name.stdout)
     assert "non_existent_func" in data_name["diagnostic"]
     assert "Fix:" in data_name["diagnostic"]
-    print("  ✓ Actionable diagnostics guide LLM with exact character width causes, $ref corrections, and escaping fixes.")
+
+    # 5. Actionable missing schema file path: explains file not found
+    res_missing_schema = run_oracle("--schema", "missing_schema_12345.json", "--json")
+    assert res_missing_schema.returncode == 1
+    data_missing_schema = json.loads(res_missing_schema.stdout)
+    assert data_missing_schema["error_type"] == "FileNotFoundError"
+    assert "missing_schema_12345.json" in data_missing_schema["error"]
+
+    # 6. Actionable missing syntax file path with fuzzy suggestion
+    res_missing_syntax = run_oracle("--syntax", "tests/test_code_oracl.py", "--json")
+    assert res_missing_syntax.returncode == 1
+    data_missing_syntax = json.loads(res_missing_syntax.stdout)
+    assert data_missing_syntax["error_type"] == "FileNotFoundError"
+    assert any("test_code_oracle.py" in s for s in data_missing_syntax.get("suggestions", []))
+    print("  ✓ Actionable diagnostics guide LLM with exact character width causes, $ref corrections, escaping fixes, and file suggestions.")
 
 
 def main():

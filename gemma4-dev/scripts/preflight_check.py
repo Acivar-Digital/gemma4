@@ -15,10 +15,15 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+# Prevent Python from writing bytecode cache files (.pyc) that ADK compiler strictly forbids
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -186,8 +191,28 @@ def check_wheels() -> CheckResult:
     )
 
 
+def clean_submission_bytecode(submission_dir: Path) -> None:
+    """Purge any __pycache__ directories or .pyc files from submission dir.
+    
+    Google ADK compiler strictly forbids .pyc files or __pycache__ inside the submission package.
+    """
+    if not submission_dir.exists():
+        return
+    for pyc in submission_dir.rglob("*.pyc"):
+        try:
+            pyc.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for cache_dir in submission_dir.rglob("__pycache__"):
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def check_submission_compilation() -> tuple[bool, str]:
     try:
+        clean_submission_bytecode(SUBMISSION_DIR)
         from adk_submission.compiler import compile_submission
         from swegemma.config import EvalConfig
         from swegemma.context import SwegemmaContext
@@ -378,6 +403,7 @@ def check_live_agent_diagnostics() -> tuple[bool, str]:
             problem_statement='Preflight live diagnostics',
         )
         tools = context.create_tools()
+        clean_submission_bytecode(SUBMISSION_DIR)
         main_agent = compile_submission(
             submission_dir=SUBMISSION_DIR,
             tool_registry=tools,

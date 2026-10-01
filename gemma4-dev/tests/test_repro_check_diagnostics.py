@@ -19,6 +19,10 @@ import pathlib
 import subprocess
 import sys
 
+# Prevent Python from writing bytecode cache files (.pyc) that ADK compiler strictly forbids
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "check.py"
 SCRIPTS_CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "scripts" / "check.py"
@@ -26,8 +30,9 @@ SCRIPTS_CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "scr
 
 def run_check(*args: str, env: dict | None = None, stdin_data: str | None = None) -> subprocess.CompletedProcess:
     """Run check.py with given arguments and return CompletedProcess."""
-    cmd = [sys.executable, str(CHECK_PY)] + list(args)
+    cmd = [sys.executable, "-B", str(CHECK_PY)] + list(args)
     environ = os.environ.copy()
+    environ["PYTHONDONTWRITEBYTECODE"] = "1"
     environ["PYTHONPATH"] = f"{REPO_ROOT}:{environ.get('PYTHONPATH', '')}"
     if env:
         environ.update(env)
@@ -53,13 +58,9 @@ def test_syntax_and_byte_identity() -> None:
         content2 = f2.read()
     assert content1 == content2, "check.py and scripts/check.py are NOT byte-identical!"
 
-    # Compile check
-    res1 = subprocess.run([sys.executable, "-m", "py_compile", str(CHECK_PY)], capture_output=True, text=True)
-    assert res1.returncode == 0, f"Compilation failed for check.py: {res1.stderr}"
-
-    res2 = subprocess.run([sys.executable, "-m", "py_compile", str(SCRIPTS_CHECK_PY)], capture_output=True, text=True)
-    assert res2.returncode == 0, f"Compilation failed for scripts/check.py: {res2.stderr}"
-
+    # Compile check (in-memory without writing disallowed .pyc files to submission directory)
+    compile(CHECK_PY.read_text(encoding="utf-8"), str(CHECK_PY), "exec")
+    compile(SCRIPTS_CHECK_PY.read_text(encoding="utf-8"), str(SCRIPTS_CHECK_PY), "exec")
     print("  ✓ Syntax & byte identity verified.")
 
 
