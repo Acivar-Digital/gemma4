@@ -2,7 +2,43 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01 (Omnivorous & Forgiving Skill Audit & Hardening)
+## [Unreleased] - 2026-10-01 (5-Skill Architecture: Code-Oracle, Test-Gate, Repro-Check Deep Diagnostics)
+
+### 5-Skill Architecture: Code-Oracle, Test-Gate, Repro-Check & Integration (projects-57i, projects-x9g, projects-rdn, projects-6x4)
+- **Built `skills/code-oracle` (`projects-57i`)**:
+  - Implemented zero-dependency multi-domain oracle tool (`oracle.py` & `scripts/oracle.py`) resolving 5 core competition nuances without repo-specific overfitting.
+  - Multi-mode CLI interface:
+    - `--eval <expr>`: Safe Python expression evaluation in a sandboxed runtime; outputs type, `repr()`, and length.
+    - `--hex <text>`: Formatted byte & escape code inspector; decodes ANSI CSI SGR colors/resets, OSC 8 hyperlinks, lone `\r` carriage returns, and invisible zero-width characters (`\u200b`, `\u200d`, `\ufe0f`).
+    - `--width <text>`: Calculates exact terminal cell display width for monospaced terminals (CJK East Asian Wide `W`/`F` = 2, emoji ZWJ sequences = 2, combining marks = 0, ANSI = 0) vs `len(text)`.
+    - `--html-esc <snippet>`: Inspects HTML/template strings for entity escaping (`&lt;`, `&gt;`, `&amp;`), tag balance, and script tag injection safety (OWASP `<script>` breakout prevention).
+    - `--schema <file_or_json>`: Inspects JSON Schema / OpenAPI schema structure; validates `$defs` vs `definitions`, local `$ref` pointer resolution, `anyOf` nullability (`{"type": "null"}` vs invalid `"None"`), and schema tree health.
+    - `--syntax <file>`: Validates AST syntax (`ast.parse`), catches regex lookbehind errors, and verifies top-level module imports without executing side-effects (cleanly absorbing legacy `syntax-guard`).
+    - Empty invocation: Overview mode with copy-pasteable example commands tailored to SWE-Gemma agents (exit code 0).
+  - Byte-for-byte synchronization verified via `cmp`.
+  - Comprehensive unit test suite in `tests/test_code_oracle.py` (9/9 passed).
+- **Enhanced `skills/repro-check` (`projects-rdn`)**:
+  - Upgraded isolated reproduction test runner (`check.py` & `scripts/check.py`) with **Deep Assertion Diagnostics**.
+  - On assertion failure, automatically dissects operands:
+    - *String Mismatches*: Prints `Actual` and `Expected` with `repr()`, lengths, character index of first divergence (`Diff at index <i>: actual='...' (hex: 0x...) vs expected='...' (hex: 0x...)`), and ANSI escape / control character breakdown.
+    - *Dict / JSON Mismatches*: Dissects missing keys, extra keys, and value mismatches for shared keys.
+    - *Sequence / List Mismatches*: Details length divergence and identifies first differing element.
+    - *Actionable Guidance*: Emits `💡 ROOT CAUSE HINT FOR LLM:` summarizing the defect mechanism.
+  - Retained outer quote stripping, `--b64` mode, AST pre-parsing, and hermetic `/tmp` execution.
+  - Unit test suite in `tests/test_repro_check_diagnostics.py` (7/7 passed).
+- **Consolidated `skills/test-gate` (`projects-x9g`)**:
+  - Unified regression testing (`blast-radius`), safe diff inspection (`diff-inspect`), and pre-submit syntax validation (`syntax-guard`) into a single authoritative `skills/test-gate/gate.py` tool.
+  - Multi-mode CLI interface supporting `--blast` (distance-1 neighbor regression test runner via AST import graph), `--diff` (safe read-only git diff viewer with hard forbidden test-file modification assertion), `--status` (syntax verification on touched files + readiness recommendation), and `--json` structured telemetry.
+  - Enforced Container B compliance: emits loud `🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE` warning and remediation instructions (`git checkout -- <file>`) if any test files are touched.
+  - Byte-for-byte synchronization between `my_submission/skills/test-gate/gate.py` and `scripts/gate.py`.
+  - Comprehensive unit test suite in `tests/test_test_gate.py` verifying all operational modes (7/7 passed).
+- **Architecture Streamlining & Obsolete Skill Retirement (`projects-6x4`)**:
+  - Wired authoritative 5-skill lean architecture into `my_submission/agent.yaml`: `code-map`, `fast-grep`, `code-oracle`, `repro-check`, and `test-gate`.
+  - Retired obsolete directories `skills/syntax-guard/`, `skills/blast-radius/`, and `skills/diff-inspect/`.
+  - Purged all `__pycache__` and `.pyc` artifacts from `my_submission/`.
+  - Updated `my_submission/prompts/main.md` with concise 5-phase lifecycle (Search, Inspection, Fix, Domain Nuance & Regression, Patch Inspection) and domain guidance (ANSI, Unicode widths, HTML, Schema).
+  - Fixed Google ADK template injection break in `skills/repro-check/SKILL.md` where unescaped braces `{i}` broke `inject_session_state`.
+  - Passed 6/6 preflight validation checks in `scripts/preflight_check.py` with 100% compliance.
 
 ### Omnivorous & Forgiving Skill Hardening (projects-1ff, projects-7yz)
 - **`skills/fast-grep` Hardened & Restored (`projects-1ff`)**:

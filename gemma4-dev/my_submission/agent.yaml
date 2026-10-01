@@ -8,10 +8,9 @@ tools:
   - get_status
   - submit_patch
 skills:
-  - skills/repro-check
-  - skills/blast-radius
-  - skills/fast-grep
   - skills/code-map
-  - skills/diff-inspect
-  - skills/syntax-guard
+  - skills/fast-grep
+  - skills/code-oracle
+  - skills/repro-check
+  - skills/test-gate
 generate_content_config: !include configs/sampling.yaml
