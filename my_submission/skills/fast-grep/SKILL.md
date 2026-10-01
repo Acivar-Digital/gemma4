@@ -1,6 +1,6 @@
 ---
 name: fast-grep
-description: Fast codebase regex and keyword search across /workspace with probability ranking, string/buffer verb boosting, call-site highlighting, and automatic AST function flashing for top 3 matches.
+description: Fast codebase regex and keyword search across /workspace with probability ranking, string/buffer verb boosting, call-site highlighting, target-centered sliding window, and clean code blocks for edit_file.
 ---
 
 # fast-grep Skill
@@ -17,9 +17,11 @@ Fast, omnivorous codebase search tool for locating strings, regex patterns, func
 - **String & Buffer Verb Boosting**: Automatically detects and boosts scores for core Python string and buffer transformation verbs (`splitlines`, `split`, `rstrip`, `strip`, `lstrip`, `replace`, `join`, `partition`, `decode`, `encode`, `from_ansi`).
 - **Call-Site & Enclosing Scope Highlighting**: Identifies active call-sites transforming text/buffer variables and marks them with `>>> ... <-- [CALL-SITE]` and `[⚡ STRING/BUFFER CALL-SITE & TRANSFORM SCOPE]` headers.
 - **Terse Issue Search Heuristics**: Automatically expands terse problem keywords (e.g., `newlines`, `newline`, `whitespace`, `indent`) to candidate string transformation operations to avoid flooding results with docstrings/comments.
-- **Top 3 AST Function Flashing**: Automatically parses Python AST to extract and flash the **top 3 complete enclosing functions** (with exact line numbers) directly in the tool output.
+- **Top 2 AST Function Flashing**: Automatically parses Python AST to extract and flash the **top 2 enclosing functions** (with exact line numbers) directly in the tool output.
+- **Target-Centered Sliding Window**: Centers a context window directly around the target matching line ($[\text{match\_line} - 15, \text{match\_line} + 25]$) so buggy logic in the middle of long functions is never hidden.
+- **Clean Code Block for `edit_file`**: Provides an unadorned `[CLEAN CODE FOR edit_file (EXACT INDENTATION)]` code block for the primary match with exact Python indentation, eliminating line-number prefix copy errors.
 - **Concise Match Index**: Displays a clean summary of all other ranked matches for quick reference.
-- **Context-Safe**: Caps large functions at 100 lines with middle folding to preserve the 32K context budget.
+- **Context-Safe**: Restricts scope flashing to 2 functions to conserve context tokens.
 - **Never crashes**: Always exits cleanly with code 0.
 
 ## Searching Terse Issues (String/Buffer Verbs)
