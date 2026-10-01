@@ -82,7 +82,7 @@ cell_2_model = """import torch
 from unsloth import FastLanguageModel
 from pathlib import Path
 
-max_seq_length = 4096
+max_seq_length = 16384
 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 load_in_4bit = True
 

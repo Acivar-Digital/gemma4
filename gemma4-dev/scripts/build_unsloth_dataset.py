@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Builds high-quality, stratified SFT training & validation datasets for Unsloth Gemma 31B.
+"""Builds high-quality, stratified Multi-Turn Tool SFT training & validation datasets for Unsloth Gemma 31B.
 
-Sources & Hardening:
-1. Verified resolved tasks from SWE-Gemma run_B39 (ground truth winning trajectories).
-2. Supervision quality: Extracts agent thought immediately adjacent to the successful final edit.
-3. Outlier filtering: Rejects non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
-4. Near-duplicate deduplication: Collapses patches with >90% similarity via difflib SequenceMatcher.
-5. Stratified 80/20 split: Balances train/validation sets across repository domains.
-6. Zero template duplication: Outputs pure Gemma-4 chat template turns directly to avoid tokenizer bugs.
-7. Strict error budget: Logs failures and hard-fails if corrupted traces exceed 5%.
+Consensus Architectural Upgrades (Triple-Reviewer Harmonized):
+1. ELIMINATES MODALITY MISMATCH: Formats data as full multi-turn conversational tool-calling
+   trajectories (system -> user -> agent tool_calls -> tool observation -> submit_patch),
+   NOT plain text markdown diffs, preserving autonomous agent reflexes in Google ADK.
+2. OBSERVATION COMPACTION: Compresses voluminous tool outputs (capped at 800 chars) to ensure
+   complete 20-30 turn trajectories fit comfortably inside the 16,384 token window.
+3. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
+4. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
+5. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
+6. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
+7. STRICT INTEGRITY GUARD: Hard-fails if corrupted or skipped traces exceed 5%.
 """
 
 from collections import defaultdict
@@ -17,7 +20,7 @@ import json
 import logging
 from pathlib import Path
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("build_unsloth_dataset")
@@ -37,61 +40,131 @@ MAX_TOOL_CALLS = 35
 DEDUP_SIMILARITY_THRESHOLD = 0.90
 MAX_SKIP_RATE = 0.05
 VAL_RATIO = 0.20
+MAX_OBSERVATION_CHARS = 800
 SEED = 42
 
 
-def extract_problem_statement(trace_path: Path) -> str:
-    """Extracts the user problem statement from the trace JSON with explicit error logging."""
+def compact_observation(raw_obs: Any) -> str:
+    """Compacts tool observation output to fit long trajectories into 16K context."""
+    if isinstance(raw_obs, dict):
+        # Extract stdout or content if available
+        if "stdout" in raw_obs and raw_obs["stdout"]:
+            text = str(raw_obs["stdout"])
+        elif "content" in raw_obs and raw_obs["content"]:
+            text = str(raw_obs["content"])
+        else:
+            text = json.dumps(raw_obs, ensure_ascii=False)
+    else:
+        text = str(raw_obs or "").strip()
+
+    if len(text) <= MAX_OBSERVATION_CHARS:
+        return text
+
+    # Keep head and tail of oversized outputs
+    half = MAX_OBSERVATION_CHARS // 2 - 20
+    return text[:half] + "\n... [truncated] ...\n" + text[-half:]
+
+
+def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Extracts system instruction, user prompt, and multi-turn tool interaction messages."""
     if not trace_path.exists():
         logger.warning(f"Trace file missing: {trace_path}")
-        return ""
+        return None, []
+
     try:
         with open(trace_path, encoding="utf-8") as f:
             trace = json.load(f)
-        for step in trace.get("steps", []):
-            if step.get("source") == "user":
-                msg = step.get("message", "").strip()
-                if msg:
-                    return msg
     except Exception as exc:
-        logger.error(f"Failed to read user prompt from {trace_path}: {exc}")
-    return ""
+        logger.error(f"Failed to parse trace {trace_path}: {exc}")
+        return None, []
+
+    steps = trace.get("steps", [])
+    user_prompt = ""
+    messages: List[Dict[str, Any]] = []
+
+    for step in steps:
+        src = step.get("source")
+        msg = (step.get("message") or "").strip()
+        tcalls = step.get("tool_calls", [])
+        obs = step.get("observation")
+
+        if src == "system" and msg:
+            if not messages or messages[0].get("role") != "system":
+                messages.append({"role": "system", "content": msg})
+
+        elif src == "user" and msg:
+            if not user_prompt:
+                user_prompt = msg
+                messages.append({"role": "user", "content": msg})
+
+        elif src == "agent":
+            # Build assistant message
+            asst_dict: Dict[str, Any] = {"role": "assistant"}
+            if msg:
+                asst_dict["content"] = msg
+            if tcalls:
+                formatted_calls = []
+                for idx, tc in enumerate(tcalls):
+                    call_id = tc.get("tool_call_id") or f"call_{len(messages)}_{idx}"
+                    formatted_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("function_name"),
+                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False)
+                        }
+                    })
+                asst_dict["tool_calls"] = formatted_calls
+
+            if "content" in asst_dict or "tool_calls" in asst_dict:
+                messages.append(asst_dict)
+
+            # Build tool observation response if present
+            if obs:
+                compact_text = compact_observation(obs)
+                call_id = (tcalls[0].get("tool_call_id") or f"call_{len(messages)-1}_0") if tcalls else "call_0"
+                fn_name = tcalls[0].get("function_name") if tcalls else "tool"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": fn_name,
+                    "content": compact_text
+                })
+
+    return user_prompt, messages
 
 
-def extract_agent_reasoning_pre_edit(trace_path: Path) -> str:
-    """Extracts the agent thought immediately preceding the successful final edit."""
-    if not trace_path.exists():
-        return ""
-    try:
-        with open(trace_path, encoding="utf-8") as f:
-            trace = json.load(f)
-        steps = trace.get("steps", [])
+def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
+    """Renders structured messages into canonical Gemma turn markers."""
+    turns: List[str] = []
 
-        # Find the last successful or final edit_file / write_file step
-        last_edit_idx = -1
-        for idx, step in enumerate(steps):
-            for tc in step.get("tool_calls", []):
-                if tc.get("function_name") in ("edit_file", "write_file"):
-                    last_edit_idx = idx
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls", [])
 
-        # Extract closest preceding agent message
-        if last_edit_idx > 0:
-            for p in range(last_edit_idx - 1, -1, -1):
-                msg = steps[p].get("message")
-                if steps[p].get("source") == "agent" and msg and isinstance(msg, str):
-                    clean_msg = msg.strip()
-                    if len(clean_msg) > 10:
-                        return clean_msg
+        if role == "system":
+            # In Gemma 4, system prompts are typically included in the user turn or system turn
+            turns.append(f"<start_of_turn>system\n{content}<end_of_turn>")
+        elif role == "user":
+            turns.append(f"<start_of_turn>user\n{content}<end_of_turn>")
+        elif role == "assistant":
+            parts = []
+            if content:
+                parts.append(content)
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    fn_name = fn.get("name")
+                    fn_args = fn.get("arguments")
+                    parts.append(f"<|tool_call|>call:{fn_name}{fn_args}<|tool_call|>")
+            asst_body = "\n".join(parts)
+            turns.append(f"<start_of_turn>model\n{asst_body}<end_of_turn>")
+        elif role == "tool":
+            tool_name = msg.get("name", "tool")
+            turns.append(f"<start_of_turn>tool\n{content}<end_of_turn>")
 
-        # Fallback to the first substantive agent thought if no pre-edit thought exists
-        for step in steps:
-            if step.get("source") == "agent":
-                msg = step.get("message")
-                if msg and isinstance(msg, str) and len(msg.strip()) > 10:
-                    return msg.strip()
-    except Exception as exc:
-        logger.error(f"Failed to extract reasoning from {trace_path}: {exc}")
-    return ""
+    return "\n".join(turns)
 
 
 def build_dataset():
@@ -112,9 +185,9 @@ def build_dataset():
     assert total_resolved > 0, "No resolved tasks found!"
 
     skipped_no_patch = 0
-    skipped_no_prompt = 0
+    skipped_no_trace = 0
     filtered_outliers = 0
-    candidate_examples: List[Dict] = []
+    candidate_examples: List[Dict[str, Any]] = []
 
     for rec in resolved_records:
         inst_id = rec.get("instance_id")
@@ -145,16 +218,10 @@ def build_dataset():
             logger.info(f"Skipping {inst_id}: tool calls ({tool_calls}) > {MAX_TOOL_CALLS} (flailing run)")
             continue
 
-        problem_text = extract_problem_statement(trace_file)
-        if not problem_text:
-            skipped_no_prompt += 1
-            logger.warning(f"Task {inst_id} missing problem statement.")
-            continue
-
-        pre_edit_thought = extract_agent_reasoning_pre_edit(trace_file)
-        if not pre_edit_thought:
-            skipped_no_prompt += 1
-            logger.warning(f"Task {inst_id} missing pre-edit thought.")
+        user_prompt, messages = extract_trajectory_messages(trace_file)
+        if not user_prompt or not messages or len(messages) < 4:
+            skipped_no_trace += 1
+            logger.warning(f"Task {inst_id} invalid or missing trajectory steps.")
             continue
 
         candidate_examples.append({
@@ -162,13 +229,14 @@ def build_dataset():
             "repo": repo,
             "patch_lines": patch_lines,
             "tool_calls": tool_calls,
-            "problem_text": problem_text,
-            "reasoning": pre_edit_thought,
+            "user_prompt": user_prompt,
             "patch_text": patch_text,
+            "messages": messages,
+            "turns_count": len(messages),
         })
 
     # Hard-fail guard against corrupted traces
-    total_skipped = skipped_no_patch + skipped_no_prompt
+    total_skipped = skipped_no_patch + skipped_no_trace
     skip_rate = total_skipped / total_resolved
     if skip_rate > MAX_SKIP_RATE:
         raise RuntimeError(
@@ -179,7 +247,7 @@ def build_dataset():
     logger.info(f"Passed quality filters: {len(candidate_examples)} candidates (dropped {filtered_outliers} outliers).")
 
     # Near-duplicate patch deduplication within same repository
-    deduped_examples: List[Dict] = []
+    deduped_examples: List[Dict[str, Any]] = []
     collapsed_duplicates = 0
 
     for cand in candidate_examples:
@@ -199,31 +267,21 @@ def build_dataset():
             deduped_examples.append(cand)
 
     logger.info(
-        f"Deduplication complete: {len(deduped_examples)} unique examples "
+        f"Deduplication complete: {len(deduped_examples)} unique multi-turn trajectories "
         f"({collapsed_duplicates} collapsed)."
     )
 
-    # Format into pure Gemma-4 chat turns (avoiding dual-template bugs in Unsloth)
+    # Format into Gemma-4 chat turns and include structured messages
     formatted_dataset = []
     for ex in deduped_examples:
-        user_content = (
-            f"You are an expert software engineer fixing an issue in `{ex['repo']}`.\n\n"
-            f"Problem Statement:\n{ex['problem_text']}\n\n"
-            "Please analyze the defect and provide the minimal, correct unified git diff patch to resolve the issue."
-        )
-        model_content = (
-            f"### Root Cause Analysis:\n{ex['reasoning']}\n\n"
-            f"### Proposed Unified Git Diff Patch:\n```diff\n{ex['patch_text']}\n```"
-        )
-        raw_text = (
-            f"<start_of_turn>user\n{user_content}<end_of_turn>\n"
-            f"<start_of_turn>model\n{model_content}<end_of_turn>"
-        )
+        raw_text = render_gemma_chat_turns(ex["messages"])
         formatted_dataset.append({
             "task_id": ex["task_id"],
             "repo": ex["repo"],
             "patch_lines": ex["patch_lines"],
             "tool_calls": ex["tool_calls"],
+            "turns_count": ex["turns_count"],
+            "messages": ex["messages"],
             "text": raw_text,
         })
 
@@ -233,8 +291,8 @@ def build_dataset():
         repo_groups[row["repo"]].append(row)
 
     random.seed(SEED)
-    train_rows: List[Dict] = []
-    val_rows: List[Dict] = []
+    train_rows: List[Dict[str, Any]] = []
+    val_rows: List[Dict[str, Any]] = []
 
     for repo, rows in sorted(repo_groups.items()):
         random.shuffle(rows)
@@ -248,23 +306,22 @@ def build_dataset():
     # Write train and validation datasets
     with open(TRAIN_OUT_PATH, "w", encoding="utf-8") as f_train:
         for row in train_rows:
-            f_train.write(json.dumps(row) + "\n")
+            f_train.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     with open(VAL_OUT_PATH, "w", encoding="utf-8") as f_val:
         for row in val_rows:
-            f_val.write(json.dumps(row) + "\n")
+            f_val.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    print("\n" + "=" * 60)
-    print("           STRATIFIED DATASET CURATION SUMMARY")
-    print("=" * 60)
+    print("\n" + "=" * 65)
+    print("      STRATIFIED MULTI-TURN SFT DATASET CURATION SUMMARY")
+    print("=" * 65)
     print(f"Total verified input traces:        {total_resolved}")
     print(f"Passed filters & deduplication:     {len(formatted_dataset)}")
-    print(f"Training set (80%):                 {len(train_rows)} rows -> {TRAIN_OUT_PATH}")
-    print(f"Validation set (20% held-out):      {len(val_rows)} rows -> {VAL_OUT_PATH}")
-    print(f"Skipped missing patch/prompt:       {total_skipped}")
+    print(f"Training set (80%):                 {len(train_rows)} trajectories -> {TRAIN_OUT_PATH}")
+    print(f"Validation set (20% held-out):      {len(val_rows)} trajectories -> {VAL_OUT_PATH}")
     print(f"Filtered outliers (>150 lines/>35): {filtered_outliers}")
     print(f"Collapsed near-duplicate patches:   {collapsed_duplicates}")
-    print("=" * 60)
+    print("=" * 65)
 
 
 if __name__ == "__main__":
