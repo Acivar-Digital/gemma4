@@ -427,16 +427,6 @@ COMMON_STOPWORDS: Set[str] = {
     "if",
 }
 
-TERSE_ISSUE_EXPANSIONS: Dict[str, List[str]] = {
-    "newline": ["splitlines", "rstrip", "strip", "replace"],
-    "newlines": ["splitlines", "rstrip", "strip", "replace"],
-    "whitespace": ["strip", "lstrip", "rstrip", "split", "replace"],
-    "indent": ["strip", "lstrip", "replace", "splitlines"],
-    "indentation": ["strip", "lstrip", "replace", "splitlines"],
-    "encoding": ["decode", "encode", "utf-8"],
-    "decoding": ["decode", "encode", "utf-8"],
-}
-
 _AST_CACHE: Dict[str, Tuple[Optional[ast.AST], List[str]]] = {}
 
 
@@ -1853,22 +1843,8 @@ def main() -> int:
             else:
                 safe_terms.append(t)
 
-        # Heuristic expansion for terse issue keywords
-        expanded_terms = list(safe_terms)
-        expansion_notes = []
-        for t in safe_terms:
-            t_key = t.lower()
-            if t_key in TERSE_ISSUE_EXPANSIONS:
-                verbs = [
-                    v
-                    for v in TERSE_ISSUE_EXPANSIONS[t_key]
-                    if v not in expanded_terms
-                ]
-                if verbs:
-                    expanded_terms.extend(verbs)
-                    expansion_notes.append(f"'{t}' -> {', '.join(verbs)}")
-
         # 2. Run primary search
+        expanded_terms = list(safe_terms)
         results = run_git_grep(
             expanded_terms,
             target,
@@ -1876,11 +1852,6 @@ def main() -> int:
             case_insensitive=is_case_insensitive,
             max_matches=max_matches * 2,
         )
-
-        if not is_json and expansion_notes:
-            print(
-                f"[fast-grep] 💡 Terse issue heuristic expanded: {'; '.join(expansion_notes)}"
-            )
 
         pattern_display = (
             terms[0] if len(terms) == 1 else ", ".join(repr(t) for t in terms)
