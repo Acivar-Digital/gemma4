@@ -1,0 +1,63 @@
+# Central gate policy — single source of truth for submission gates.
+# Every threshold used by scripts/check_submission.py lives here.
+# Sources are cited per-value. When a value changes, change it HERE only,
+# and the gates + their red-tests will follow.
+
+served_model:
+  # Kaggle serves this exact model at inference.
+  name: gemma-4-31b-it-qat-w4a16-ct
+  source: AGENTS.md strict-constraints; HARNESS_README.md:177/185 model allowlist
+
+adapter:
+  # A LoRA's base must match the served model EXACTLY. No allowlist.
+  # Currently FAILS: staged adapter base is unsloth/gemma-4-31B-it-unsloth-bnb-4bit (4-bit bnb),
+  # which is a quantization mismatch against the QAT w4a16 served model.
+  required_base_model: gemma-4-31b-it-qat-w4a16-ct
+  # agent.yaml must declare this adapter name.
+  declared_name: main_lora
+  # adapters/ subdir inside the submission must be populated.
+  dir: adapters
+  source: verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path
+
+tool_budget:
+  # eval_config.yaml sets this; prompts/main.md MUST agree (parity gate).
+  # main.md was corrected from a false 50 to this true 40 on 2026-10-04.
+  max_tool_calls: 40
+  source: my_submission/eval_config.yaml:4 evaluation.max_tool_calls
+
+serving:
+  # configs/sampling.yaml current values (verified compliant 2026-10-04).
+  # thinking_level MUST be absent: LiteLLM mistranslates it into OpenAI
+  # reasoning_effort, which the Kaggle Gemma runtime rejects.
+  forbidden_sampling_keys: thinking_level
+  include_thoughts_required: true
+  thinking_budget_current: 4096
+  max_output_tokens_current: 16384
+  # PROJECT rule, NOT from HARNESS_README: the harness only requires
+  # max_output_tokens + thinking_budget <= 32768, which 16384 passes. But
+  # token_threshold is 14336, so large outputs crowd context before
+  # compaction. docs/FINDINGS.md:76 flagged 16384 as the canary's
+  # context-starvation bug. Asserted separately until a real Gemma run settles it.
+  max_output_tokens_project_cap: 4096
+  source: HARNESS_README.md:146-150,178; docs/FINDINGS.md:76,90-92
+
+submission:
+  # HARNESS_README.md:134 sets the size limit on UNPACKED total, not compressed zip size.
+  max_unpacked_mb: 3072
+  max_output_tokens_ceiling: 32768
+  source: HARNESS_README.md:134,178
+
+run_health:
+  # Degenerate-run fingerprint from the one real Gemma 4 run: 129 rows, 0 resolved,
+  # 117 empty patches, test_exit_code histogram {-1:115, 2:5, 1:6, 124:3},
+  # 77/95 traces at zero completion tokens. If a run matches this, it is an
+  # INFRASTRUCTURE FAILURE, not a quality result.
+  zero_completion_token_traces_min_fraction: 0.5
+  empty_patch_min_count: 100
+  source: cloud_results/results/task_results.jsonl (verified 2026-10-04)
+
+submission_quota:
+  # Official rules allow ONE submission per day, not 5. The skill doc asserting
+  # 5-per-24h is a defect to fix. See docs/gemma-and-the-shape-of-doubt.md:136.
+  per_day: 1
+  source: docs/gemma-and-the-shape-of-doubt.md:136
