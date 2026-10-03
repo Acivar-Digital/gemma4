@@ -17,7 +17,7 @@ Modes:
        explaining that Container B automatically reverts (discards) test-file modifications during evaluation.
        Instructs exact command: git checkout -- <file>.
      - Summarizes lines added, lines removed, files touched.
-     - Diff truncation safety: truncates massive diffs (>500 lines or >50KB) with file-by-file summary.
+     - Diff truncation safety: truncates massive diffs (>80 lines or >6KB) with file-by-file summary.
   3. status / --status / -s:
      - Full patch readiness: modified files, test file safety check, syntax check on touched files,
        and recommendation on whether it is safe to run submit_patch.
@@ -78,8 +78,8 @@ SCRATCH_FILE_PATTERNS = [
     r"^verify.*\.py$",
 ]
 
-MAX_DIFF_LINES = 500
-MAX_DIFF_BYTES = 50 * 1024  # 50 KB
+MAX_DIFF_LINES = 80
+MAX_DIFF_BYTES = 6 * 1024  # 6 KB (6,144 bytes)
 
 
 def strip_ansi(text: str) -> str:
@@ -164,7 +164,7 @@ class TestGateResult(BaseModel):
     can_submit_patch: bool = Field(default=False, description="True if patch is ready and safe for submit_patch")
     summary: str = Field(default="", description="Concise human-readable summary")
     recommendation: str = Field(default="", description="Explicit actionable recommendation")
-    diff_preview: str = Field(default="", description="Unified diff preview (capped at 500 lines / 50KB)")
+    diff_preview: str = Field(default="", description="Unified diff preview (capped at 80 lines / 6KB)")
 
 
 FailureDetail.model_rebuild()
@@ -1118,7 +1118,7 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
 
     for idx, line in enumerate(diff_lines):
         line_bytes = len(line.encode("utf-8", errors="replace")) + 1
-        if idx >= MAX_DIFF_LINES or (accumulated_bytes + line_bytes > MAX_DIFF_BYTES and idx >= 20):
+        if idx >= MAX_DIFF_LINES or (accumulated_bytes + line_bytes > MAX_DIFF_BYTES):
             is_truncated = True
             break
         truncated_lines.append(line)
@@ -1127,12 +1127,13 @@ def execute_diff(ws: pathlib.Path, extra_args: Optional[List[str]] = None) -> Te
     total_files = len(file_stats)
 
     if is_truncated:
-        omitted_lines = total_diff_lines - len(truncated_lines)
         preview = "\n".join(truncated_lines)
+        if preview:
+            preview += "\n\n"
         preview += (
-            f"\n\n... [DIFF TRUNCATED: {omitted_lines} lines omitted to prevent LLM context blowout; "
-            f"capped at {len(truncated_lines)} lines / {accumulated_bytes // 1024}KB] ...\n\n"
-            f"File-by-file summary of changes:\n"
+            "... [TRUNCATED: Diff preview exceeded 80 lines / 6KB ceiling. "
+            "Use read_file to inspect individual modified files directly]\n\n"
+            "File-by-file summary of changes:\n"
         )
         for stat in file_stats:
             tag = " [FORBIDDEN TEST]" if stat.is_forbidden else ""

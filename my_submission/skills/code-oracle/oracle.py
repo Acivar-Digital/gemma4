@@ -29,10 +29,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import difflib
+import functools
 import html
 from html.parser import HTMLParser
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -64,6 +67,89 @@ VALID_JSON_SCHEMA_TYPES = {
 # ==============================================================================
 # Helper Utilities
 # ==============================================================================
+
+def truncate_value(
+    val_text: str,
+    max_chars: int = 2000,
+    max_lines: Optional[int] = 40,
+    hint: str = "Filter or slice your expression with [:100] to inspect specific slices",
+) -> str:
+    """Truncate long string representation or formatted output with clean banner.
+
+    Ensures total output characters <= max_chars and lines <= max_lines.
+    """
+    if not val_text:
+        return ""
+
+    total_chars = len(val_text)
+    lines = val_text.splitlines(keepends=True)
+    total_lines = len(lines)
+
+    exceeds_chars = total_chars > max_chars
+    exceeds_lines = max_lines is not None and total_lines > max_lines
+
+    if not exceeds_chars and not exceeds_lines:
+        return val_text
+
+    banner = (
+        f"... [TRUNCATED: Output exceeded {max_chars:,} chars (total: {total_chars} chars). "
+        f"{hint}]"
+    )
+
+    banner_with_nl = "\n" + banner
+    banner_len = len(banner_with_nl)
+    char_budget = max(0, max_chars - banner_len)
+
+    if max_lines is not None:
+        line_budget = max(1, max_lines - 1)
+        truncated_lines = lines[:line_budget]
+        body = "".join(truncated_lines)
+    else:
+        body = val_text
+
+    if len(body) > char_budget:
+        body = body[:char_budget]
+
+    if body.endswith("\n"):
+        return f"{body}{banner}"
+    else:
+        return f"{body}\n{banner}"
+
+
+def bound_output_chars(max_chars: int = 3000):
+    """Decorator that caps stdout output of a function to max_chars with clean banner."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            as_json = kwargs.get("as_json", False)
+            if not as_json and len(args) >= 2:
+                as_json = bool(args[1])
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ret = func(*args, **kwargs)
+            raw_output = buf.getvalue()
+
+            if not as_json and len(raw_output) > max_chars:
+                total_chars = len(raw_output)
+                banner = (
+                    f"... [TRUNCATED: Output exceeded {max_chars:,} chars (total: {total_chars} chars). "
+                    f"Filter or slice your expression with [:100] to inspect specific slices]"
+                )
+                banner_with_nl = "\n" + banner + "\n"
+                budget = max(0, max_chars - len(banner_with_nl))
+                body = raw_output[:budget]
+                if body.endswith("\n"):
+                    final_output = f"{body}{banner}\n"
+                else:
+                    final_output = f"{body}\n{banner}\n"
+                sys.stdout.write(final_output)
+            else:
+                sys.stdout.write(raw_output)
+            return ret
+        return wrapper
+    return decorator
+
 
 def read_input_text(input_val: str) -> str:
     """If input_val is an existing file path, read its text, otherwise return input_val.
@@ -288,12 +374,12 @@ def run_eval(expr: str, as_json: bool = False) -> int:
     }
     eval_locals: Dict[str, Any] = {}
 
-    # Set timer for timeout / infinite loop protection (5.0 seconds for heavy imports)
+    # Set timer for timeout / infinite loop protection (2.5 seconds for heavy imports)
     timer_armed = False
     try:
         if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
             signal.signal(signal.SIGALRM, _eval_alarm_handler)
-            signal.setitimer(signal.ITIMER_REAL, 5.0)
+            signal.setitimer(signal.ITIMER_REAL, 2.5)
             timer_armed = True
     except Exception:
         pass
@@ -426,8 +512,18 @@ def run_eval(expr: str, as_json: bool = False) -> int:
                 pass
 
     val_type = type(val).__name__
-    val_repr = repr(val)
-    val_str = str(val)
+    try:
+        val_repr = repr(val)
+    except Exception:
+        val_repr = f"<{val_type} instance (repr failed)>"
+    try:
+        val_str = str(val)
+    except Exception:
+        val_str = f"<{val_type} instance (str failed)>"
+
+    # Cap val_repr and val_str to a maximum of 2,000 characters each (or 40 lines)
+    val_repr = truncate_value(val_repr, max_chars=2000, max_lines=40)
+    val_str = truncate_value(val_str, max_chars=2000, max_lines=40)
 
     val_len: Optional[int] = None
     try:
@@ -519,6 +615,7 @@ def parse_sgr_params(params_str: str) -> List[str]:
     return res
 
 
+@bound_output_chars(max_chars=3000)
 def run_hex(input_val: str, as_json: bool = False) -> int:
     """Hex dump and escape sequence inspector."""
     stripped_val = input_val.strip()
@@ -828,6 +925,7 @@ def calculate_terminal_cells(text: str) -> Tuple[int, List[Dict[str, Any]]]:
     return total_width, breakdown
 
 
+@bound_output_chars(max_chars=3000)
 def run_width(input_val: str, as_json: bool = False) -> int:
     """Calculates exact terminal cell display width for monospaced terminals."""
     text = read_input_text(input_val)
@@ -1352,6 +1450,7 @@ def inspect_schema_tree(root: Any) -> Dict[str, Any]:
     }
 
 
+@bound_output_chars(max_chars=3000)
 def run_schema(input_val: str, as_json: bool = False) -> int:
     """Inspects JSON Schema / OpenAPI schema structure."""
     stripped = input_val.strip()
@@ -1857,7 +1956,7 @@ SUPPORTED MODES:
   6. -S, --syntax <file>  Validates AST syntax (ast.parse), regexes, and checks top-level
                           module import resolution without executing side-effects.
 
-RECOMMENDED ARGUMENT SCHEMAS:
+RECOMMENDED ARGUMENT SCHEMAS / COPY-PASTEABLE EXAMPLE COMMANDS:
   # 1. Safely evaluate an expression:
   args: ["--eval", 'len("hello world")']
   args: ["1 + 2 * 3"]  # auto-detected

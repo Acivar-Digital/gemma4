@@ -18,7 +18,7 @@ Consolidates regression testing (`blast-radius`) and git diff inspection (`diff-
 2. **Safe Git Diff & Safety Assertion (`--diff`, `diff`, `-d`)**:
    - Runs safe read-only git diff against `HEAD`.
    - **CRITICAL SWE-BENCH SAFETY ASSERTION**: Detects any test file modifications in `/workspace` (`tests/*`, `test_*.py`, `conftest.py`). Emits a loud `🚨 FORBIDDEN TEST FILE MODIFIED IN /WORKSPACE` warning with exact `git checkout -- <file>` revert commands because Container B automatically reverts (discards) test-file modifications during evaluation.
-   - Diff truncation safety: truncates diffs exceeding 500 lines or 50KB to protect LLM context windows, providing file-by-file stats and net changes.
+   - Diff truncation safety: truncates diffs exceeding 80 lines or 6KB to protect LLM context windows, providing file-by-file stats and net changes.
    - Detects untracked scratch files (`repro*.py`, `tmp*.py`) that `git add -N .` would pollute the official patch with.
 
 3. **Full Patch Readiness Gate (`--status`, `status`, `-s`)**:
@@ -80,5 +80,5 @@ args: ["status", "--json"]     # Machine-readable JSON output
 
 ## Guarantees
 - **Always Safe**: Read-only, never mutates files, and always exits with code 0.
-- **Context-Safe**: Tracebacks and diffs are capped (<500 lines / <50KB) to prevent LLM context blowout.
+- **Context-Safe**: Tracebacks and diffs are capped (<80 lines / <6KB) to prevent LLM context blowout.
 - **Actionable Diagnostics**: Emits exact failing test names, line numbers, statements, and revert commands.

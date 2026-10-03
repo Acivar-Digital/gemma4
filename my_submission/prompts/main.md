@@ -124,6 +124,7 @@ You have a total budget of 50 tool calls per task. Use get_status() to track you
 - NEVER emit the identical tool call with identical arguments consecutively.
 - If any tool returns `INVALID_ARGUMENTS` or an error, IMMEDIATELY halt and inspect your arguments. NEVER repeat the same malformed call. If unsure, switch to direct tool calling (`read_file`, `edit_file`).
 - Limit `repro-check` to at most 2 calls per task. Once 2 probes have run, you MUST proceed to `read_file` or `edit_file`.
+- Never run shell commands or scripts that dump git logs, commit histories, or binary object stores. Keep all diagnostic expressions surgical, bounded, and focused strictly on the bug.
 
 3. ABSOLUTELY FORBIDDEN: NEVER TOUCH TEST FILES OR WRITE SCRATCH SCRIPTS IN /WORKSPACE:
 - ABSOLUTELY FORBIDDEN: NEVER modify, edit, or write to ANY test file (`tests/*`, `test_*.py`, `*_test.py`, `conftest.py`)!

@@ -2325,8 +2325,26 @@ def _format_assertion_failure(
 format_assertion_diagnostic = _format_assertion_failure
 
 
+def _truncate_output(text: Optional[str], max_chars: int = 2000) -> str:
+    """Cap output stream to max_chars characters.
+
+    If output exceeds max_chars, truncate and append banner.
+    """
+    if not text or len(text) <= max_chars:
+        return text or ""
+    total_chars = len(text)
+    capped = text[:max_chars]
+    sep = "" if capped.endswith("\n") else "\n"
+    return f"{capped}{sep}... [TRUNCATED: Output exceeded 2,000 chars (total: {total_chars} chars)]"
+
+
 def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib.Path) -> str:
     """Render structured report into deterministic human and LLM-friendly diagnostic output."""
+    if report.raw_stdout:
+        report.raw_stdout = _truncate_output(report.raw_stdout, 2000)
+    if report.raw_stderr:
+        report.raw_stderr = _truncate_output(report.raw_stderr, 2000)
+
     lines: List[str] = []
 
     if report.status == "duplicate_probe":
@@ -2465,13 +2483,12 @@ def print_help() -> None:
     """Print comprehensive help and usage guide."""
     help_text = """repro-check: Omnivorous Defect Reproduction & Verification Engine.
 
-Usage:
-  python3 check.py [options] [<code>]
-  python3 check.py --code "assert 1 == 1" [options]
-  python3 check.py --b64 <base64_code> [options]
-  python3 check.py --file <script.py> [options]
-  cat <script.py> | python3 check.py [options]
-  run_skill_script('repro-check', 'check.py', args=['[options]', '<code>'])
+Usage via run_skill_script:
+  skill_name: "repro-check", file_path: "check.py"
+  args: ["--code", "assert 1 == 1"]
+  args: ["--b64", "<base64_code>"]
+  args: ["--file", "/tmp/repro.py"]
+  args: ["--expect-exception", "ValueError", "--code", "assert ..."]
 
 Options:
   --code, -c <CODE>             Python code snippet to execute (alternative to positional argument).

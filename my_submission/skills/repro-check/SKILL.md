@@ -12,42 +12,59 @@ In SWE-bench and real-world issues, there is **no unit test in the repo for the 
 `blast-radius` only checks regression of existing tests.
 `repro-check` directly tests if the **reported defect is confirmed or resolved**.
 
-## How to Run
+## How to Run (via run_skill_script)
 
-### 1. Direct Python Snippet (Positional, `--code`, or Multiple Words)
-```bash
-python3 check.py "assert 1 == 1"
-# Multiple unquoted tokens joined automatically:
-python3 check.py assert 1 == 1
-# Explicit code flag:
-python3 check.py --code "from rich.text import Text; assert Text.from_ansi('\\n').plain == '\\n'"
+Invoke `run_skill_script` with `skill_name="repro-check"`, `file_path="check.py"`, and `args`:
+
+### 1. Direct Python Snippet (`--code`)
+```json
+{
+  "skill_name": "repro-check",
+  "file_path": "check.py",
+  "args": ["--code", "assert 1 == 1"]
+}
 ```
 
-### 2. Base64 Mode (`--b64` / `--base64`)
+### 2. Base64 Mode (`--b64`)
 Eliminates JSON escaping and quote conflicts:
-```bash
-python3 check.py --b64 "YXNzZXJ0IDQgKyA0ID09IDg="
+```json
+{
+  "skill_name": "repro-check",
+  "file_path": "check.py",
+  "args": ["--b64", "YXNzZXJ0IDQgKyA0ID09IDg="]
+}
 ```
 
-### 3. File or Stdin Pipe (`--file`, `repro.py`, stdin)
-```bash
-python3 check.py /tmp/repro.py
-python3 check.py --file /tmp/repro.py
-cat /tmp/repro.py | python3 check.py
+### 3. File Execution (`--file`)
+Execute a scratch reproduction script saved in `/tmp`:
+```json
+{
+  "skill_name": "repro-check",
+  "file_path": "check.py",
+  "args": ["--file", "/tmp/repro.py"]
+}
 ```
 
-### 4. Missing-Validation Defect Verification (`--expect-exception`, `-e`)
+### 4. Missing-Validation Defect Verification (`--expect-exception`)
 For bugs where invalid input is silently accepted without validation:
-```bash
-python3 check.py -e ValueError "from mypkg import validate; validate(-1)"
+```json
+{
+  "skill_name": "repro-check",
+  "file_path": "check.py",
+  "args": ["--expect-exception", "ValueError", "--code", "from mypkg import validate; validate(-1)"]
+}
 ```
 - **Baseline reproduction**: If baseline code silently completes without raising the exception, `defect_confirmed=True` (exit 1).
 - **Post-fix verification**: When the fix causes the exception to be raised, `status=PASSED` (exit 0).
 
-### 5. Configurable Timeout (`--timeout`, `-t`)
+### 5. Configurable Timeout (`--timeout`)
 Default timeout is 15s. Infinite loops (`while True: pass`) are killed cleanly via process group signal (`os.killpg`) without hanging:
-```bash
-python3 check.py -t 5 "while True: pass"
+```json
+{
+  "skill_name": "repro-check",
+  "file_path": "check.py",
+  "args": ["--timeout", "5", "--code", "while True: pass"]
+}
 ```
 
 ## CLI Options & Flags
