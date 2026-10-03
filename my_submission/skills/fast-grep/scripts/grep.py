@@ -1658,7 +1658,7 @@ def extract_function_scope(
 def print_help() -> None:
     """Print clean usage information."""
     print(
-        """Usage: python grep.py [options] <pattern...> [path]
+        """Tool Invocation: run_skill_script(skill_name="fast-grep", file_path="grep.py", args=[...])
 
 fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents.
 
@@ -1685,23 +1685,23 @@ Diagnostics:
 
 
 def print_overview(target_display: str = "/workspace") -> None:
-    """Print helpful, copy-pasteable usage overview when called without pattern."""
+    """Print helpful usage overview when called without pattern."""
     print("=" * 80)
     print("fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents")
     print("=" * 80)
-    print("\nUsage:")
-    print("  python3 grep.py [options] <pattern...> [path]")
-    print("\nTailored copy-pasteable commands for next step:")
+    print("\nTool Invocation:")
+    print('  run_skill_script(skill_name="fast-grep", file_path="grep.py", args=[...])')
+    print("\nRecommended search arguments for next step:")
     print("  1. Search symbol or phrase:")
-    print('     python3 grep.py "def score_match"')
+    print('     args: ["def score_match"]')
     print("  2. Case-insensitive search:")
-    print('     python3 grep.py -i "apirouter"')
+    print('     args: ["-i", "apirouter"]')
     print("  3. Search in specific directory:")
-    print('     python3 grep.py "splitlines" src/')
+    print('     args: ["splitlines", "src/"]')
     print("  4. Multi-term union search:")
-    print("     python3 grep.py splitlines rstrip strip")
+    print('     args: ["splitlines", "rstrip", "strip"]')
     print("  5. Structured JSON output:")
-    print('     python3 grep.py --json "APIRouter"')
+    print('     args: ["--json", "APIRouter"]')
     print("\nOptions:")
     print("  -p, --pattern <term>   Search pattern or regex")
     print("  -d, --dir <path>       Target directory or file (defaults to /workspace)")
@@ -1762,11 +1762,11 @@ def main() -> int:
         # Overview mode (no terms provided or empty arguments)
         if is_overview or (not terms and not invalid_target):
             overview_cmds = [
-                'python3 grep.py "def score_match"',
-                'python3 grep.py -i "apirouter"',
-                'python3 grep.py "splitlines" src/',
-                'python3 grep.py splitlines rstrip strip',
-                'python3 grep.py --json "APIRouter"',
+                'args: ["def score_match"]',
+                'args: ["-i", "apirouter"]',
+                'args: ["splitlines", "src/"]',
+                'args: ["splitlines", "rstrip", "strip"]',
+                'args: ["--json", "APIRouter"]',
             ]
             if is_json:
                 explanation = MatchExplanation(
@@ -1785,7 +1785,7 @@ def main() -> int:
                     total_matches=0,
                     explanation=explanation,
                     suggestions=[
-                        "Provide a search pattern: python3 grep.py '<pattern>'"
+                        "Provide a search pattern in args: ['<pattern>']"
                     ],
                     copy_pasteable_commands=overview_cmds,
                 )
@@ -1820,8 +1820,8 @@ def main() -> int:
         if not terms:
             print(
                 "[fast-grep] ⚠️ No valid search terms provided after parsing arguments.\n"
-                "Usage: python grep.py [options] <pattern...> [path]\n"
-                "Example: python grep.py 'def score_match' ."
+                "Tool parameters: args: ['<pattern>'] or args: ['<pattern>', '<path>']\n"
+                "Example: args: ['def score_match']"
             )
             return 0
 
@@ -1884,7 +1884,7 @@ def main() -> int:
                                     content=parts[2] if len(parts) > 2 else "",
                                 )
                             )
-                    cmd = f'python3 grep.py "{first_term}"'
+                    cmd = f'args: ["{first_term}"]'
                     if cmd not in copy_pasteable_commands:
                         copy_pasteable_commands.append(cmd)
                     suggestions_list.append(
@@ -1921,11 +1921,14 @@ def main() -> int:
                         )
                 if ci_matches:
                     target_arg = (
-                        f" {target_display.replace('/workspace/', '').replace('/workspace', '.')}"
+                        target_display.replace("/workspace/", "").replace("/workspace", ".")
                         if target != ws
                         else ""
                     )
-                    cmd = f'python3 grep.py -i "{first_term}"{target_arg}'.strip()
+                    if target_arg:
+                        cmd = f'args: ["-i", "{first_term}", "{target_arg}"]'
+                    else:
+                        cmd = f'args: ["-i", "{first_term}"]'
                     if cmd not in copy_pasteable_commands:
                         copy_pasteable_commands.append(cmd)
                     suggestions_list.append(
@@ -1970,7 +1973,7 @@ def main() -> int:
                             sample_lineno=sl,
                         )
                     )
-                    sub_cmd = f'python3 grep.py "{sub}"'
+                    sub_cmd = f'args: ["{sub}"]'
                     if sub_cmd not in copy_pasteable_commands:
                         copy_pasteable_commands.append(sub_cmd)
 
@@ -1980,7 +1983,7 @@ def main() -> int:
                 terms, symbols, top_n=5, cutoff=0.35
             )
             for fs in fuzzy_suggestions[:2]:
-                f_cmd = f'python3 grep.py "{fs.symbol}"'
+                f_cmd = f'args: ["{fs.symbol}"]'
                 if f_cmd not in copy_pasteable_commands:
                     copy_pasteable_commands.append(f_cmd)
 
@@ -1989,15 +1992,13 @@ def main() -> int:
                 raw_phrase or " ".join(terms), ws, max_results=4
             )
             for sf in similar_files[:2]:
-                sf_cmd = f'python3 grep.py "{first_term}" {sf}'
+                sf_cmd = f'args: ["{first_term}", "{sf}"]'
                 if sf_cmd not in copy_pasteable_commands:
                     copy_pasteable_commands.append(sf_cmd)
 
             if not copy_pasteable_commands:
-                copy_pasteable_commands.append(
-                    f'python3 grep.py -i "{first_term}"'
-                )
-                copy_pasteable_commands.append(f'python3 grep.py "{first_term}"')
+                copy_pasteable_commands.append(f'args: ["-i", "{first_term}"]')
+                copy_pasteable_commands.append(f'args: ["{first_term}"]')
 
             # Formulate structured explanation & result
             status = (
@@ -2064,13 +2065,13 @@ def main() -> int:
                         f"  - {om.file}:{om.lineno}: {om.content.strip()[:80]}"
                     )
                 print(
-                    f'  Try searching without path filter: python3 grep.py "{first_term}"\n'
+                    f'  Try searching without path filter: args: ["{first_term}"]\n'
                 )
 
             # 2. Case-insensitive report
             if ci_matches:
                 print(
-                    f'💡 0 exact matches, but {len(ci_matches)} matches exist with -i / --ignore-case! Try: python3 grep.py -i "{pattern_display}"'
+                    f'💡 0 exact matches, but {len(ci_matches)} matches exist with -i / --ignore-case! Try: args: ["-i", "{pattern_display}"]'
                 )
                 for m in ci_matches[:6]:
                     print(f"  - {m.file}:{m.lineno}: {m.content.strip()[:80]}")
@@ -2115,7 +2116,7 @@ def main() -> int:
                 print()
 
             # 6. Actionable next steps for LLM
-            print("🚀 ACTIONABLE NEXT STEPS FOR LLM:")
+            print("🚀 RECOMMENDED NEXT SEARCH ARGUMENTS:")
             for idx, cmd in enumerate(copy_pasteable_commands, start=1):
                 print(f"  {idx}. {cmd}")
             print()

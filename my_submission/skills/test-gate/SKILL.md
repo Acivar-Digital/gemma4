@@ -28,27 +28,54 @@ Consolidates regression testing (`blast-radius`) and git diff inspection (`diff-
 4. **Structured JSON Output (`--json`, `-j`)**:
    - Returns 100% Pydantic v2 structured schemas (`TestGateResult`) for programmatic tool use.
 
+## Tool Invocation Contract
+
+Pass the following parameters to `run_skill_script`:
+* skill_name: "test-gate"
+* file_path: "gate.py"
+* args: List of string arguments
+
 ## How to Run
 
-### Smart Default (tests modified files or shows status)
-```bash
-python3 gate.py
+### Via ADK `run_skill_script`
+
+#### 1. Smart Default (tests modified files or shows status)
+```python
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=[])
+```
+Or via `args: [...]` schema:
+```yaml
+args: []
 ```
 
-### Positional Argument Routing
-```bash
-python3 gate.py diff                 # View diff & check test file safety
-python3 gate.py blast                # Run neighbor tests on touched files
-python3 gate.py status               # Check patch readiness before submitting
-python3 gate.py fastapi/routing.py   # Run neighbor tests for target file
+#### 2. Positional Argument Routing
+```python
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["diff"])                 # View diff & check test file safety
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["blast"])                # Run neighbor tests on touched files
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["status"])               # Check patch readiness before submitting
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["fastapi/routing.py"])   # Run neighbor tests for target file
+```
+Or via `args: [...]` schema:
+```yaml
+args: ["diff"]                 # View diff & check test file safety
+args: ["blast"]                # Run neighbor tests on touched files
+args: ["status"]               # Check patch readiness before submitting
+args: ["fastapi/routing.py"]   # Run neighbor tests for target file
 ```
 
-### Forgiving Flags & Timeout Tuning
-```bash
-python3 gate.py -d                   # Short flag for diff
-python3 gate.py -s                   # Short flag for status
-python3 gate.py -b -t 30             # Blast with 30s timeout per test file
-python3 gate.py status --json        # Machine-readable JSON output
+#### 3. Forgiving Flags & Timeout Tuning
+```python
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-d"])                   # Short flag for diff
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-s"])                   # Short flag for status
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-b", "-t", "30"])       # Blast with 30s timeout per test file
+run_skill_script(skill_name="test-gate", file_path="gate.py", args=["status", "--json"])     # Machine-readable JSON output
+```
+Or via `args: [...]` schema:
+```yaml
+args: ["-d"]                   # Short flag for diff
+args: ["-s"]                   # Short flag for status
+args: ["-b", "-t", "30"]       # Blast with 30s timeout per test file
+args: ["status", "--json"]     # Machine-readable JSON output
 ```
 
 ## Guarantees

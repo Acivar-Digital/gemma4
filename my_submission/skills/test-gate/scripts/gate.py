@@ -924,7 +924,8 @@ def execute_blast(
             "No modified files detected in git working tree and no target specified.\n"
             f"Available source modules to test:\n"
             + "\n".join(f"  • {f}" for f in sample_files)
-            + "\nUsage: python3 gate.py --blast <path/to/file.py>"
+            + '\nUsage: run_skill_script(skill_name="test-gate", file_path="gate.py", args=["--blast", "<path/to/file.py>"])'
+            + '\n   or: args: ["--blast", "<path/to/file.py>"]'
         )
 
         return TestGateResult(
@@ -1004,7 +1005,7 @@ def execute_blast(
         rec = (
             f"Exact failing tests:\n"
             + "\n".join(f"  ✗ {t}" for t in failing_names)
-            + "\nGuidance: Fix the logic causing test failures in your modified files before calling submit_patch(). Inspect the failing statements and expected vs actual values above, then re-run python3 gate.py."
+            + '\nGuidance: Fix the logic causing test failures in your modified files before calling submit_patch(). Inspect the failing statements and expected vs actual values above, then re-run run_skill_script(skill_name="test-gate", file_path="gate.py", args=[]).'
         )
 
     return TestGateResult(
@@ -1426,6 +1427,8 @@ def print_usage_guide(invalid_arg: Optional[str] = None):
     if invalid_arg:
         print(f"[test-gate] ⚠️ Unknown argument or flag: '{invalid_arg}'\n")
     print("test-gate: Authoritative regression runner, diff inspector, and patch readiness gate.\n")
+    print("Tool Invocation:")
+    print('  run_skill_script(skill_name="test-gate", file_path="gate.py", args=[...])\n')
     print("Available Modes & Options:")
     print("  --blast [file], -b, blast    Run distance-1 neighbor tests on modified or target files (default)")
     print("  --diff, -d, diff             Safe read-only git diff with test-file mutation assertion")
@@ -1434,16 +1437,16 @@ def print_usage_guide(invalid_arg: Optional[str] = None):
     print("  --timeout <sec>, -t <sec>    Pytest execution timeout per test file (default: 60s)")
     print("  --workspace <dir>, -w <dir>  Explicit workspace root directory")
     print("  --help, -h                   Show this help message\n")
-    print("Copy-Pasteable Examples:")
-    print("  python3 gate.py                      # Smart default: check status or run neighbor tests if files modified")
-    print("  python3 gate.py diff                 # Positional diff inspection")
-    print("  python3 gate.py blast                # Positional blast regression")
-    print("  python3 gate.py status               # Positional patch readiness")
-    print("  python3 gate.py fastapi/routing.py   # Run distance-1 neighbor tests for target file")
-    print("  python3 gate.py --diff               # Inspect diff and assert no test files were touched")
-    print("  python3 gate.py --status             # Verify syntax, safety, and patch submission readiness")
-    print("  python3 gate.py --status --json      # Structured patch readiness assessment for agents")
-    print("  python3 gate.py -t 30 --blast        # Run blast regression with 30s timeout per test file")
+    print("Recommended Arguments:")
+    print("  args: []                                      # Smart default: check status or run neighbor tests if files modified")
+    print('  args: ["diff"]                                # Positional diff inspection')
+    print('  args: ["blast"]                               # Positional blast regression')
+    print('  args: ["status"]                              # Positional patch readiness')
+    print('  args: ["fastapi/routing.py"]                  # Run distance-1 neighbor tests for target file')
+    print('  args: ["--diff"]                              # Inspect diff and assert no test files were touched')
+    print('  args: ["--status"]                            # Verify syntax, safety, and patch submission readiness')
+    print('  args: ["--status", "--json"]                  # Structured patch readiness assessment for agents')
+    print('  args: ["-t", "30", "--blast"]                 # Run blast regression with 30s timeout per test file')
 
 
 # ==============================================================================

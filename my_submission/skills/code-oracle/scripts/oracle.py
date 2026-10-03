@@ -176,7 +176,7 @@ def _eval_alarm_handler(signum: int, frame: Any) -> None:
 def run_eval(expr: str, as_json: bool = False) -> int:
     """Safely evaluates a Python expression or statement in the current environment."""
     if not expr or not expr.strip():
-        diag = "No expression provided to --eval. Example: python3 oracle.py --eval 'len([1, 2, 3])'"
+        diag = "No expression provided to --eval. Example: args: ['--eval', 'len([1, 2, 3])']"
         if as_json:
             print(json.dumps({"status": "error", "mode": "eval", "error": diag}, indent=2))
         else:
@@ -529,7 +529,7 @@ def run_hex(input_val: str, as_json: bool = False) -> int:
             diag = (
                 f"File '{stripped_val}' does not exist on disk.\n"
                 "What is wrong: Specified file path could not be located.\n"
-                "Fix: Check file path relative to workspace or pass text directly: python3 oracle.py --hex $'\\x1b[31mText\\x1b[0m'"
+                "Fix: Check file path relative to workspace or pass text directly: args: ['--hex', '\\x1b[31mText\\x1b[0m']"
             )
             if as_json:
                 print(json.dumps({"status": "error", "mode": "hex", "error_type": "FileNotFoundError", "error": err_msg, "diagnostic": diag}, indent=2))
@@ -1361,7 +1361,7 @@ def run_schema(input_val: str, as_json: bool = False) -> int:
             diag = (
                 f"File '{stripped}' not found.\n"
                 "What is wrong: The specified schema file does not exist on disk.\n"
-                "Fix: Check file path relative to workspace or pass inline JSON: python3 oracle.py --schema '{\"type\": \"object\"}'"
+                "Fix: Check file path relative to workspace or pass inline JSON: args: ['--schema', '{\"type\": \"object\"}']"
             )
             if as_json:
                 print(json.dumps({"status": "error", "mode": "schema", "error_type": "FileNotFoundError", "error": f"File '{stripped}' not found.", "diagnostic": diag}, indent=2))
@@ -1706,7 +1706,7 @@ def run_syntax(target: Optional[str] = None, as_json: bool = False) -> int:
 
             suggestion_msg = ""
             if close_matches:
-                suggestion_msg = f"\n  Did you mean: {close_matches[0]}?\n  Fix: python3 oracle.py --syntax {close_matches[0]}"
+                suggestion_msg = f"\n  Did you mean: {close_matches[0]}?\n  Fix: args: ['--syntax', '{close_matches[0]}']"
 
             err_msg = f"Target file '{target}' does not exist."
             if as_json:
@@ -1716,7 +1716,7 @@ def run_syntax(target: Optional[str] = None, as_json: bool = False) -> int:
                     "error_type": "FileNotFoundError",
                     "error": err_msg,
                     "suggestions": close_matches,
-                    "fix": f"python3 oracle.py --syntax {close_matches[0]}" if close_matches else None,
+                    "fix": f"args: ['--syntax', '{close_matches[0]}']" if close_matches else None,
                 }, indent=2))
             else:
                 print("=" * 80)
@@ -1857,30 +1857,30 @@ SUPPORTED MODES:
   6. -S, --syntax <file>  Validates AST syntax (ast.parse), regexes, and checks top-level
                           module import resolution without executing side-effects.
 
-COPY-PASTEABLE EXAMPLE COMMANDS:
+RECOMMENDED ARGUMENT SCHEMAS:
   # 1. Safely evaluate an expression:
-  python3 oracle.py --eval 'len("hello world")'
-  python3 oracle.py '1 + 2 * 3'  # auto-detected
+  args: ["--eval", 'len("hello world")']
+  args: ["1 + 2 * 3"]  # auto-detected
 
   # 2. Inspect ANSI escapes, hex dump, or invisible characters:
-  python3 oracle.py --hex $'\\x1b[31;1mError\\x1b[0m\\r\\n'
-  python3 oracle.py file_with_hidden_characters.txt
+  args: ["--hex", "\\x1b[31;1mError\\x1b[0m\\r\\n"]
+  args: ["file_with_hidden_characters.txt"]
 
   # 3. Calculate terminal display cell width for monospaced layouts:
-  python3 oracle.py --width '👨‍👩‍👧‍👦 Family'
-  python3 oracle.py -w $'\\x1b[32mClean Output\\x1b[0m'
+  args: ["--width", "👨‍👩‍👧‍👦 Family"]
+  args: ["-w", "\\x1b[32mClean Output\\x1b[0m"]
 
   # 4. Inspect HTML template escaping and tag balance:
-  python3 oracle.py --html-esc '<div><p>Hello & welcome</p></div>'
-  python3 oracle.py templates/swagger_ui.html
+  args: ["--html-esc", "<div><p>Hello & welcome</p></div>"]
+  args: ["templates/swagger_ui.html"]
 
   # 5. Validate OpenAPI / JSON Schema references and dialect:
-  python3 oracle.py --schema openapi.json
-  python3 oracle.py '{"$defs": {"A": {"type": "string"}}, "$ref": "#/$defs/A"}'
+  args: ["--schema", "openapi.json"]
+  args: ['{"$defs": {"A": {"type": "string"}}, "$ref": "#/$defs/A"}']
 
   # 6. Validate AST syntax, regex lookbehinds, and top-level imports:
-  python3 oracle.py --syntax rich/text.py
-  python3 oracle.py -S  # auto-checks modified files from git status
+  args: ["--syntax", "rich/text.py"]
+  args: ["-S"]  # auto-checks modified files from git status
 
 ADDITIONAL OPTIONS:
   --json, -j              Output results in machine-readable JSON format

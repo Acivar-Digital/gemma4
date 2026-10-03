@@ -2,7 +2,37 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-01 (5-Skill Hardening & Resilience Audit: Omnivorous CLI, Loop Immunity, Actionable Diagnostics)
+## [Unreleased] - 2026-10-03 (Declarative Skill Hardening, Monotone Governor Ladder, Track 1 Repackaging & Multi-Turn SFT Dataset)
+
+### Skill Hardening & Declarative ADK Standardization
+- **Declarative ADK Interface**: All 5 skills (`fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`) scrubbed of shell CLI affordances (`python3 script.py ...`) and standardized to declarative ADK `run_skill_script` and `args: [...]` schemas, eliminating execution ambiguity.
+- **Twin Script Synchronization**: Synchronized twin scripts between `my_submission/skills/` and active script directories to ensure exact byte-level parity across environments.
+- **`skills/repro-check` Hardening**: Hardened `repro-check` with Exit Code 1 on empty assertions (preventing false-positive repro passes) and MD5 probe deduplication to skip redundant executions.
+
+### Prompt Governor Reconciled (Monotone 40-Call Ladder)
+- **Unified Monotone Turn Ladder**: Replaced conflicting turn ceilings with a strict monotone 40-call ladder to prevent exploratory stalls:
+  - **Turns 1–6 (Discovery)**: Codebase navigation, symbol tracing, and root cause localization via `fast-grep` and `code-map`.
+  - **Turn 7 (Mandatory Initial Edit)**: Hard circuit breaker requiring an initial patch attempt via `edit_file`.
+  - **Turns 8–15 (Verification & Refinement)**: Repro script execution, targeted regression verification via `test-gate`, and precision adjustments.
+  - **$\le$ 5 Calls Remaining (Emergency Submit)**: Strict terminal phase requiring syntax status checks and `submit_patch()` before budget exhaustion.
+
+### Track 1 Baseline Repackaged & Verified
+- **Clean Submission Archive**: Repackaged `submission.zip` cleanly (64 MB, 0 bytecode `.pyc` files or `__pycache__` artifacts).
+- **Cryptographic Verification**: Validated SHA-256 hash `e2dba0f3b8f023e4d65a3377d073630750d2033ea2c1bf6f486a063bb47ccdc3`.
+- **Readiness Gate**: Confirmed Track 1 baseline ready for immediate Kaggle leaderboard submission upon daily quota reset.
+
+### Track 2 Multi-Turn SFT Dataset Curated
+- **High-Density Decision Samples**: Extracted 1,239 high-density decision samples (991 train / 248 val) from 48 verified surgical task trajectories in `results/run_B39`.
+- **Outlier Filtering**: Pruned 8 flailing outlier trajectories characterized by tool-call loops or budget exhaustion.
+- **Assistant-Only Loss Masking**: Applied assistant-only loss masking across conversational turns to focus training signal exclusively on model reasoning and tool actions.
+
+### Track 2 Unsloth Kaggle LoRA Training Pipeline (projects-5zh)
+- **Notebook Compilation**: Verified and compiled `scripts/build_unsloth_notebook.py` into production-ready `kaggle_unsloth/train_gemma4_lora_minimal.ipynb`.
+- **Rank-8 Attention/Output LoRA**: Configured Gemma 4 31B QLoRA with `r=8`, `lora_alpha=8`, `lora_dropout=0.05`, and explicit attention/projection targets `['q_proj', 'k_proj', 'v_proj', 'o_proj']` (MLPs frozen).
+- **Assistant-Only Loss & Zero Truncation**: Configured `assistant_only_loss=True` and `train_on_responses_only` over all 1,239 samples (991 train, 248 val), setting `max_seq_length=6144` (fitting max trajectory of 3,062 tokens with 0 truncation).
+- **Safe Kaggle Environment Detection**: Multi-path discovery for mounted datasets (`/kaggle/input`, `/kaggle/working/data`, `./data`) and model paths with zero host leaks.
+
+## [2026-10-01] - 5-Skill Hardening & Resilience Audit: Omnivorous CLI, Loop Immunity, Actionable Diagnostics
 
 ### 5-Skill Hardening & Full Resilience Audit (projects-yr2, projects-2cl, projects-805, projects-fai, projects-7k5)
 - **`skills/code-map` (`projects-yr2`)**:

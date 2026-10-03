@@ -53,6 +53,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field
 
 PROBE_COUNT_FILE = pathlib.Path("/tmp/.swegemma_repro_probe_count")
+PROBE_HISTORY_FILE = pathlib.Path("/tmp/.repro_probe_history.json")
 
 OP_MAP = {
     ast.Eq: "==",
@@ -140,7 +141,7 @@ class DiagnosticReport(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    status: str = Field(..., description="Status: passed, PASSED, missing_exception, assertion_error, runtime_exception, syntax_error, probe_budget_reached, probe_run, timeout, error")
+    status: str = Field(..., description="Status: passed, PASSED, missing_exception, assertion_error, runtime_exception, syntax_error, probe_budget_reached, probe_run, missing_assertion, duplicate_probe, timeout, error")
     exit_code: int = Field(default=0, description="Process exit code")
     summary: str = Field(..., description="High-level diagnostic summary")
     assertion_diagnostic: Optional[AssertionDiagnostic] = Field(default=None, description="Details if assertion failed")
@@ -168,7 +169,7 @@ class ReproCheckOutput(BaseModel):
 
     success: bool = Field(..., description="True if verification passed cleanly")
     defect_confirmed: bool = Field(..., description="True if defect was reproduced via assertion or exception")
-    category: str = Field(..., description="Category: passed, assertion_failure, workspace_exception, runtime_exception, syntax_error, probe_budget_reached, probe_run, general_failure, missing_exception")
+    category: str = Field(..., description="Category: passed, assertion_failure, workspace_exception, runtime_exception, syntax_error, probe_budget_reached, probe_run, missing_assertion, duplicate_probe, general_failure, missing_exception")
     report: DiagnosticReport = Field(..., description="Structured diagnostic report")
     rendered_output: str = Field(..., description="Rendered human/agent readable text")
 
@@ -1681,6 +1682,45 @@ def reset_probe_count() -> None:
         pass
 
 
+def check_and_record_probe_payload(code: str, expect_exception: bool) -> Tuple[bool, int]:
+    """Check if this exact probe payload has been executed before.
+
+    Returns:
+        (is_duplicate, current_execution_count)
+    """
+    import hashlib
+    import json
+
+    payload_normalized = f"{code.strip()}::expect_exception={expect_exception}"
+    payload_hash = hashlib.md5(payload_normalized.encode("utf-8")).hexdigest()
+
+    history: Dict[str, int] = {}
+    try:
+        if PROBE_HISTORY_FILE.exists():
+            history = json.loads(PROBE_HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        history = {}
+
+    count = history.get(payload_hash, 0)
+    history[payload_hash] = count + 1
+
+    try:
+        PROBE_HISTORY_FILE.write_text(json.dumps(history), encoding="utf-8")
+    except Exception:
+        pass
+
+    return (count > 0, count + 1)
+
+
+def reset_probe_history() -> None:
+    """Reset probe history cache."""
+    try:
+        if PROBE_HISTORY_FILE.exists():
+            PROBE_HISTORY_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def workspace_has_modifications(ws: pathlib.Path) -> bool:
     """Check if the workspace currently has uncommitted modified files."""
     try:
@@ -2289,6 +2329,13 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
     """Render structured report into deterministic human and LLM-friendly diagnostic output."""
     lines: List[str] = []
 
+    if report.status == "duplicate_probe":
+        lines.append(f"[repro-check] 🛑 REPETITION CIRCUIT BREAKER: {report.summary}")
+        lines.append("  You have submitted this exact byte-identical reproduction script before!")
+        lines.append("  Repeating identical probes wastes your 40-call budget without generating new information.")
+        lines.append("  Stop running duplicate scripts! Modify your probe assertions or proceed directly to edit_file.")
+        return "\n".join(lines)
+
     if report.status.lower() == "passed":
         if "Expected exception" in report.summary:
             lines.append(f"[repro-check] ✅ PASSED: {report.summary}")
@@ -2309,8 +2356,10 @@ def render_report_output(report: DiagnosticReport, has_checks: bool, ws: pathlib
                 )
             else:
                 lines.append(
-                    f"[repro-check] ℹ️ PROBE RUN ({probe_cnt}/2 probes used): "
-                    f"Code executed cleanly (exit code 0), but contained NO assertions or test functions."
+                    f"[repro-check] ❌ FAILED (Missing Assertion) [{probe_cnt}/2 probes used]: "
+                    "Code executed with returncode 0, but verified NOTHING because it contained NO assertions (assert) or checks! "
+                    "In SWE-bench, print statements do NOT reproduce defects or verify fixes. "
+                    "You MUST add assert statements (e.g. `assert actual == expected, 'mismatch'`) or pass expect_exception=True to verify behavior."
                 )
                 if report.raw_stdout:
                     lines.append(report.raw_stdout)
@@ -2642,9 +2691,33 @@ def main() -> int:
 
         ws = get_workspace_dir()
 
-        # If workspace modified, reset probe count immediately
+        # If workspace modified, reset probe count and deduplication history
         if workspace_has_modifications(ws):
             reset_probe_count()
+            reset_probe_history()
+        else:
+            # Check for duplicate identical payload on unmodified workspace
+            is_dup, seen_count = check_and_record_probe_payload(code, expect_exception)
+            if is_dup:
+                rendered = (
+                    f"[repro-check] 🛑 REPETITION CIRCUIT BREAKER (Duplicate Payload #{seen_count}): "
+                    "You have submitted this exact byte-identical reproduction script before on an unmodified workspace! "
+                    "Repeating identical probes wastes your 40-call budget without generating new information. "
+                    "Stop running duplicate scripts! Modify your probe assertions or proceed directly to edit_file."
+                )
+                output = ReproCheckOutput(
+                    success=False,
+                    defect_confirmed=False,
+                    category="duplicate_probe",
+                    report=DiagnosticReport(
+                        status="duplicate_probe",
+                        exit_code=1,
+                        summary=f"Duplicate probe payload detected (seen {seen_count} times)",
+                    ),
+                    rendered_output=rendered,
+                )
+                print(output.rendered_output)
+                return 1
 
         transformed_code, has_checks, check_count = prepare_executable_code(code)
 
@@ -2691,9 +2764,9 @@ def main() -> int:
                     defect_confirmed = False
                     success = False
                 else:
-                    category = "probe_run"
+                    category = "missing_assertion"
                     defect_confirmed = False
-                    success = True
+                    success = False  # HARD FAIL on empty assertion probe
         elif report.status == "missing_exception":
             reset_probe_count()
             category = "missing_exception"

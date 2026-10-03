@@ -851,11 +851,11 @@ def compute_fuzzy_suggestions(
 
     suggestions: List[SymbolSuggestion] = []
     for score, sym, kind, loc in scored[:top_n]:
-        inspect_cmd = f"python3 map.py --symbol {sym}"
+        inspect_cmd = f'args: ["--symbol", "{sym}"]'
         file_cmd = None
         if loc and ":" in loc:
             f_path = loc.split(":")[0]
-            file_cmd = f"python3 map.py --file {f_path}"
+            file_cmd = f'args: ["--file", "{f_path}"]'
 
         suggestions.append(
             SymbolSuggestion(
@@ -1304,9 +1304,9 @@ def analyze_symbol(
             "their defining module or class body and may not be registered as top-level public nodes "
             "in precomputed code graphs.\n"
             "Recommended inspection actions:\n"
-            f"  1. Search definitions with fast-grep: grep.py 'def {clean_symbol}'\n"
-            f"  2. Search attribute accesses: grep.py '.{clean_symbol}'\n"
-            "  3. Inspect the containing module file directly using map.py --file <path>."
+            f"  1. Search definitions with fast-grep: args: ['def {clean_symbol}']\n"
+            f"  2. Search attribute accesses: args: ['.{clean_symbol}']\n"
+            "  3. Inspect the containing module file directly: args: ['--file', '<path>']."
         )
     elif "." in clean_symbol:
         leaf = clean_symbol.split(".")[-1]
@@ -1314,16 +1314,16 @@ def analyze_symbol(
         inspection_hint = (
             f"Symbol '{clean_symbol}' is a qualified or dotted path. Qualified paths depend on "
             "import bindings and module hierarchies. If the qualified path fails to resolve:\n"
-            f"  1. Search for the unqualified leaf symbol: '{leaf}'\n"
-            f"  2. Search for the enclosing module or class: '{parent}'\n"
-            f"  3. Trace references with fast-grep: grep.py '{leaf}'\n"
-            "  4. Inspect the parent module file directly using map.py --file <path>."
+            f"  1. Search for the unqualified leaf symbol: args: ['{leaf}']\n"
+            f"  2. Search for the enclosing module or class: args: ['{parent}']\n"
+            f"  3. Trace references with fast-grep: args: ['{leaf}']\n"
+            "  4. Inspect the parent module file directly: args: ['--file', '<path>']."
         )
     elif not is_valid_ident:
         inspection_hint = (
             f"Query '{clean_symbol}' is not a valid Python identifier. code-map --symbol specializes "
             "in Python AST symbols (classes, functions, methods, variables). For arbitrary text patterns, "
-            f"use fast-grep: grep.py '{clean_symbol}'"
+            f"use fast-grep: args: ['{clean_symbol}']"
         )
 
     if found:
@@ -1335,12 +1335,12 @@ def analyze_symbol(
         )
         if defs:
             first_def = defs[0]
-            next_steps.append(f"Inspect defining module: python3 map.py --file {first_def.file_path}")
+            next_steps.append(f"Inspect defining module: args: ['--file', '{first_def.file_path}']")
         if focus == "callers" and all_callers:
-            next_steps.append(f"Inspect top caller: python3 map.py --symbol {all_callers[0].split()[0]}")
+            next_steps.append(f"Inspect top caller: args: ['--symbol', '{all_callers[0].split()[0]}']")
         elif focus == "callees" and all_callees:
-            next_steps.append(f"Inspect top callee: python3 map.py --symbol {all_callees[0].split()[0]}")
-        next_steps.append(f"Search direct calls across repo: grep.py '{clean_symbol}'")
+            next_steps.append(f"Inspect top callee: args: ['--symbol', '{all_callees[0].split()[0]}']")
+        next_steps.append(f"Search direct calls across repo with fast-grep: args: ['{clean_symbol}']")
     else:
         if graph_loaded:
             explanation = (
@@ -1379,8 +1379,8 @@ def analyze_symbol(
                 next_steps.append(f"Try closest suggested symbol: {top_s.inspect_command}")
             if top_s.file_command:
                 next_steps.append(f"Inspect candidate file: {top_s.file_command}")
-        next_steps.append(f"Search codebase text with fast-grep: grep.py '{clean_symbol}'")
-        next_steps.append("View repository structure and modules: python3 map.py")
+        next_steps.append(f"Search codebase text with fast-grep: args: ['{clean_symbol}']")
+        next_steps.append("View repository structure and modules: args: []")
 
     return CodeGraphResult(
         mode="symbol",
@@ -1549,7 +1549,7 @@ def format_symbol_report(result: CodeGraphResult) -> str:
             lines.append("TOP-LEVEL PUBLIC SYMBOLS IN REPOSITORY:")
             for sym in result.available_top_symbols:
                 clean_sym = sym.replace("class ", "").replace("def ", "").replace("()", "")
-                lines.append(f"  • {sym}  ->  python3 map.py --symbol {clean_sym}")
+                lines.append(f"  • {sym}  ->  args: ['--symbol', '{clean_sym}']")
             lines.append("")
 
     if result.inspection_hint:
@@ -1840,7 +1840,7 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             for s in suggestions:
                 lines.append(f"  • {s}")
                 clean_s = s.replace("📁 ", "").replace("📄 ", "").rstrip("/")
-                lines.append(f"     👉 python3 map.py --file {clean_s}")
+                lines.append(f"     👉 args: ['--file', '{clean_s}']")
             lines.append("")
         if layout_items:
             lines.append("📂 Top-level repository layout (/workspace):")
@@ -1852,8 +1852,8 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
         if suggestions:
             for s in suggestions[:3]:
                 best = s.replace("📁 ", "").replace("📄 ", "").rstrip("/")
-                next_steps.append(f"Inspect closest match: python3 map.py --file {best}")
-        next_steps.append("View repository overview and packages: python3 map.py")
+                next_steps.append(f"Inspect closest match: args: ['--file', '{best}']")
+        next_steps.append("View repository overview and packages: args: []")
 
         if next_steps:
             lines.append("👉 Actionable next steps:")
@@ -1935,7 +1935,7 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
             top_level_layout=layout_items,
             is_truncated=False,
             rendered_text=rendered,
-            next_steps=["Run 'python3 map.py' to see packages with Python code"],
+            next_steps=["Run with args: [] to see packages with Python code"],
         )
 
     # 3. Target is a single file with syntax error: Special detailed diagnostic
@@ -2021,10 +2021,10 @@ def generate_file_skeleton(target_str: str, max_lines: int = 120) -> FileSkeleto
     next_steps: List[str] = []
     if modules and modules[0].symbols:
         first_sym = modules[0].symbols[0].name
-        next_steps.append(f"Trace symbol call-graph: python3 map.py --symbol {first_sym}")
+        next_steps.append(f"Trace symbol call-graph: args: ['--symbol', '{first_sym}']")
     if len(py_files) > 1 and is_truncated:
         first_mod = modules[0].path
-        next_steps.append(f"Inspect single module outline: python3 map.py --file {first_mod}")
+        next_steps.append(f"Inspect single module outline: args: ['--file', '{first_mod}']")
 
     return FileSkeletonResult(
         mode="file",
@@ -2082,12 +2082,12 @@ def generate_workspace_overview(ws: pathlib.Path) -> WorkspaceOverviewResult:
     example_sym = clean_sample_symbols[0] if clean_sample_symbols else "main"
 
     commands = [
-        f"python3 map.py --file {example_mod}           # Compact AST outline of a key module",
-        f"python3 map.py --file {example_pkg}                 # Map package directory structure",
-        f"python3 map.py --symbol {example_sym}             # Trace call-graph, callers, callees, definitions",
-        f"python3 map.py --symbol {example_sym} --callers   # Focus specifically on inbound callers",
-        f"python3 map.py {example_mod}                  # Positional shorthand (auto-detects file)",
-        f"python3 map.py {example_sym}                  # Positional shorthand (auto-detects symbol)",
+        f'args: ["--file", "{example_mod}"]           # Compact AST outline of a key module',
+        f'args: ["--file", "{example_pkg}"]                 # Map package directory structure',
+        f'args: ["--symbol", "{example_sym}"]             # Trace call-graph, callers, callees, definitions',
+        f'args: ["--symbol", "{example_sym}", "--callers"]   # Focus specifically on inbound callers',
+        f'args: ["{example_mod}"]                  # Positional shorthand (auto-detects file)',
+        f'args: ["{example_sym}"]                  # Positional shorthand (auto-detects symbol)',
     ]
 
     lines: List[str] = [
@@ -2121,7 +2121,7 @@ def generate_workspace_overview(ws: pathlib.Path) -> WorkspaceOverviewResult:
             lines.append(f"  • {sym}")
         lines.append("")
 
-    lines.append("💡 TAILORED COPY-PASTEABLE COMMANDS:")
+    lines.append("💡 RECOMMENDED TOOL ARGUMENTS:")
     for cmd in commands:
         lines.append(f"  {cmd}")
     lines.append("")
@@ -2385,8 +2385,8 @@ def print_help():
     """Print user/LLM help text."""
     print("""code-map: AST code structure and symbol call-graph tracer.
 
-Usage:
-  python3 map.py [TARGET] [OPTIONS]
+Tool Invocation:
+  run_skill_script(skill_name="code-map", file_path="map.py", args=[...])
 
 Modes:
   --symbol, -s <name>     Trace callers, callees, definitions, and class hierarchy across repository.
@@ -2405,18 +2405,18 @@ Options:
   --graph, -g <path>      Explicit path to precomputed codebase graph JSON.
   --help, -h              Show this help message and exit.
 
-Examples:
-  python3 map.py                                # Repository overview & tailored usage guide
-  python3 map.py --symbol APIRouter             # Trace symbol callers/callees/definitions
-  python3 map.py -s APIRouter --callers         # Focus on inbound callers of APIRouter
-  python3 map.py -s APIRouter --callees         # Focus on outbound callees of APIRouter
-  python3 map.py --file fastapi/routing.py      # Compact AST outline of a single file
-  python3 map.py -f fastapi                     # Map directory modules up to max_lines budget
-  python3 map.py -d fastapi                     # Directory mapping shorthand
-  python3 map.py APIRouter                      # Auto-detected symbol mode
-  python3 map.py fastapi/routing.py             # Auto-detected file mode
-  python3 map.py fastapi                        # Auto-detected directory mode
-  python3 map.py --symbol APIRouter --json      # Output structured JSON schema
+Recommended Arguments:
+  args: []                                      # Repository overview & tailored usage guide
+  args: ["--symbol", "APIRouter"]               # Trace symbol callers/callees/definitions
+  args: ["-s", "APIRouter", "--callers"]        # Focus on inbound callers of APIRouter
+  args: ["-s", "APIRouter", "--callees"]        # Focus on outbound callees of APIRouter
+  args: ["--file", "fastapi/routing.py"]        # Compact AST outline of a single file
+  args: ["-f", "fastapi"]                       # Map directory modules up to max_lines budget
+  args: ["-d", "fastapi"]                       # Directory mapping shorthand
+  args: ["APIRouter"]                           # Auto-detected symbol mode
+  args: ["fastapi/routing.py"]                  # Auto-detected file mode
+  args: ["fastapi"]                             # Auto-detected directory mode
+  args: ["--symbol", "APIRouter", "--json"]     # Output structured JSON schema
 """)
 
 
