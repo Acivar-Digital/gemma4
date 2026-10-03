@@ -37,6 +37,22 @@ Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) f
 - Verify by reading files / running `swegemma eval --task-id ...`, never by guessing.
 - **CRITICAL EXECUTION PROTOCOL (bd `execution-protocol-only-start-sh`):** The user ONLY runs `./start.sh` to execute SWE-Gemma evaluations and tests. Agents must NEVER run evaluation runners directly, NEVER invoke `scripts/run_eval.py`, NEVER launch evaluations in tmux windows, and NEVER execute tests automatically. All test executions are initiated exclusively by the user running `./start.sh`.
 
+### Git Hygiene — Keep Large Artifacts Out of History
+
+**The ~42GB working directory is NOT the git repository.** `.git` is ~1.1GB; all tracked files total ~327MB. Do not infer "huge repo" from `du -sh .` — the 42GB is on disk, not in git.
+
+- **Keep these out of git** — already `.gitignore`d, 0 tracked files, leave them that way: `snapshots/` (~20G), `models/` (~18G), `adapters_staging/` (~848M), `checkpoints/` (~777M), `embeddings/` (~446M), `graphs/` (~403M), `results/` (~124M), `wheels/` (~27M). If a task seems to require tracking one of these, STOP and report it; that is the failure this section prevents.
+- **Never commit generated build artifacts, especially `submission.zip`.** It is rebuilt in seconds by `scripts/submit_safe.sh`; every repack committed adds ~80MB **permanently** to immutable history. If tracked, prefer `git rm --cached submission.zip` and add it to `.gitignore` — say so plainly, because history cannot be shrunk without a rewrite.
+- **GitHub's hard limit is 100MB per file** — a single tracked file over it fails `git push` outright. `my_submission/adapters/main_lora/adapter_model.safetensors` is 86MB: under the limit, thin margin. Never commit checkpoints or larger quantizations.
+- **No duplicate copies of large artifacts.** The main_lora adapter is tracked 3× (86M + 69M + 69M). One canonical location only.
+- **Prefer the cheap direction.** `git rm --cached` is cheap and safe; purging blobs already in history needs a rewrite that invalidates every commit SHA and every tag. Never rewrite history to fix repo size unless the user explicitly asks for it in that turn.
+
+Before staging anything large:
+
+```bash
+git ls-files -z | xargs -0 du -h | sort -rh | head
+```
+
 ## Instructions
 - Run `bd prime` at the start of the session or after compact to refresh persist memories.
 
