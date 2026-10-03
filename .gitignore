@@ -50,3 +50,4 @@ env/
 test.txt
 checkpoints/
 *.bak
+adapters_staging/
