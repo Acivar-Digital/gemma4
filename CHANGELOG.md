@@ -2,7 +2,16 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-03 (ADK Schema Validation Fix, LiteRouter Directive Configuration & .DS_Store Sanitization Hardening)
+## [Unreleased] - 2026-10-03 (Context Explosion Hardening, Truncation Guards & Repackaged Track 1 Baseline)
+
+### Context Explosion Hardening & Skill Output Sanitization
+- **`code-oracle` Output Truncation Guard**: Implemented `truncate_value()` capping `val_repr` and `val_str` to at most 2,000 characters and 40 lines with a clean notice (`... [TRUNCATED: Output exceeded 2,000 chars (total: N chars). Filter or slice your expression with [:100] to inspect specific slices]`). Applied `@bound_output_chars(max_chars=3000)` to `--hex`, `--width`, and `--schema` in text output mode, preserving valid JSON in `--json` mode. Both `scripts/oracle.py` and `oracle.py` synchronized byte-identical.
+- **`repro-check` Global Safety Net**: Added `_truncate_output()` capping `raw_stdout` and `raw_stderr` to 2,000 characters in `render_report_output()` with a clear truncation banner. Both `scripts/check.py` and `check.py` synchronized byte-identical.
+- **`test-gate` Diff Ceiling Reduction**: Tightened `diff_preview` ceiling from 50KB / 500 lines to 6KB / 80 lines (`MAX_DIFF_BYTES = 6 * 1024`, `MAX_DIFF_LINES = 80`) with clean truncation message instructing agent to use `read_file` for detailed file inspection. Both `scripts/gate.py` and `gate.py` synchronized byte-identical.
+- **Anti-Git-Dump & Bounded Diagnostic Directives**: Added explicit directive to `my_submission/prompts/main.md` and `sample_submission/prompts/system.md`: *"Never run shell commands or scripts that dump git logs, commit histories, or binary object stores. Keep all diagnostic expressions surgical, bounded, and focused strictly on the bug."*
+- **Repackaged Track 1 Baseline (`submission.zip`)**: Recompiled and packaged clean root-layout `submission.zip` (229 KB, 0 `.pyc`, 0 `.DS_Store`, 0 `._*`, SHA-256 `ed4aa5bbc2de41ed6775d33f07b3057b3439f10805ab78675b3686a355717840`), fully verified against all 9 pre-submission gates and passing all 6/6 preflight environment tiers.
+
+## [2026-10-03] - (ADK Schema Validation Fix, LiteRouter Directive Configuration & .DS_Store Sanitization Hardening)
 
 ### ADK Submission Sanitization & macOS Metadata Protection
 - **Automated `.DS_Store` & AppleDouble Purge**: Enhanced `clean_submission_bytecode` in `scripts/preflight_check.py` and integrated an automatic sanitization step in `scripts/run_eval.py` prior to `Evaluator` startup. It aggressively deletes `.DS_Store`, `._*` AppleDouble metadata, `.pyc`, and `__pycache__` artifacts from `my_submission/` before ADK directory validation. This permanently eliminates the ADK `SubmissionValidationError: File has disallowed extension '': .DS_Store` sandbox failures.

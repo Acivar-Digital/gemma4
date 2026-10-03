@@ -635,6 +635,53 @@ def test_actionable_diagnostics():
     print("  ✓ Actionable diagnostics guide LLM with exact character width causes, $ref corrections, escaping fixes, and file suggestions.")
 
 
+def test_output_truncation():
+    print("[14/14] Testing output truncation guards (2,000 chars / 40 lines for eval, 3,000 chars for hex/width/schema)...")
+    # 1. Eval character cap (2,000 chars)
+    res_eval = run_oracle("--eval", "list(range(5000))", "--json")
+    assert res_eval.returncode == 0
+    data_eval = json.loads(res_eval.stdout)
+    assert len(data_eval["repr"]) <= 2000, f"repr length {len(data_eval['repr'])} > 2000"
+    assert len(data_eval["formatted"]) <= 2000, f"formatted length {len(data_eval['formatted'])} > 2000"
+    expected_banner = "... [TRUNCATED: Output exceeded 2,000 chars (total: 28890 chars). Filter or slice your expression with [:100] to inspect specific slices]"
+    assert expected_banner in data_eval["repr"]
+    assert expected_banner in data_eval["formatted"]
+
+    # 2. Eval line count cap (40 lines)
+    res_lines = run_oracle("--eval", '"\\n".join(f"line_{i}" for i in range(100))', "--json")
+    assert res_lines.returncode == 0
+    data_lines = json.loads(res_lines.stdout)
+    lines = data_lines["formatted"].splitlines()
+    assert len(lines) <= 40, f"line count {len(lines)} > 40"
+    assert len(data_lines["formatted"]) <= 2000
+    assert "... [TRUNCATED: Output exceeded 2,000 chars" in data_lines["formatted"]
+
+    # 3. Hex dump output cap (3,000 chars)
+    large_text = "abc \x1b[31m colored \x1b[0m 123 \n" * 500
+    res_hex = run_oracle("--hex", large_text)
+    assert res_hex.returncode == 0
+    assert len(res_hex.stdout) <= 3000, f"hex stdout length {len(res_hex.stdout)} > 3000"
+    assert "... [TRUNCATED: Output exceeded 3,000 chars" in res_hex.stdout
+
+    # 4. Width output cap (3,000 chars)
+    res_width = run_oracle("--width", large_text)
+    assert res_width.returncode == 0
+    assert len(res_width.stdout) <= 3000, f"width stdout length {len(res_width.stdout)} > 3000"
+    assert "... [TRUNCATED: Output exceeded 3,000 chars" in res_width.stdout
+
+    # 5. Schema output cap (3,000 chars)
+    large_schema = {
+        "$defs": {},
+        "properties": {f"prop_{i}": {"$ref": f"#/definitions/Missing{i}"} for i in range(100)}
+    }
+    res_schema = run_oracle("--schema", json.dumps(large_schema))
+    assert res_schema.returncode == 1  # has dangling refs
+    assert len(res_schema.stdout) <= 3000, f"schema stdout length {len(res_schema.stdout)} > 3000"
+    assert "... [TRUNCATED: Output exceeded 3,000 chars" in res_schema.stdout
+
+    print("  ✓ Output truncation guards verified for eval (chars & lines) and hex/width/schema (chars).")
+
+
 def main():
     print("=" * 80)
     print("RUNNING CODE-ORACLE GAUNTLET TEST SUITE")
@@ -653,6 +700,7 @@ def main():
     test_crash_and_infinite_loop_immunity()
     test_schema_resilience_and_recursion_cycle()
     test_actionable_diagnostics()
+    test_output_truncation()
 
     print("=" * 80)
     print("ALL CODE-ORACLE UNIT TESTS PASSED CLEANLY! (EXIT CODE 0)")

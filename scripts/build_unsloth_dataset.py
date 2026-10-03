@@ -28,14 +28,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("build_unsloth_dataset")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-B39_DIR = ROOT_DIR / "results" / "run_B39"
-TRACES_DIR = B39_DIR / "traces"
-PATCHES_DIR = B39_DIR / "patches"
-RESULTS_JSONL = B39_DIR / "task_results.jsonl"
 OUT_DIR = ROOT_DIR / "data"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_OUT_PATH = OUT_DIR / "unsloth_sft_train.jsonl"
 VAL_OUT_PATH = OUT_DIR / "unsloth_sft_val.jsonl"
+
+RUN_DIRS = [
+    ROOT_DIR / "results" / "run_B40",
+    ROOT_DIR / "results" / "run_B39",
+]
 
 MAX_DIFF_LINES = 150
 MAX_TOOL_CALLS = 35
@@ -325,9 +326,6 @@ def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
 
 
 def build_dataset():
-    if not RESULTS_JSONL.exists():
-        raise FileNotFoundError(f"Missing results log: {RESULTS_JSONL}")
-
     # Load tokenizer for precise token boundary check
     tokenizer = None
     try:
@@ -339,17 +337,27 @@ def build_dataset():
     except Exception as exc:
         logger.warning(f"Could not load local tokenizer: {exc}. Using character heuristics.")
 
-    resolved_records = []
-    with open(RESULTS_JSONL, encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("resolved") is True:
-                resolved_records.append(rec)
+    # Ingest resolved tasks across RUN_DIRS (prioritize newer runs like run_B40)
+    resolved_by_id = {}
+    run_sources = {}
+    for run_dir in RUN_DIRS:
+        results_jsonl = run_dir / "task_results.jsonl"
+        if not results_jsonl.exists():
+            logger.warning(f"Results log not found: {results_jsonl}")
+            continue
+        with open(results_jsonl, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                inst_id = rec.get("instance_id")
+                if rec.get("resolved") is True and inst_id not in resolved_by_id:
+                    resolved_by_id[inst_id] = rec
+                    run_sources[inst_id] = run_dir
 
+    resolved_records = list(resolved_by_id.values())
     total_resolved = len(resolved_records)
-    logger.info(f"Loaded {total_resolved} verified resolved tasks from run_B39.")
+    logger.info(f"Loaded {total_resolved} unique verified resolved tasks across runs: {[r.name for r in RUN_DIRS]}.")
     assert total_resolved > 0, "No resolved tasks found!"
 
     skipped_no_patch = 0
@@ -360,8 +368,9 @@ def build_dataset():
     for rec in resolved_records:
         inst_id = rec.get("instance_id")
         repo = rec.get("repo")
-        trace_file = TRACES_DIR / f"trace_{inst_id}.json"
-        patch_file = PATCHES_DIR / f"{inst_id}.patch"
+        src_dir = run_sources[inst_id]
+        trace_file = src_dir / "traces" / f"trace_{inst_id}.json"
+        patch_file = src_dir / "patches" / f"{inst_id}.patch"
 
         if not patch_file.exists():
             skipped_no_patch += 1

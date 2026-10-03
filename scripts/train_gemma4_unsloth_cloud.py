@@ -74,12 +74,16 @@ def main():
     dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     load_in_4bit = True
     
-    # Prefer unsloth 4-bit repo if accessible, else base google repo
+    # Prefer local cached model if available in GCS /opt/model, then candidate repos
     hf_token = os.environ.get("HF_TOKEN", None)
-    candidate_models = [
+    local_model_dir = Path(os.environ.get("LOCAL_MODEL_DIR", "/opt/model"))
+    candidate_models = []
+    if (local_model_dir / "config.json").exists():
+        candidate_models.append(str(local_model_dir))
+    candidate_models.extend([
         "unsloth/gemma-4-31B-it-unsloth-bnb-4bit",
         "google/gemma-4-31b-it",
-    ]
+    ])
     
     model = None
     tokenizer = None
@@ -104,11 +108,11 @@ def main():
         sys.exit(1)
         
     # Configure Rank-8 LoRA targeting attention projections only (freeze MLPs)
-    print("Configuring Rank-8 LoRA (q_proj, v_proj, o_proj)...")
+    print("Configuring Rank-8 LoRA (q_proj, k_proj, v_proj, o_proj)...")
     model = FastLanguageModel.get_peft_model(
         model,
         r=8,
-        target_modules=["q_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_alpha=16,
         lora_dropout=0.0,
         bias="none",
@@ -227,14 +231,14 @@ def main():
         except TypeError:
             trainer = SFTTrainer(tokenizer=tokenizer, **sft_kwargs)
     
-    # Apply response-only loss masking
+    # Apply response-only loss masking with canonical Gemma 4 tokens
     try:
         trainer = train_on_responses_only(
             trainer,
-            instruction_part="<|turn>user\n",
-            response_part="<|turn>model\n",
+            instruction_part="<start_of_turn>user\n",
+            response_part="<start_of_turn>model\n",
         )
-        print("Successfully applied response-only loss masking on model turns.")
+        print("Successfully applied response-only loss masking on model turns (<start_of_turn>model).")
     except Exception as exc:
         print(f"Warning: Response-only loss masking fallback: {exc}")
         

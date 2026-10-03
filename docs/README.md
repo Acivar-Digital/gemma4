@@ -18,11 +18,6 @@
 | 8 | [08-eval-plan.md](08-eval-plan.md) | How we test: `swegemma eval --task-id` on 1–2 fastapi tasks, 50 calls / 30 min |
 | 9 | [09-roadmap.md](09-roadmap.md) | Theory → YAML draft → local test → iterate. Gates + approvals |
 
-## Ensemble status
-- Tried `opencode-ensemble` scout split (harness reader / baseline mapper / decisions checker).
-- Subagent backend failed: `Model unavailable: openrouter/google/gemini-3.5-flash-lite` ×3 → lead did direct recon (see docs 01–04). No code changed.
-- Next: fill docs 01–09 one by one, get approval, only then draft YAML.
-
 ## Key facts (locked v1, from AGENTS.md + recon today)
 - Metric: Resolution Rate. Phase 1 Container A (`/workspace`, `git add -N . && git diff HEAD`), Phase 2 Container B (fresh snapshot + `agent_patch` + `test_patch` + hermetic pytest, JUnit `exit_code==0`).
 - Submission = `agent.yaml` + `sub_agents/*.yaml` + `prompts/*.md` + `configs/*.yaml`, `!include` depth ≤10, no `..`, <3 GiB. No `agent.py`.

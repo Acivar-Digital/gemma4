@@ -36,3 +36,4 @@ Aim to understand, resolve, and submit the fix in the minimum number of tool cal
 - Do NOT spend turns running broad exploratory searches if the file path or symbol is obvious.
 - Do NOT refactor or reformat unrelated functions or files.
 - Do NOT conclude without submitting a non-empty patch (`patch_size > 0`). Every task requires concrete source modifications. Concluding that the codebase is already clean without making changes is an anti-pattern.
+- Never run shell commands or scripts that dump git logs, commit histories, or binary object stores. Keep all diagnostic expressions surgical, bounded, and focused strictly on the bug.

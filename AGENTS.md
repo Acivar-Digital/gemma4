@@ -220,21 +220,3 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 - If a required sync or push is blocked, stop and report the exact command and error.
 
 <!-- END BEADS INTEGRATION -->
-
-## OpenCode Ensemble Multi-Agent Roster
-
-This repository uses `@hueyexe/opencode-ensemble` for parallel subagent execution with isolated Git worktrees and real-time dashboard tracking on port 4747.
-
-Models are **decoupled from agent definitions** and configured dynamically via `.opencode/ensemble.json` or runtime `team_spawn` flags.
-
-### Current Active Mapping (Configurable in `ensemble.json`):
-
-| Role | Agent Mode | Worktree | Current Model | Gateway | Responsibilities |
-| :--- | :--- | :---: | :--- | :--- | :--- |
-| **Lead / Conductor** | root session | `false` | `lr-zn-rs/muse-spark-1.3-contributor-free` | LiteRouter (:7766) | Architecture, task breakdown, code review, merge, verification gates |
-| **Scout** | `explore` | `false` | `lr-or/thinkingmachines/inkling-small:free` | LiteRouter (:7766) | Codebase mapping, risk discovery, file ownership plan |
-| **Builder** | `build` | `true` | `agy-gemini/gemini-3.8-flash-high` | Antigravity (:8045) | High-speed, high-precision code implementation |
-| **QA** | `build` | `true` | `agy-gemini/gemini-pro-agent` | Antigravity (:8045) | Combinatorial testing, test fixtures, regression verification |
-| **Reviewer** | `explore` | `false` | `agy-claude/claude-opus-4-6-thinking` | Antigravity (:8045) | Diff review, security & edge-case audit before merge |
-
-*Note: You can switch models anytime by updating `.opencode/ensemble.json` or passing `model: "<new_model>"` in `team_spawn` without modifying agent files.*

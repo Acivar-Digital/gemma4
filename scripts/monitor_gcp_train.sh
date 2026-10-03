@@ -31,7 +31,7 @@ echo "================================="
 find_active_vm() {
     gcloud compute instances list \
         --project="${PROJECT}" \
-        --filter="name ~ gemma4-unsloth-g2- AND status = RUNNING" \
+        --filter="name ~ gemma4-unsloth- AND status = RUNNING" \
         --format="value(name,zone)" | head -n 1
 }
 
@@ -69,7 +69,10 @@ case "${MODE}" in
         ;;
 
     wait|-w|--wait)
-        echo "Monitoring training progress until adapter weights land in GCS..."
+        INTERVAL_SECONDS="${POLL_INTERVAL:-300}"
+        INTERVAL_MIN=$((INTERVAL_SECONDS / 60))
+        echo "Monitoring training progress every ${INTERVAL_MIN} minutes until adapter weights land in GCS..."
+        echo "Log file: /tmp/gemma4_gcp_monitor.log"
         ADAPTER_URI="gs://${BUCKET}/output/main_lora/adapter_model.safetensors"
         START_TIME=$(date +%s)
 
@@ -81,9 +84,9 @@ case "${MODE}" in
 
             # Check if adapter safetensors has landed in GCS
             if gcloud storage ls "${ADAPTER_URI}" >/dev/null 2>&1; then
-                echo ""
-                echo "[${TIMESTAMP}] 🎉 Adapter found in Cloud Storage!"
-                echo "Downloading to ${REPO_ROOT}/my_submission/adapters/main_lora/..."
+                echo "" | tee -a /tmp/gemma4_gcp_monitor.log
+                echo "[${TIMESTAMP}] 🎉 Adapter found in Cloud Storage!" | tee -a /tmp/gemma4_gcp_monitor.log
+                echo "Downloading to ${REPO_ROOT}/my_submission/adapters/main_lora/..." | tee -a /tmp/gemma4_gcp_monitor.log
                 
                 mkdir -p "${REPO_ROOT}/my_submission/adapters/main_lora"
                 gcloud storage cp -r "gs://${BUCKET}/output/main_lora/*" "${REPO_ROOT}/my_submission/adapters/main_lora/"
@@ -92,25 +95,26 @@ case "${MODE}" in
                 if [[ -f "${REPO_ROOT}/my_submission/adapters/main_lora/adapter_model.safetensors" ]]; then
                     SIZE_BYTES=$(wc -c < "${REPO_ROOT}/my_submission/adapters/main_lora/adapter_model.safetensors")
                     SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
-                    echo "✅ Download verified: adapter_model.safetensors (${SIZE_MB} MB)"
+                    echo "✅ Download verified: adapter_model.safetensors (${SIZE_MB} MB)" | tee -a /tmp/gemma4_gcp_monitor.log
 
-                    # Update agent.yaml with adapter reference if not present
-                    if ! grep -q "adapter: main_lora" "${REPO_ROOT}/my_submission/agent.yaml"; then
-                        echo "Mounting 'adapter: main_lora' in my_submission/agent.yaml..."
-                        sed -i '' 's/^model: gemma-4-31b-it-qat-w4a16-ct/model: gemma-4-31b-it-qat-w4a16-ct\nadapter: main_lora/' "${REPO_ROOT}/my_submission/agent.yaml"
-                    fi
-
-                    # Package submission_lora.zip
-                    echo "Packaging submission_lora.zip..."
-                    (cd "${REPO_ROOT}/my_submission" && zip -q -r "${REPO_ROOT}/submission_lora.zip" . -x "*.pyc" -x "__pycache__/*")
+                    # Stage candidate adapter in adapters_staging for 14-task verification
+                    mkdir -p "${REPO_ROOT}/adapters_staging/main_lora"
+                    cp -rf "${REPO_ROOT}/my_submission/adapters/main_lora/"* "${REPO_ROOT}/adapters_staging/main_lora/"
                     
-                    LORA_ZIP_SIZE=$(wc -c < "${REPO_ROOT}/submission_lora.zip")
-                    LORA_ZIP_MB=$((LORA_ZIP_SIZE / 1024 / 1024))
-                    echo "🏆 Packaged ${REPO_ROOT}/submission_lora.zip (${LORA_ZIP_MB} MB)"
-                    echo "Training and submission preparation COMPLETE."
+                    echo "🔒 PROMOTION GATE: Candidate adapter is staged in adapters_staging/main_lora/." | tee -a /tmp/gemma4_gcp_monitor.log
+                    echo "⚠️ Per .agents/skills/gcp-train/SKILL.md, DO NOT mount to active baseline until verified." | tee -a /tmp/gemma4_gcp_monitor.log
+                    echo "👉 Next Step: Run candidate evaluation on the 14-task gauntlet." | tee -a /tmp/gemma4_gcp_monitor.log
+                    echo "   Once resolution rate >= 43.4% is verified, mount via:" | tee -a /tmp/gemma4_gcp_monitor.log
+                    echo "   python3 -c \"
+with open('my_submission/agent.yaml', 'r') as f: content = f.read()
+if 'adapter: main_lora' not in content:
+    content = content.replace('model: gemma-4-31b-it-qat-w4a16-ct', 'model: gemma-4-31b-it-qat-w4a16-ct\\\\nadapter: main_lora')
+    with open('my_submission/agent.yaml', 'w') as f: f.write(content)
+\"" | tee -a /tmp/gemma4_gcp_monitor.log
+                    echo "Training harvest and verification staging COMPLETE." | tee -a /tmp/gemma4_gcp_monitor.log
                     exit 0
                 else
-                    echo "Error: adapter_model.safetensors missing from download!"
+                    echo "Error: adapter_model.safetensors missing from download!" | tee -a /tmp/gemma4_gcp_monitor.log
                     exit 1
                 fi
             fi
@@ -118,21 +122,21 @@ case "${MODE}" in
             # Check VM state
             ACTIVE_VM_INFO=$(find_active_vm)
             if [[ -z "${ACTIVE_VM_INFO}" ]]; then
-                echo ""
-                echo "[${TIMESTAMP}] ⚠️ VM has terminated, but adapter_model.safetensors was not found in GCS!"
-                echo "Fetching last 40 lines of serial console log for post-mortem diagnostics..."
+                echo "" | tee -a /tmp/gemma4_gcp_monitor.log
+                echo "[${TIMESTAMP}] ⚠️ VM has terminated, but adapter_model.safetensors was not found in GCS!" | tee -a /tmp/gemma4_gcp_monitor.log
+                echo "Fetching last 40 lines of serial console log for post-mortem diagnostics..." | tee -a /tmp/gemma4_gcp_monitor.log
                 LAST_VM=$(gcloud compute instances list --project="${PROJECT}" --sort-by="~creationTimestamp" --format="value(name,zone)" | head -n 1)
                 if [[ -n "${LAST_VM}" ]]; then
                     LAST_NAME=$(echo "${LAST_VM}" | awk '{print $1}')
                     LAST_ZONE=$(echo "${LAST_VM}" | awk '{print $2}')
-                    gcloud compute instances get-serial-port-output "${LAST_NAME}" --zone="${LAST_ZONE}" --project="${PROJECT}" | tail -n 40
+                    gcloud compute instances get-serial-port-output "${LAST_NAME}" --zone="${LAST_ZONE}" --project="${PROJECT}" | tail -n 40 | tee -a /tmp/gemma4_gcp_monitor.log
                 fi
                 exit 1
             fi
 
             VM_NAME=$(echo "${ACTIVE_VM_INFO}" | awk '{print $1}')
-            printf "\r[%s] Elapsed: %dm | VM: %s (RUNNING) | Waiting for adapter weights..." "${TIMESTAMP}" "${ELAPSED_MIN}" "${VM_NAME}"
-            sleep 30
+            echo "[${TIMESTAMP}] Elapsed: ${ELAPSED_MIN}m | VM: ${VM_NAME} (RUNNING) | Polling GCS every ${INTERVAL_MIN}m..." | tee -a /tmp/gemma4_gcp_monitor.log
+            sleep "${INTERVAL_SECONDS}"
         done
         ;;
 

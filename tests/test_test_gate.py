@@ -25,7 +25,7 @@ Verifies:
      revert instructions ('git checkout -- <file>') when test files are touched.
    - Untracked scratch file warning (repro.py, tmp*.py).
 6. Diff truncation safety:
-   - Massive diffs (>500 lines or >50KB) truncate cleanly after 500 lines,
+   - Massive diffs (>80 lines or >6KB) truncate cleanly after 80 lines,
      provide a file-by-file summary of changes, and show total lines added/removed.
 7. --status mode:
    - Empty diff patch block.
@@ -130,7 +130,7 @@ def test_cli_help_and_unknown_options():
         res = run_gate(flag)
         assert res.returncode == 0
         assert "Available Modes & Options:" in res.stdout
-        assert "Copy-Pasteable Examples:" in res.stdout
+        assert "Recommended Arguments:" in res.stdout
 
     # Unknown option should explain available options and exit 0
     res_unk = run_gate("--unknown-flag-xyz")
@@ -139,7 +139,7 @@ def test_cli_help_and_unknown_options():
     assert "--blast" in res_unk.stdout
     assert "--diff" in res_unk.stdout
     assert "--status" in res_unk.stdout
-    assert "python3 gate.py" in res_unk.stdout
+    assert "run_skill_script" in res_unk.stdout or "args:" in res_unk.stdout
     print("  ✓ Help and unknown flag diagnostics work cleanly with exit code 0.")
 
 
@@ -229,7 +229,7 @@ def test_blast_mode_regression_runner():
         assert res_clean.returncode == 0
         assert "No modified files detected in git working tree" in res_clean.stdout
         assert "pkg/calc.py" in res_clean.stdout
-        assert "Usage: python3 gate.py --blast" in res_clean.stdout
+        assert "--blast" in res_clean.stdout
 
         # 2. Modify source file with correct implementation -> tests pass
         calc_file = repo_path / "pkg" / "calc.py"
@@ -324,7 +324,7 @@ def test_diff_mode_and_forbidden_test_mutation():
 
 
 def test_diff_truncation_safety():
-    """Mandate 2: Diff truncation safety for massive diffs (>500 lines or >50KB)."""
+    """Mandate 2: Diff truncation safety for massive diffs (>80 lines or >6KB)."""
     print("[6/9] Testing diff truncation safety for massive diffs...")
     with tempfile.TemporaryDirectory() as tmp_dir:
         repo_path = pathlib.Path(tmp_dir)
@@ -341,13 +341,13 @@ def test_diff_truncation_safety():
 
         res = run_gate("--diff", cwd=repo_path, env=env)
         assert res.returncode == 0
-        assert "[DIFF TRUNCATED:" in res.stdout
-        assert "lines omitted to prevent LLM context blowout" in res.stdout
+        assert "[TRUNCATED: Diff preview exceeded 80 lines / 6KB ceiling" in res.stdout
+        assert "Use read_file to inspect individual modified files directly" in res.stdout
         assert "File-by-file summary of changes:" in res.stdout
         assert "Total changes:" in res.stdout
         assert "pkg/calc.py" in res.stdout
 
-    print("  ✓ Diff truncation safety verified (>500 lines truncated cleanly).")
+    print("  ✓ Diff truncation safety verified (>80 lines truncated cleanly).")
 
 
 def test_status_mode_readiness():
