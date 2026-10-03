@@ -50,3 +50,4 @@ checkpoints/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+gemma4-dev/gemma4-dev.code-workspace
