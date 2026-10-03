@@ -26,8 +26,15 @@ backups/
 kaggle.json
 *.token
 *.token.json
-.beads/
 asus_vpn/
+
+# Beads / Dolt files (standard bd pattern)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+gemma4-dev.code-workspace
 
 # Bytecode & Caches
 __pycache__/
@@ -43,11 +50,3 @@ env/
 test.txt
 checkpoints/
 *.bak
-
-# Beads / Dolt files (added by bd init)
-.dolt/
-*.db
-.beads-credential-key
-.beads/proxieddb/
-*.gate.lock*
-gemma4-dev/gemma4-dev.code-workspace

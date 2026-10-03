@@ -14,8 +14,9 @@ RED="\033[0;31m"
 MAGENTA="\033[0;35m"
 RESET="\033[0m"
 
-KERNEL_SLUG="francisclyap/gemma4-eval-40calls"
+KERNEL_SLUG="${2:-francisclyap/gemma4-canary-eval}"
 SUBMISSION_ZIP="submission.zip"
+OUTPUT_DIR="cloud_results/canary_test_results"
 
 print_header() {
     clear
@@ -99,15 +100,44 @@ run_once() {
     echo -e "${CYAN}======================================================================${RESET}"
 }
 
-watch_mode() {
+wait_mode() {
+    echo -e "${BOLD}${CYAN}Entering silent wait mode for kernel: ${KERNEL_SLUG}${RESET}"
+    echo -e "Waiting for completion without consuming LLM tokens..."
+    mkdir -p "${OUTPUT_DIR}"
+
+    local attempt=0
     while true; do
-        run_once
-        echo -e "\nPress [Ctrl+C] to exit watch mode. Refreshing in 30 seconds..."
-        sleep 30
+        attempt=$((attempt + 1))
+        local raw_status
+        raw_status=$(kaggle kernels status "${KERNEL_SLUG}" 2>&1 || true)
+        local timestamp
+        timestamp=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+        if [[ "${raw_status}" =~ COMPLETE ]]; then
+            echo -e "\n[${timestamp}] ${GREEN}${BOLD}Kernel ${KERNEL_SLUG} has COMPLETED successfully! 🏁${RESET}"
+            echo -e "Fetching kernel outputs to ${OUTPUT_DIR}..."
+            kaggle kernels output "${KERNEL_SLUG}" -p "${OUTPUT_DIR}" || true
+            echo -e "Outputs saved to ${OUTPUT_DIR}. Exiting wait mode."
+            return 0
+        elif [[ "${raw_status}" =~ ERROR|FAILED ]]; then
+            echo -e "\n[${timestamp}] ${RED}${BOLD}Kernel ${KERNEL_SLUG} encountered an ERROR or FAILED! 🔴${RESET}"
+            echo -e "Status: ${raw_status}"
+            echo -e "Attempting to fetch logs to ${OUTPUT_DIR}..."
+            kaggle kernels output "${KERNEL_SLUG}" -p "${OUTPUT_DIR}" || true
+            return 1
+        elif [[ "${raw_status}" =~ RUNNING ]]; then
+            echo -ne "\r[${timestamp}] Check #${attempt}: Still RUNNING... (sleeping 30s)    "
+            sleep 30
+        else
+            echo -ne "\r[${timestamp}] Check #${attempt}: ${raw_status} (sleeping 30s)    "
+            sleep 30
+        fi
     done
 }
 
-if [[ "${1:-}" == "--watch" || "${1:-}" == "-w" ]]; then
+if [[ "${1:-}" == "--wait" || "${1:-}" == "-wait" ]]; then
+    wait_mode
+elif [[ "${1:-}" == "--watch" || "${1:-}" == "-w" ]]; then
     watch_mode
 else
     run_once

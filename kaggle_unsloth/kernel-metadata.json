@@ -1,7 +1,7 @@
 {
-  "id": "francisclyap/gemma4-unsloth-lora-training",
-  "title": "gemma4-unsloth-lora-training",
-  "code_file": "train_gemma4_lora.ipynb",
+  "id": "francisclyap/gemma4-lora-minimal-thinking",
+  "title": "gemma4-lora-minimal-thinking",
+  "code_file": "train_gemma4_lora_minimal.ipynb",
   "language": "python",
   "kernel_type": "notebook",
   "is_private": true,
@@ -14,12 +14,11 @@
     "lora"
   ],
   "dataset_sources": [
+    "francisclyap/gemma4-unsloth-sft-dataset",
     "metric/gemma-4-developer-agent-wheelhouse"
   ],
   "kernel_sources": [],
-  "competition_sources": [
-    "gemma-4-developer-agent"
-  ],
+  "competition_sources": [],
   "model_sources": [
     "google/gemma-4/Other/gemma-4-31b-it-qat-w4a16-ct/2"
   ],

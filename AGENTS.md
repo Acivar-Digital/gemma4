@@ -18,7 +18,7 @@ Source of truth: `HARNESS_README.md` (671 lines). Read it before any design work
 - `graphs/` (127 .json), `embeddings/` (.npz), `snapshots/`, `wheels/`, `docker/`, `sandbox/`
 - `gemma-4-developer-agent/` — empty.
 - `my_submission/` — Active Track 1 baseline submission (declarative ADK agent with 5 pre-installed skills: `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`). Scored 56/129 (43.4%) in run_B39.
-- `submission.zip` — Packaged and verified competition submission archive.
+- `submission.zip` — Packaged and verified 221 KB competition submission archive.
 
 ## Canonical Architecture Source of Truth
 Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) for the final, locked architectural truth on:
@@ -36,6 +36,9 @@ Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) f
 - `bd` for all tracking. Non-interactive shell flags (`cp -f`, `mv -f`, `rm -f`, `rm -rf`).
 - Verify by reading files / running `swegemma eval --task-id ...`, never by guessing.
 - **CRITICAL EXECUTION PROTOCOL (bd `execution-protocol-only-start-sh`):** The user ONLY runs `./start.sh` to execute SWE-Gemma evaluations and tests. Agents must NEVER run evaluation runners directly, NEVER invoke `scripts/run_eval.py`, NEVER launch evaluations in tmux windows, and NEVER execute tests automatically. All test executions are initiated exclusively by the user running `./start.sh`.
+
+## Instructions
+- Run `bd prime` at the start of the session or after compact to refresh persist memories.
 
 ---
 

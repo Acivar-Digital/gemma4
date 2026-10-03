@@ -1,6 +1,0 @@
-# Optional participant evaluation configuration for Stage 1 inference.
-evaluation:
-  timeout_seconds: 60
-  max_tool_calls: 40
-  max_time_minutes: 4.5
-  max_turns: 100
