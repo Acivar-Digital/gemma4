@@ -2,10 +2,33 @@
 """Builds a self-contained Kaggle submission notebook for Gemma 4 Developer Agent.
 
 Embeds:
-1. The full my_submission directory (agent.yaml, configs/, prompts/, skills/)
+1. The full my_submission directory (agent.yaml, configs/, prompts/, skills/, adapters/)
 2. Fixes vLLM GPU memory utilization to 0.90 to eliminate cache block exhaustion on 4x L4
 3. Evaluates a sample smoke task to verify live vLLM inference and patch generation
 4. Packages and validates /kaggle/working/submission.zip (< 3 GiB, zero bytecode)
+
+Hardening pass. This builder must never emit a kernel that builds cleanly and then
+fails opaquely at run time, because "kernel built" and "model was weak" are
+indistinguishable from a score alone. Every pre-flight condition that can be
+checked without spending GPU quota is checked HERE, before the notebook is
+written, and aborts the build with an actionable message.
+
+Fail-loud policy for the generated kernel:
+  * the model directory must exist and look like a real model before vLLM starts;
+  * the served model, the model declared in agent.yaml, and the model the model
+    registry aliases must all be the same string;
+  * the adapter must exist on disk with its weight + config files before the
+    expensive build, and at run time again after the zip is unpacked;
+  * the inference endpoint is health-probed before the campaign starts and
+    re-probed before every task; an unhealthy endpoint aborts the campaign;
+  * any unexpected per-task exception aborts the campaign. Per-task resolution
+    failure is normal data; an exception is not.
+
+Deliberate exceptions to the fail-loud policy, each documented at its site:
+  * removing a broken cutlass .pth hook (OSError, line ~cell_0) -- the file is
+    already gone or unwritable, and the hook is cosmetic for this run;
+  * sandbox scratch-dir cleanup (OSError, cell_3 finally) -- best-effort disk
+    hygiene, must never mask the real task outcome.
 """
 
 import base64
@@ -19,10 +42,190 @@ SUBMISSION_DIR = ROOT_DIR / "my_submission"
 KERNEL_DIR = ROOT_DIR / "kaggle_kernel"
 KERNEL_DIR.mkdir(parents=True, exist_ok=True)
 
+# The served competition model. This string is policy/harness-defined and is the
+# single model the kernel targets. It is NOT re-read or duplicated here: the
+# generated kernel re-derives the model it serves from agent.yaml's `model:` key
+# and asserts that key against this constant, so agent.yaml can never drift
+# away from what the kernel actually starts.
+KERNEL_TARGET_MODEL = "gemma-4-31b-it-qat-w4a16-ct"
+
+# Adapter contract, mirroring scripts/gate_policy.yaml `adapter:`. The kernel
+# serves a real adapter now, so a missing/empty adapter is a hard build abort.
+ADAPTER_DIR_NAME = "adapters"
+ADAPTER_REQUIRED_FILES = ("adapter_config.json", "adapter_model.safetensors")
+
+
+def _fail(message: str) -> None:
+    """Abort the build loudly. Never returns."""
+    raise SystemExit(
+        "\n"
+        "================================================================\n"
+        "KERNEL BUILD ABORTED -- refusing to emit a kernel that would fail\n"
+        "silently at run time.\n"
+        "================================================================\n"
+        f"REASON: {message}\n"
+        "OPERATOR ACTION: fix the item above, then re-run this script.\n"
+        "================================================================\n"
+    )
+
+
+def _banner(title: str) -> None:
+    print("\n" + "=" * 70)
+    print(f"  {title}")
+    print("=" * 70)
+
+
+def _read_agent_yaml_model(agent_dir: Path) -> str:
+    """Return the `model:` value from agent.yaml without a YAML dependency.
+
+    agent.yaml is a flat scalar map plus `!include` tags, so a line scan is
+    sufficient and avoids adding PyYAML to the build host. The scan is strict:
+    anything ambiguous raises rather than guessing, because guessing here would
+    reintroduce exactly the silent-drift failure this pass removes.
+    """
+    agent_yaml = agent_dir / "agent.yaml"
+    if not agent_yaml.is_file():
+        _fail(f"{agent_yaml} is missing. The submission has no agent declaration.")
+    matches = []
+    for line in agent_yaml.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("model:") or stripped.startswith("#"):
+            continue
+        value = stripped.split(":", 1)[1].strip().strip("'\"")
+        if value:
+            matches.append(value)
+    if not matches:
+        _fail(f"{agent_yaml} declares no `model:` key. Cannot confirm the served model.")
+    unique = sorted(set(matches))
+    if len(unique) > 1:
+        _fail(f"{agent_yaml} declares conflicting `model:` values {unique}. Refusing to guess.")
+    return unique[0]
+
+
+def _preflight() -> dict:
+    """Validate everything cheap to check before writing any expensive artifact.
+
+    Returns a report dict that is echoed to the operator and interpolated into
+    the generated kernel, so the kernel and this build log cannot disagree.
+    """
+    _banner("KERNEL BUILD PRE-FLIGHT (no GPU quota spent)")
+
+    if not SUBMISSION_DIR.is_dir():
+        _fail(f"Submission directory {SUBMISSION_DIR} does not exist.")
+
+    # --- Which model? -------------------------------------------------
+    declared_model = _read_agent_yaml_model(SUBMISSION_DIR)
+    print(f"  served model (policy constant) : {KERNEL_TARGET_MODEL}")
+    print(f"  agent.yaml declared model      : {declared_model}")
+    if declared_model != KERNEL_TARGET_MODEL:
+        _fail(
+            "agent.yaml declares a different model than the kernel serves.\n"
+            f"    agent.yaml : {declared_model}\n"
+            f"    kernel     : {KERNEL_TARGET_MODEL}\n"
+            "  A kernel that serves model A against an agent built for model B "
+            "produces a garbage score that looks exactly like model weakness. "
+            "Fix agent.yaml (or the policy constant) before building."
+        )
+    print(f"  model agreement               : OK ({declared_model})")
+
+    # --- Which adapter? ------------------------------------------------
+    adapters_root = SUBMISSION_DIR / ADAPTER_DIR_NAME
+    declared_adapter = None
+    agent_yaml_text = (SUBMISSION_DIR / "agent.yaml").read_text(encoding="utf-8")
+    for line in agent_yaml_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("adapter:") and not stripped.startswith("#"):
+            declared_adapter = stripped.split(":", 1)[1].strip().strip("'\"")
+            break
+
+    if declared_adapter is None:
+        _fail(
+            "agent.yaml declares no `adapter:` key, but this builder always "
+            "mounts the real adapter.\n"
+            "  This kernel is the full-eval path and ships adapters/main_lora. "
+            "Silence here would mean the kernel silently serves base weights "
+            "only while looking identical in the log. Declare the adapter in "
+            "agent.yaml or use an explicitly adapter-less builder."
+        )
+    print(f"  declared adapter              : {declared_adapter}")
+
+    adapter_dir = adapters_root / declared_adapter
+    if not adapter_dir.is_dir():
+        _fail(
+            f"Adapter directory {adapter_dir} is missing.\n"
+            "  The submission declares an adapter but does not ship it. The "
+            "kernel would build and then serve base weights with no LoRA, "
+            "scoring near zero for a reason that has nothing to do with the "
+            "model's capability. Train/promote the adapter first."
+        )
+    missing = [name for name in ADAPTER_REQUIRED_FILES if not (adapter_dir / name).is_file()]
+    if missing:
+        _fail(
+            f"Adapter {adapter_dir} is incomplete; missing {missing}.\n"
+            "  adapter_config.json + adapter_model.safetensors are both "
+            "required. A zero-byte or truncated adapter is the failure class "
+            "that wastes a quota run, so it is checked here and again at run "
+            "time after the zip is unpacked."
+        )
+    empty = [
+        name
+        for name in ADAPTER_REQUIRED_FILES
+        if (adapter_dir / name).stat().st_size == 0
+    ]
+    if empty:
+        _fail(f"Adapter {adapter_dir} has empty file(s) {empty}. Refusing to build.")
+    adapter_bytes = (adapter_dir / "adapter_model.safetensors").stat().st_size
+    print(f"  adapter dir                   : {adapter_dir}")
+    print(f"  adapter weights               : {adapter_bytes:,} bytes")
+    print(f"  adapter files present         : OK {list(ADAPTER_REQUIRED_FILES)}")
+
+    print(f"\n  TARGET MODEL : {declared_model}")
+    print(f"  ADAPTER MOUNT: {declared_adapter} ({adapter_bytes:,} bytes of LoRA weights)")
+    print("  ABOUT TO DO  : rebuild submission.zip from my_submission/, embed it as")
+    print("                base64 into a 5-cell notebook, and write")
+    print("                kaggle_kernel/gemma4-eval-40calls.ipynb + kernel-metadata.json.")
+    print("                The kernel will health-probe the vLLM endpoint before the")
+    print("                campaign and before every task, and will abort rather than")
+    print("                report a score if the endpoint is dead.")
+
+    return {
+        "model": declared_model,
+        "adapter_name": declared_adapter,
+        "adapter_files": list(ADAPTER_REQUIRED_FILES),
+        "adapter_weights_bytes": adapter_bytes,
+    }
+
+
+PREFLIGHT = _preflight()
+
 # 1. Package clean my_submission into an in-memory zip
+# NOTE: make_archive is derived from the basename of the output prefix, so the
+# archive is always <prefix>.zip. Derive that name instead of assuming it.
 zip_path = ROOT_DIR / "submission.zip"
 if not zip_path.exists():
-    shutil.make_archive(str(ROOT_DIR / "submission"), "zip", root_dir=SUBMISSION_DIR)
+    archive_base = str(ROOT_DIR / "submission")
+    made = shutil.make_archive(archive_base, "zip", root_dir=SUBMISSION_DIR)
+    zip_path = Path(made)
+
+if not zip_path.is_file() or zip_path.stat().st_size == 0:
+    _fail(f"Packaged submission archive {zip_path} is missing or empty.")
+
+# Verify the archive actually contains the adapter we just validated. An archive
+# built from a stale tree is the classic way a "real" adapter silently vanishes.
+with zipfile.ZipFile(zip_path) as archive:
+    names = set(archive.namelist())
+adapter_prefix = f"{ADAPTER_DIR_NAME}/{PREFLIGHT['adapter_name']}/"
+absent = [
+    name for name in PREFLIGHT["adapter_files"] if adapter_prefix + name not in names
+]
+if absent:
+    _fail(
+        f"{zip_path} does not contain {adapter_prefix}{absent}.\n"
+        f"  The archive is stale relative to {SUBMISSION_DIR}. Delete "
+        f"{zip_path.name} and re-run so the archive is rebuilt from the "
+        "current tree; the kernel would otherwise serve without the adapter."
+    )
+print(f"Adapter present in {zip_path.name}: {adapter_prefix}{PREFLIGHT['adapter_files']}")
 
 b64_zip = base64.b64encode(zip_path.read_bytes()).decode("ascii")
 print(f"Embedded submission.zip base64 payload: {len(b64_zip)} chars")
@@ -66,8 +269,17 @@ for pth_pattern in (
     for pth in glob.glob(pth_pattern):
         try:
             os.unlink(pth)
-        except OSError:
-            pass
+        except OSError as hook_error:
+            # SPECIFIC, DELIBERATE TOLERANCE. The only OSError conditions
+            # reachable here are FileNotFoundError (another glob match or a
+            # previous cell already removed it -- success either way) and
+            # PermissionError on a read-only dist-packages layer. In the second
+            # case the hook stays, which degrades to the same behaviour the
+            # pre-existing code tolerated, and the cell continues. This is NOT
+            # a swallow-all: the handler names OSError, does not catch
+            # Exception/BaseException, and logs what it did not remove so the
+            # condition is visible in the log rather than invisible.
+            print(f'WARNING: could not remove cutlass .pth hook {pth}: {hook_error!r}')
 
 # Restore PEP 440 '+cu128' wheel filenames stripped by Kaggle dataset uploads
 tmp_whl = Path('/tmp/wheelhouse')
@@ -127,6 +339,24 @@ for root, dirs, files in os.walk(AGENT_DIR):
         if d == '__pycache__':
             shutil.rmtree(os.path.join(root, d))
 
+# FAIL LOUD: the adapter must be on disk AFTER unpacking, not just at build time.
+# A truncated base64 payload, a stale archive, or a bad zip layout would
+# otherwise produce a kernel that starts vLLM with LoRA disabled and reports a
+# low score that is indistinguishable from model weakness.
+ADAPTER_NAME = '{PREFLIGHT['adapter_name']}'
+ADAPTER_DIR = AGENT_DIR / 'adapters' / ADAPTER_NAME
+assert ADAPTER_DIR.is_dir(), (
+    f'ADAPTER MISSING: {{ADAPTER_DIR}} does not exist after unpacking. The kernel '
+    'will NOT score the model you think it is scoring. Do not continue.'
+)
+for _required in {PREFLIGHT['adapter_files']!r}:
+    _p = ADAPTER_DIR / _required
+    assert _p.is_file() and _p.stat().st_size > 0, (
+        f'ADAPTER INCOMPLETE: {{_p}} missing or zero bytes. Aborting before vLLM starts.'
+    )
+print('ADAPTER VERIFIED ON DISK:', ADAPTER_DIR,
+      sorted(p.name for p in ADAPTER_DIR.iterdir() if p.is_file()))
+
 TASKS_PATH = DATA_DIR / 'tasks.jsonl'
 tasks = load_tasks(TASKS_PATH)
 GRAPH_DIR = str(DATA_DIR / 'graphs')
@@ -139,31 +369,103 @@ for p in sorted(AGENT_DIR.rglob('*')):
         print(f'  - {{p.relative_to(AGENT_DIR)}} ({{p.stat().st_size}} bytes)')
 """
 
-cell_2_vllm = """import litellm
+cell_2_vllm = f"""import json
+import queue
+import threading
+import time
+import urllib.request
+
+import litellm
 import torch
 from pathlib import Path
 from adk_submission import VllmConfig, VllmServer, discover_adapters
 from swegemma.config import ALLOWED_ADAPTER_EXTENSIONS
 from swegemma.models.discovery import validate_single_declared_model
 
-litellm.drop_params = True
+# ---------------------------------------------------------------- banner ----
+# An operator reading only the log must never be misled about what is running.
+print('=' * 78)
+print(f'  TARGET MODEL : {PREFLIGHT["model"]}')
+print(f'  ADAPTER      : {PREFLIGHT["adapter_name"]} '
+      f'({PREFLIGHT["adapter_weights_bytes"]:,} bytes)')
+print(f'  ADAPTER MOUNT: enabled -- vLLM will serve this LoRA on top of the base model.')
+print('  ABOUT TO DO  : start vLLM on port 8000, health-probe /health and')
+print('                /v1/chat/completions, and only then evaluate all tasks.')
+print('  ON FAILURE   : this kernel ABORTS with a named error. It never reports a')
+print('                score for a run it could not actually serve.')
+print('=' * 78)
 
-TARGET_MODEL_NAME = 'gemma-4-31b-it-qat-w4a16-ct'
-_MP = Path('/kaggle/input/models/google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2')
-if not _MP.exists():
-    _f = sorted(Path('/kaggle/input').rglob('gemma-4-31b-it-qat-w4a16-ct'))
-    print('model fallback search:', _f[:3])
-    _MP = _f[0] if _f else _MP
-MODEL_PATH = _MP
-print('USING MODEL:', MODEL_PATH, MODEL_PATH.exists())
+# ------------------------------------------------- litellm.drop_params ------
+# This line used to be a bare attribute assignment, which fails INVISIBLY in
+# two ways: (1) if the imported litellm has no `drop_params` attribute, Python
+# happily creates one on the module and litellm keeps RAISING on unsupported
+# params -- every inference call then fails far away from this line; (2) if the
+# litellm in the wheelhouse moved the flag, it is set on an object nobody reads.
+# So: set it, then read it back and fail loudly if it did not take.
+litellm.drop_params = True
+assert getattr(litellm, 'drop_params', None) is True, (
+    'litellm.drop_params did not take effect: litellm will raise on '
+    'unsupported params and every model call will fail far from this line. '
+    'Abort instead of scoring 0 on a routing error.'
+)
+print('litellm.drop_params verified True (unsupported params will be dropped, not raised).')
+
+# -------------------------------------------------- model path validation ---
+# Used to be: `if not _MP.exists(): search ... ; _MP = _f[0] if _f else _MP`
+# followed by a print of MODEL_PATH.exists(). That print was cosmetic: if the
+# search found nothing, the ORIGINAL non-existent path was kept, vLLM was asked
+# to load it, and the failure surfaced as an opaque serving error at run time.
+# Now the path is a hard precondition and the search result is asserted.
+TARGET_MODEL_NAME = '{PREFLIGHT["model"]}'
+MODEL_WEIGHTS_MARKERS = ('config.json',)
+_canonical = Path('/kaggle/input/models/google/gemma-4/other/{PREFLIGHT["model"]}/2')
+if not _canonical.is_dir():
+    _found = sorted(
+        p for p in Path('/kaggle/input').rglob('{PREFLIGHT["model"]}')
+        if p.is_dir() and (p / 'config.json').is_file()
+    )
+    if not _found:
+        raise SystemExit(
+            f'MODEL NOT FOUND: {{_canonical}} is absent and no directory containing '
+            f'config.json was found for {{TARGET_MODEL_NAME!r}} under /kaggle/input.\\n'
+            '  Attach the google/gemma-4 model to the kernel and re-run. Serving '
+            'without it cannot produce a valid score.'
+        )
+    print('model fallback search:', [str(p) for p in _found[:3]])
+    _canonical = _found[0]
+
+MODEL_PATH = _canonical
+assert MODEL_PATH.is_dir(), f'MODEL PATH NOT A DIRECTORY: {{MODEL_PATH}}'
+for _marker in MODEL_WEIGHTS_MARKERS:
+    assert (MODEL_PATH / _marker).is_file(), (
+        f'MODEL WEIGHTS INCOMPLETE: {{MODEL_PATH / _marker}} is missing. '
+        'vLLM cannot load this model; abort rather than serve nothing.'
+    )
+print('USING MODEL:', MODEL_PATH, '| exists:', MODEL_PATH.exists(), '| config.json: OK')
+
 INFERENCE_API_KEY = 'EMPTY'
 
 declared_model = validate_single_declared_model(AGENT_DIR)
+assert declared_model == TARGET_MODEL_NAME, (
+    f'MODEL MISMATCH: agent.yaml declares {{declared_model!r}} but this kernel '
+    f'serves {{TARGET_MODEL_NAME!r}}. The agent would be scored against weights '
+    'it was not built for. Aborting.'
+)
+print('agent.yaml model matches served model:', declared_model)
+
 adapters = discover_adapters(str(AGENT_DIR), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS)
+# FAIL LOUD: we validated a real adapter at build time, so a silent empty
+# manifest at run time means the unpack diverged from what we validated.
+assert adapters, (
+    'NO ADAPTERS DISCOVERED at run time, but this kernel was built to mount '
+    f'{PREFLIGHT["adapter_name"]}. vLLM would serve base weights only and '
+    'the resulting score would be a serving artefact, not a model result.'
+)
+print('ADAPTERS DISCOVERED:', adapters)
 
 gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
 tp_size = 4 if gpu_count >= 4 else (2 if gpu_count >= 2 else 1)
-print(f'Detected GPUs: {gpu_count}, Tensor Parallel Size: {tp_size}')
+print(f'Detected GPUs: {{gpu_count}}, Tensor Parallel Size: {{tp_size}}')
 
 # Configure vLLM with 0.90 memory utilization (official starter recommendation)
 # to guarantee sufficient KV cache memory blocks for 32,768 context length
@@ -183,9 +485,10 @@ vllm_cfg = VllmConfig(
     tensor_parallel_size=tp_size,
     startup_timeout=60 * 20,
 )
+assert vllm_cfg.enable_lora, 'vLLM LoRA is disabled despite a discovered adapter manifest.'
 server_instance = VllmServer(vllm_cfg, adapter_manifest=adapters)
 server_instance.start()
-print(f'vLLM server started on {server_instance.base_url} (tp={tp_size})')
+print(f'vLLM server started on {{server_instance.base_url}} (tp={{tp_size}})')
 
 models = server_instance.create_model_registry(
     aliases=[declared_model, TARGET_MODEL_NAME],
@@ -193,6 +496,104 @@ models = server_instance.create_model_registry(
     api_key=INFERENCE_API_KEY,
 )
 print('Model registry created successfully.')
+
+# ------------------------------------------------------- run-health gate ----
+# ADAPTED from the known-good prior art at
+# docs/gemma-and-the-shape-of-doubt.md:2818 (SAMPLING_HEALTH_RUNNER), whose
+# docstring is: 'Hash-pinned V14 evaluation with a separate inference health
+# gate per task. The gate runs before the task timer and never enters agent
+# history. It stops the campaign on infrastructure failure; it does not retry
+# or change a patch.'
+#
+# Reused VERBATIM in shape: the /health + /v1/chat/completions '2+2 -> 4'
+# probe, the daemon-thread absolute wall deadline, and EndpointUnhealthy as a
+# BaseException subclass so the campaign abort escapes ordinary per-task
+# `except Exception` handling. Deliberately NOT reused: install_health_gate(),
+# which monkeypatches a V14-specific runner module's progress() and reads a
+# V14-specific argparse Namespace (args.run_root, args.port) that does not
+# exist here. Those two lines are the only V14-bound parts of the prior art.
+#
+# Purpose: a kernel that builds and serves a DEAD endpoint currently looks
+# identical to a kernel serving a weak model. The last real run scored 0/129
+# with 77/95 traces at zero completion tokens -- exactly this confusion. This
+# gate makes dead-serving loud.
+class EndpointUnhealthy(BaseException):
+    \"\"\"Campaign abort, deliberately outside ordinary per-task error handling.\"\"\"
+
+
+def _probe_endpoint(base, *, timeout=20):
+    started = time.monotonic()
+    with urllib.request.urlopen(base + '/health', timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError('Health endpoint did not return 200')
+    payload = {{'model': TARGET_MODEL_NAME, 'temperature': 0, 'max_tokens': 8,
+               'chat_template_kwargs': {{'enable_thinking': False}},
+               'messages': [{{'role': 'user', 'content': 'What is 2+2? Reply with only the integer.'}}]}}
+    request = urllib.request.Request(base + '/v1/chat/completions',
+        data=json.dumps(payload).encode(), headers={{'Content-Type': 'application/json'}})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = response.read(65537)
+        if len(data) > 65536:
+            raise RuntimeError('Probe response exceeded 64 KiB')
+    document = json.loads(data)
+    if (document['choices'][0]['message'].get('content') or '').strip() != '4':
+        raise RuntimeError('Inference probe did not return 4')
+    return {{'status': 'PASS', 'elapsed_seconds': round(time.monotonic() - started, 3),
+            'usage': document.get('usage'), 'response_sha256': __import__('hashlib').sha256(data).hexdigest()}}
+
+
+def probe_endpoint(base, *, timeout=20, wall_timeout=40):
+    # Socket timeouts alone do not bound a slow-drip response. A daemon worker
+    # gives the gate one absolute deadline; a missed deadline aborts the run.
+    result = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            result.put((True, _probe_endpoint(base, timeout=timeout)))
+        except BaseException as error:
+            result.put((False, error))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    try:
+        passed, value = result.get(timeout=wall_timeout)
+    except queue.Empty as error:
+        raise TimeoutError('Inference health gate exceeded its absolute wall deadline') from error
+    if not passed:
+        raise value
+    return value
+
+
+INFERENCE_BASE_URL = 'http://127.0.0.1:8000'
+HEALTH_LOG_PATH = WORKING_DIR / 'endpoint_health.jsonl'
+
+
+def require_healthy_endpoint(context):
+    \"\"\"Probe the endpoint or abort the whole campaign. Never enters agent history.\"\"\"
+    row = {{'context': context, 'kind': 'VALIDATION_ONLY_INFERENCE_PROBE',
+           'enters_agent_history': False}}
+    try:
+        row.update(probe_endpoint(INFERENCE_BASE_URL))
+    except Exception as error:
+        row.update(status='HOLD', error=repr(error))
+        with HEALTH_LOG_PATH.open('a') as stream:
+            stream.write(json.dumps(row, sort_keys=True) + '\\n')
+        raise EndpointUnhealthy(
+            'INFERENCE ENDPOINT DEAD before ' + context + ': ' + repr(error) + '\\n'
+            '  The kernel built and vLLM started, but the model is not being '
+            'served. Every task below would score 0 for an infrastructure '
+            'reason. STOP: read the vLLM log above for the load error, fix it, '
+            'and re-run. This run is void.'
+        ) from error
+    with HEALTH_LOG_PATH.open('a') as stream:
+        stream.write(json.dumps(row, sort_keys=True) + '\\n')
+    print(f'  endpoint health ({{context}}): {{row[\"status\"]}} '
+          f'in {{row[\"elapsed_seconds\"]}}s usage={{row.get(\"usage\")}}', flush=True)
+    return row
+
+
+require_healthy_endpoint('pre_campaign')
+print('Pre-campaign endpoint health: PASS. The campaign may proceed.')
 """
 
 cell_3_eval = """import asyncio
@@ -251,12 +652,31 @@ evaluator = Evaluator(eval_config)
 
 resolved_count = 0
 total_evaluated = 0
+zero_token_tasks = []
 predictions = []
 
 print(f"Starting evaluation across all {len(tasks)} tasks on Kaggle 4x L4 GPUs...", flush=True)
+print(f"Model under test: {TARGET_MODEL_NAME} | adapter: {ADAPTER_NAME}", flush=True)
+
+# Degenerate-run detector. The previous real run scored 0/129 with 77/95 traces
+# at ZERO completion tokens -- an infrastructure failure that looked exactly like
+# model weakness. This threshold makes that class of run impossible to mistake
+# for a genuine weak-model result. See also require_healthy_endpoint() in the
+# serving cell, which catches the same failure earlier and more precisely.
+DEGENERATE_PATCH_CHARS = 200
+DEGENERATE_FRACTION = 0.9
 
 for idx, task in enumerate(tasks, start=1):
     print(f"[{idx}/{len(tasks)}] Evaluating {task.instance_id} ({task.repo})...", flush=True)
+
+    # Run-health gate before the task timer, per the prior art
+    # (docs/gemma-and-the-shape-of-doubt.md:2818): 'The gate runs before the task
+    # timer and never enters agent history. It stops the campaign on
+    # infrastructure failure; it does not retry or change a patch.'
+    # EndpointUnhealthy subclasses BaseException, so it deliberately escapes the
+    # `except Exception` below and aborts the campaign.
+    require_healthy_endpoint(f'pre_task:{task.instance_id}')
+
     try:
         result = run_sync(evaluator.evaluate_task, task=task, task_index=idx, total_tasks=len(tasks))
         is_resolved = bool(result.resolved)
@@ -264,6 +684,7 @@ for idx, task in enumerate(tasks, start=1):
             resolved_count += 1
         total_evaluated += 1
 
+        patch_text = result.agent_patch or ""
         record = {
             "task_id": task.instance_id,
             "repo": task.repo,
@@ -271,10 +692,13 @@ for idx, task in enumerate(tasks, start=1):
             "test_exit_code": result.test_exit_code,
             "tool_calls": result.tool_calls,
             "duration_seconds": round(result.duration_seconds, 2),
-            "patch_length": len(result.agent_patch or ""),
-            "patch": result.agent_patch or "",
+            "patch_length": len(patch_text),
+            "patch": patch_text,
         }
-        predictions.append({"id": task.instance_id, "prediction": result.agent_patch or ""})
+        predictions.append({"id": task.instance_id, "prediction": patch_text})
+
+        if len(patch_text) < DEGENERATE_PATCH_CHARS:
+            zero_token_tasks.append(task.instance_id)
 
         # Guardrail 1: Incremental flush to JSONL after every task
         with open(JSONL_PATH, "a", encoding="utf-8") as jf:
@@ -285,16 +709,71 @@ for idx, task in enumerate(tasks, start=1):
             f"exit={result.test_exit_code}, patch={record['patch_length']}ch, calls={result.tool_calls}, {result.duration_seconds:.1f}s",
             flush=True
         )
-    except Exception as e:
-        print(f"  -> ERROR evaluating {task.instance_id}: {e}", flush=True)
-        predictions.append({"id": task.instance_id, "prediction": ""})
+    except EndpointUnhealthy:
+        # Infrastructure failure. Re-raise: the campaign is void, and continuing
+        # would produce a 0-score that is indistinguishable from model weakness.
+        raise
+    except Exception as error:
+        # FAIL LOUD. This handler used to print the error, append an empty
+        # prediction, and continue to the next task -- so a run in which every
+        # task raised produced a clean "EVALUATION COMPLETE / Final Score:
+        # 0.00%" line, indistinguishable from a model that is simply weak. That
+        # is precisely the confusion this gate system exists to eliminate, and
+        # it is what burned the last quota. The partial results already written
+        # to task_results.jsonl are preserved for diagnosis, then the campaign
+        # aborts with a named error.
+        with open(JSONL_PATH, "a", encoding="utf-8") as jf:
+            jf.write(json.dumps({
+                "task_id": task.instance_id,
+                "repo": task.repo,
+                "resolved": False,
+                "error": repr(error),
+                "aborted": True,
+            }) + "\\n")
+        raise SystemExit(
+            f'\\nEVALUATION ABORTED at task {idx}/{len(tasks)} ({task.instance_id}): {error!r}\\n'
+            '  An unexpected exception is NOT a task-level result; it is a bug or '
+            'an infrastructure fault. Continuing would emit an empty prediction '
+            'and finish with a 0-score that cannot be distinguished from model '
+            f'weakness. Partial per-task results are preserved at {JSONL_PATH}. '
+            'Fix the cause and re-run.'
+        ) from error
     finally:
         # Guardrail 2: Clean up temporary sandbox venvs to prevent disk overflow
         for sb_dir in Path("/tmp").glob("swegemma_sandbox_*"):
             try:
                 shutil.rmtree(sb_dir, ignore_errors=True)
-            except Exception:
-                pass
+            except OSError as cleanup_error:
+                # SPECIFIC, DELIBERATE TOLERANCE. This is best-effort disk
+                # hygiene running in a finally block: rmtree(ignore_errors=True)
+                # already suppresses per-file errors, so the only escape here is
+                # an OSError on the directory entry itself. Raising from a
+                # finally would MASK the real task outcome, which is the one
+                # thing this block must not do. The error is named and printed
+                # so a disk-overflow failure is still visible in the log.
+                print(f"WARNING: sandbox cleanup failed for {sb_dir}: {cleanup_error!r}", flush=True)
+
+# Post-campaign degenerate-run assertion: a run in which almost every task
+# produced no patch is an infra failure, not a model result. Refuse to print a
+# headline score for it.
+if total_evaluated:
+    degenerate_fraction = len(zero_token_tasks) / total_evaluated
+    print(
+        f"\\nDegenerate-run check: {len(zero_token_tasks)}/{total_evaluated} tasks "
+        f"produced < {DEGENERATE_PATCH_CHARS} patch chars ({degenerate_fraction:.1%}).",
+        flush=True,
+    )
+    if degenerate_fraction >= DEGENERATE_FRACTION:
+        raise SystemExit(
+            f'\\nEVALUATION ABORTED: degenerate run -- {degenerate_fraction:.1%} of '
+            f'{total_evaluated} tasks produced essentially no patch '
+            f'(first few: {zero_token_tasks[:5]}).\\n'
+            '  This is the signature of the previous 0/129 run (77/95 traces at '
+            'zero completion tokens): the model is not being served, or every '
+            'generation is empty. It is NOT evidence of model weakness. Do not '
+            f'read the score as one. Per-task results: {JSONL_PATH}; endpoint '
+            f'health log: {HEALTH_LOG_PATH}.'
+        )
 
 print(f"\\n=================== EVALUATION COMPLETE ===================", flush=True)
 print(f"Final Score: {resolved_count}/{total_evaluated} ({resolved_count/max(1, total_evaluated)*100:.2f}%)", flush=True)
@@ -407,6 +886,31 @@ out_nb = KERNEL_DIR / "gemma4-eval-40calls.ipynb"
 out_nb.write_text(json.dumps(notebook, indent=1), encoding="utf-8")
 print(f"Wrote notebook to {out_nb} ({out_nb.stat().st_size} bytes)")
 
+# Post-write self-check: re-open what was actually serialized and confirm the
+# hardening survived the JSON round-trip. Cheap, and it closes the gap where an
+# f-string interpolation silently dropped a guard.
+_emitted = json.loads(out_nb.read_text(encoding="utf-8"))
+_emitted_cells = "\n".join(
+    "".join(cell["source"]) for cell in _emitted["cells"] if cell["cell_type"] == "code"
+)
+for _required_marker, _why in (
+    ("MODEL NOT FOUND", "model-path precondition"),
+    ("ADAPTER INCOMPLETE", "run-time adapter precondition"),
+    ("NO ADAPTERS DISCOVERED", "run-time adapter precondition"),
+    ("litellm.drop_params did not take effect", "drop_params verification"),
+    ("INFERENCE ENDPOINT DEAD", "run-health gate"),
+    ("EVALUATION ABORTED at task", "per-task fail-loud handler"),
+    ("degenerate run", "degenerate-run detector"),
+    (PREFLIGHT["adapter_name"], "adapter identity"),
+):
+    if _required_marker not in _emitted_cells:
+        _fail(
+            f"Emitted notebook is missing the '{_why}' guard "
+            f"(marker {_required_marker!r} absent). Refusing to ship a kernel "
+            "that would fail silently."
+        )
+print(f"Emitted-notebook self-check: all {len(_emitted['cells'])} cells carry their guards.")
+
 # 3. Write kernel-metadata.json
 metadata = {
     "id": "francisclyap/gemma4-eval-40calls",
@@ -425,6 +929,30 @@ metadata = {
     "model_sources": ["google/gemma-4/Other/gemma-4-31b-it-qat-w4a16-ct/2"],
     "machine_shape": "NvidiaL4",
 }
+# The Kaggle model-source slug embeds the model name as a path segment. Assert it
+# still agrees with the policy constant so the attached model and the served
+# model can never drift apart unnoticed.
+_model_sources = metadata["model_sources"]
+assert len(_model_sources) == 1 and f"/{PREFLIGHT['model']}/" in _model_sources[0], (
+    f"kernel-metadata model_sources {_model_sources} does not pin "
+    f"{PREFLIGHT['model']!r}. The kernel would attach a different model than it "
+    "serves. Fix the slug and re-run."
+)
 out_meta = KERNEL_DIR / "kernel-metadata.json"
 out_meta.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 print(f"Wrote metadata to {out_meta}")
+
+_banner("KERNEL BUILT -- WHAT IS IN THE BOX")
+print(f"  notebook     : {out_nb}")
+print(f"  metadata     : {out_meta}")
+print(f"  target model : {PREFLIGHT['model']}")
+print(f"  adapter      : {PREFLIGHT['adapter_name']} "
+      f"({PREFLIGHT['adapter_weights_bytes']:,} bytes) -- MOUNTED")
+print(f"  eval scope   : all tasks from the competition tasks.jsonl, 4x L4")
+print("  fail-loud    : model path, adapter presence, litellm.drop_params,")
+print("                 per-task endpoint health, per-task exceptions, and a")
+print("                 degenerate-run check all abort the kernel with a named")
+print("                 error instead of emitting a 0-score.")
+print("  NEXT STEP    : this script only BUILDS the kernel. It does not run it")
+print("                 and spends no GPU quota. To execute the evaluation the")
+print("                 operator runs ./start.sh.")
