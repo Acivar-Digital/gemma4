@@ -1,0 +1,9 @@
+{
+  "title": "Gemma 4 Unsloth SFT Multi-Turn Trajectories",
+  "id": "francisclyap/gemma4-unsloth-sft-dataset",
+  "licenses": [
+    {
+      "name": "apache-2.0"
+    }
+  ]
+}

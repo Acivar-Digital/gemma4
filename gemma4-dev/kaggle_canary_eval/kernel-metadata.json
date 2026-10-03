@@ -1,0 +1,26 @@
+{
+  "id": "francisclyap/gemma4-canary-eval",
+  "title": "gemma4-canary-eval",
+  "code_file": "canary_eval.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "keywords": [
+    "gpu"
+  ],
+  "dataset_sources": [
+    "metric/gemma-4-developer-agent-wheelhouse",
+    "francisclyap/gemma4-lora-adapter"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "gemma-4-developer-agent"
+  ],
+  "model_sources": [
+    "google/gemma-4/Other/gemma-4-31b-it-qat-w4a16-ct/2"
+  ],
+  "machine_shape": "NvidiaL4"
+}

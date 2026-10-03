@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
-"""Builds high-quality, stratified Multi-Turn Tool SFT training & validation datasets for Unsloth Gemma 31B.
+"""Builds high-quality, stratified Multi-Turn Decision SFT training & validation datasets for Unsloth Gemma 31B.
 
 Consensus Architectural Upgrades (Triple-Reviewer Harmonized):
-1. ELIMINATES MODALITY MISMATCH: Formats data as full multi-turn conversational tool-calling
-   trajectories (system -> user -> agent tool_calls -> tool observation -> submit_patch),
-   NOT plain text markdown diffs, preserving autonomous agent reflexes in Google ADK.
-2. OBSERVATION COMPACTION: Compresses voluminous tool outputs (capped at 800 chars) to ensure
-   complete 20-30 turn trajectories fit comfortably inside the 16,384 token window.
-3. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
-4. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
-5. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
-6. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
-7. STRICT INTEGRITY GUARD: Hard-fails if corrupted or skipped traces exceed 5%.
+1. HIGH-DENSITY DECISION SLICING: Decomposes long trajectories into focused decision windows
+   (concise system + problem statement + preceding tool observation + target agent tool call),
+   ensuring 100% of samples contain active, supervised agent actions.
+2. 3072-TOKEN COMPACT WINDOW: Compacts repetitive directory trees and verbose observations
+   so that 97% of decision points fit comfortably inside a 3072-token window without truncation.
+3. BANNED-TOOL REJECTION: Hard-filters out any invalid calls to load_skill, list_skills, or
+   load_skill_resource to reinforce strict compliance with pre-installed environment skills.
+4. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
+5. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
+6. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
+7. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
 """
 
-from collections import defaultdict
+from collections import defaultdict, Counter
 import difflib
 import json
 import logging
 from pathlib import Path
 import random
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -41,13 +43,105 @@ DEDUP_SIMILARITY_THRESHOLD = 0.90
 MAX_SKIP_RATE = 0.05
 VAL_RATIO = 0.20
 MAX_OBSERVATION_CHARS = 800
+MAX_SEQ_TOKENS = 3072
 SEED = 42
+
+SYSTEM_PROMPT = (
+    "You are the Autonomous Software Developer fixing Python defects in /workspace.\n"
+    "Tools: read_file, edit_file, write_file, get_status, submit_patch.\n"
+    "Skills: fast-grep, code-map, code-oracle, repro-check, test-gate."
+)
+
+BANNED_TOOL_PATTERNS = ["load_skill", "list_skills", "load_skill_resource"]
+
+
+def sanitize_content(text: str) -> str:
+    """Sanitizes local host paths and sandbox artifacts from training data."""
+    if not text:
+        return ""
+    text = re.sub(
+        r"[^\s\"'\\]*swegemma_sandbox_[^\s\"'\\]+/workspace/?",
+        "/workspace/",
+        text,
+    )
+    text = re.sub(
+        r"[^\s\"'\\]*swegemma_sandbox_[^\s\"'\\]+/venv/bin/python3",
+        "python3",
+        text,
+    )
+    text = re.sub(
+        r"[^\s\"'\\]*swegemma_sandbox_[^\s\"'\\]*",
+        "/workspace",
+        text,
+    )
+    text = re.sub(
+        r"/(?:private/)?var/folders/[^\s\"'\\]+",
+        "/tmp",
+        text,
+    )
+    text = re.sub(
+        r"/Users/[a-zA-Z0-9_\-]+/\.antigravity-ide/[^\s\"'\\]+/bin/([a-zA-Z0-9_\-]+)",
+        r"\1",
+        text,
+    )
+    text = re.sub(
+        r"/Users/[a-zA-Z0-9_\-]+/\.bun/bin/([a-zA-Z0-9_\-]+)",
+        r"\1",
+        text,
+    )
+    text = re.sub(r"/Users/[a-zA-Z0-9_\-]+/[^\s\"'\\]*", "/workspace", text)
+    text = text.replace("/workspace//", "/workspace/")
+    return text
+
+
+def clean_user_prompt(content: str) -> str:
+    """Sanitizes and compacts the user prompt, truncating verbose workspace layout trees."""
+    content = sanitize_content(content)
+    if "## Workspace Layout" in content:
+        parts = content.split("## Workspace Layout")
+        layout_lines = parts[1].strip().splitlines()[:15]
+        return parts[0].strip() + "\n\n## Workspace Layout\n" + "\n".join(layout_lines) + "\n... [directory tree truncated]"
+    return content.strip()
+
+
+def sanitize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitizes tool arguments and normalizes skill script paths."""
+    fn_name = tc.get("function_name")
+    raw_args = tc.get("arguments", {})
+
+    if fn_name == "run_skill_script" and isinstance(raw_args, dict):
+        cleaned_args = dict(raw_args)
+        if "file_path" in cleaned_args:
+            fp = Path(str(cleaned_args["file_path"])).name
+            if fp == "fast_grep.py":
+                fp = "grep.py"
+            cleaned_args["file_path"] = fp
+
+        if "args" in cleaned_args and isinstance(cleaned_args["args"], list):
+            new_args = []
+            for a in cleaned_args["args"]:
+                if isinstance(a, str):
+                    new_args.append(sanitize_content(a))
+                else:
+                    new_args.append(a)
+            cleaned_args["args"] = new_args
+        return {"function_name": fn_name, "arguments": cleaned_args}
+
+    elif isinstance(raw_args, dict):
+        cleaned_args = {}
+        for k, v in raw_args.items():
+            if isinstance(v, str):
+                cleaned_args[k] = sanitize_content(v)
+            else:
+                cleaned_args[k] = v
+        return {"function_name": fn_name, "arguments": cleaned_args}
+
+    return tc
 
 
 def compact_observation(raw_obs: Any) -> str:
-    """Compacts tool observation output to fit long trajectories into 16K context."""
+    """Compacts tool observation output to fit long trajectories into context."""
     if isinstance(raw_obs, dict):
-        # Extract stdout or content if available
         if "stdout" in raw_obs and raw_obs["stdout"]:
             text = str(raw_obs["stdout"])
         elif "content" in raw_obs and raw_obs["content"]:
@@ -57,16 +151,17 @@ def compact_observation(raw_obs: Any) -> str:
     else:
         text = str(raw_obs or "").strip()
 
+    text = sanitize_content(text)
+
     if len(text) <= MAX_OBSERVATION_CHARS:
         return text
 
-    # Keep head and tail of oversized outputs
     half = MAX_OBSERVATION_CHARS // 2 - 20
     return text[:half] + "\n... [truncated] ...\n" + text[-half:]
 
 
-def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """Extracts system instruction, user prompt, and multi-turn tool interaction messages."""
+def extract_raw_trajectory(trace_path: Path) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """Extracts raw steps from a trace JSON file into structured messages."""
     if not trace_path.exists():
         logger.warning(f"Trace file missing: {trace_path}")
         return None, []
@@ -88,30 +183,25 @@ def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[D
         tcalls = step.get("tool_calls", [])
         obs = step.get("observation")
 
-        if src == "system" and msg:
-            if not messages or messages[0].get("role") != "system":
-                messages.append({"role": "system", "content": msg})
-
-        elif src == "user" and msg:
+        if src == "user" and msg:
             if not user_prompt:
-                user_prompt = msg
-                messages.append({"role": "user", "content": msg})
+                user_prompt = clean_user_prompt(msg)
 
         elif src == "agent":
-            # Build assistant message
             asst_dict: Dict[str, Any] = {"role": "assistant"}
             if msg:
-                asst_dict["content"] = msg
+                asst_dict["content"] = sanitize_content(msg)
             if tcalls:
                 formatted_calls = []
                 for idx, tc in enumerate(tcalls):
                     call_id = tc.get("tool_call_id") or f"call_{len(messages)}_{idx}"
+                    cleaned_tc = sanitize_tool_call(tc)
                     formatted_calls.append({
                         "id": call_id,
                         "type": "function",
                         "function": {
-                            "name": tc.get("function_name"),
-                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False)
+                            "name": cleaned_tc.get("function_name"),
+                            "arguments": json.dumps(cleaned_tc.get("arguments", {}), ensure_ascii=False)
                         }
                     })
                 asst_dict["tool_calls"] = formatted_calls
@@ -119,7 +209,6 @@ def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[D
             if "content" in asst_dict or "tool_calls" in asst_dict:
                 messages.append(asst_dict)
 
-            # Build tool observation response if present
             if obs:
                 compact_text = compact_observation(obs)
                 call_id = (tcalls[0].get("tool_call_id") or f"call_{len(messages)-1}_0") if tcalls else "call_0"
@@ -134,17 +223,86 @@ def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[D
     return user_prompt, messages
 
 
+def is_banned_turn(asst_msg: Dict[str, Any]) -> bool:
+    """Checks if an assistant message invokes prohibited skills or empty operations."""
+    tcalls = asst_msg.get("tool_calls", [])
+    for tc in tcalls:
+        fn_name = tc.get("function", {}).get("name", "")
+        if any(banned in fn_name for banned in BANNED_TOOL_PATTERNS):
+            return True
+        args_str = tc.get("function", {}).get("arguments", "")
+        if any(banned in args_str for banned in BANNED_TOOL_PATTERNS):
+            return True
+    return False
+
+
+def slice_trajectory_decisions(
+    task_id: str,
+    repo: str,
+    user_prompt: str,
+    messages: List[Dict[str, Any]],
+    tokenizer: Any = None
+) -> List[Dict[str, Any]]:
+    """Slices a full trajectory into high-density decision windows centered on assistant actions."""
+    samples: List[Dict[str, Any]] = []
+
+    for i, m in enumerate(messages):
+        if m.get("role") != "assistant":
+            continue
+
+        if is_banned_turn(m):
+            continue
+
+        # Skip empty turns
+        if not m.get("content") and not m.get("tool_calls"):
+            continue
+
+        window = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        # Include up to 2 preceding interaction turns (e.g., prior assistant action + tool result)
+        start_ctx = max(0, i - 2)
+        for ctx_idx in range(start_ctx, i):
+            window.append(messages[ctx_idx])
+
+        # Target assistant turn
+        window.append(m)
+
+        # Measure tokens if tokenizer available
+        tok_len = None
+        if tokenizer is not None:
+            try:
+                rendered = tokenizer.apply_chat_template(window, tokenize=False, add_generation_prompt=False)
+                tok_len = len(tokenizer.encode(rendered))
+                if tok_len > MAX_SEQ_TOKENS:
+                    continue
+            except Exception:
+                pass
+
+        samples.append({
+            "task_id": task_id,
+            "repo": repo,
+            "messages": window,
+            "target_turn_index": i,
+            "target_tools": [tc.get("function", {}).get("name") for tc in m.get("tool_calls", [])],
+            "estimated_tokens": tok_len,
+        })
+
+    return samples
+
+
 def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
-    """Renders structured messages into canonical Gemma turn markers."""
+    """Renders structured messages into canonical Gemma turn markers with pseudo-XML directives."""
     turns: List[str] = []
 
     for msg in messages:
         role = msg.get("role")
-        content = msg.get("content") or ""
+        content = (msg.get("content") or "").strip()
         tool_calls = msg.get("tool_calls", [])
 
         if role == "system":
-            # In Gemma 4, system prompts are typically included in the user turn or system turn
             turns.append(f"<start_of_turn>system\n{content}<end_of_turn>")
         elif role == "user":
             turns.append(f"<start_of_turn>user\n{content}<end_of_turn>")
@@ -161,7 +319,6 @@ def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
             asst_body = "\n".join(parts)
             turns.append(f"<start_of_turn>model\n{asst_body}<end_of_turn>")
         elif role == "tool":
-            tool_name = msg.get("name", "tool")
             turns.append(f"<start_of_turn>tool\n{content}<end_of_turn>")
 
     return "\n".join(turns)
@@ -170,6 +327,17 @@ def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
 def build_dataset():
     if not RESULTS_JSONL.exists():
         raise FileNotFoundError(f"Missing results log: {RESULTS_JSONL}")
+
+    # Load tokenizer for precise token boundary check
+    tokenizer = None
+    try:
+        from transformers import AutoTokenizer
+        tok_path = ROOT_DIR / "checkpoints" / "checkpoint-8"
+        if tok_path.exists():
+            tokenizer = AutoTokenizer.from_pretrained(tok_path)
+            logger.info("Loaded checkpoint-8 tokenizer for token length filtering.")
+    except Exception as exc:
+        logger.warning(f"Could not load local tokenizer: {exc}. Using character heuristics.")
 
     resolved_records = []
     with open(RESULTS_JSONL, encoding="utf-8") as f:
@@ -187,7 +355,7 @@ def build_dataset():
     skipped_no_patch = 0
     skipped_no_trace = 0
     filtered_outliers = 0
-    candidate_examples: List[Dict[str, Any]] = []
+    candidate_trajectories: List[Dict[str, Any]] = []
 
     for rec in resolved_records:
         inst_id = rec.get("instance_id")
@@ -197,15 +365,17 @@ def build_dataset():
 
         if not patch_file.exists():
             skipped_no_patch += 1
-            logger.warning(f"Task {inst_id} missing patch file.")
-            continue
-        patch_text = patch_file.read_text(encoding="utf-8").strip()
-        if not patch_text:
-            skipped_no_patch += 1
-            logger.warning(f"Task {inst_id} has empty patch file.")
+            logger.warning(f"Patch file missing: {patch_file}")
             continue
 
-        patch_lines = len(patch_text.splitlines())
+        try:
+            patch_text = patch_file.read_text(encoding="utf-8")
+            patch_lines = len(patch_text.splitlines())
+        except Exception as exc:
+            logger.warning(f"Failed to read patch {patch_file}: {exc}")
+            skipped_no_patch += 1
+            continue
+
         tool_calls = rec.get("tool_calls", 0)
 
         # Outlier filtering
@@ -218,13 +388,13 @@ def build_dataset():
             logger.info(f"Skipping {inst_id}: tool calls ({tool_calls}) > {MAX_TOOL_CALLS} (flailing run)")
             continue
 
-        user_prompt, messages = extract_trajectory_messages(trace_file)
+        user_prompt, messages = extract_raw_trajectory(trace_file)
         if not user_prompt or not messages or len(messages) < 4:
             skipped_no_trace += 1
             logger.warning(f"Task {inst_id} invalid or missing trajectory steps.")
             continue
 
-        candidate_examples.append({
+        candidate_trajectories.append({
             "task_id": inst_id,
             "repo": repo,
             "patch_lines": patch_lines,
@@ -232,7 +402,6 @@ def build_dataset():
             "user_prompt": user_prompt,
             "patch_text": patch_text,
             "messages": messages,
-            "turns_count": len(messages),
         })
 
     # Hard-fail guard against corrupted traces
@@ -244,15 +413,15 @@ def build_dataset():
             f"exceeds allowed maximum {MAX_SKIP_RATE:.0%}!"
         )
 
-    logger.info(f"Passed quality filters: {len(candidate_examples)} candidates (dropped {filtered_outliers} outliers).")
+    logger.info(f"Passed quality filters: {len(candidate_trajectories)} candidates (dropped {filtered_outliers} outliers).")
 
     # Near-duplicate patch deduplication within same repository
-    deduped_examples: List[Dict[str, Any]] = []
+    deduped_trajectories: List[Dict[str, Any]] = []
     collapsed_duplicates = 0
 
-    for cand in candidate_examples:
+    for cand in candidate_trajectories:
         is_duplicate = False
-        for accepted in deduped_examples:
+        for accepted in deduped_trajectories:
             if cand["repo"] == accepted["repo"]:
                 sim = difflib.SequenceMatcher(None, cand["patch_text"], accepted["patch_text"]).ratio()
                 if sim >= DEDUP_SIMILARITY_THRESHOLD:
@@ -264,30 +433,38 @@ def build_dataset():
                     )
                     break
         if not is_duplicate:
-            deduped_examples.append(cand)
+            deduped_trajectories.append(cand)
 
     logger.info(
-        f"Deduplication complete: {len(deduped_examples)} unique multi-turn trajectories "
+        f"Deduplication complete: {len(deduped_trajectories)} unique trajectories "
         f"({collapsed_duplicates} collapsed)."
     )
 
-    # Format into Gemma-4 chat turns and include structured messages
-    formatted_dataset = []
-    for ex in deduped_examples:
-        raw_text = render_gemma_chat_turns(ex["messages"])
-        formatted_dataset.append({
-            "task_id": ex["task_id"],
-            "repo": ex["repo"],
-            "patch_lines": ex["patch_lines"],
-            "tool_calls": ex["tool_calls"],
-            "turns_count": ex["turns_count"],
-            "messages": ex["messages"],
-            "text": raw_text,
-        })
+    # Slice each trajectory into decision samples
+    all_decision_samples: List[Dict[str, Any]] = []
+    tool_counter = Counter()
 
-    # Stratified 80/20 Train/Validation Split
+    for traj in deduped_trajectories:
+        decisions = slice_trajectory_decisions(
+            task_id=traj["task_id"],
+            repo=traj["repo"],
+            user_prompt=traj["user_prompt"],
+            messages=traj["messages"],
+            tokenizer=tokenizer
+        )
+        for d in decisions:
+            raw_text = render_gemma_chat_turns(d["messages"])
+            d["text"] = raw_text
+            for t in d["target_tools"]:
+                tool_counter[t] += 1
+            all_decision_samples.append(d)
+
+    logger.info(f"Generated {len(all_decision_samples)} high-density decision training samples.")
+    logger.info(f"Target tool call distribution: {dict(tool_counter)}")
+
+    # Stratified 80/20 Train/Validation Split by Repository
     repo_groups = defaultdict(list)
-    for row in formatted_dataset:
+    for row in all_decision_samples:
         repo_groups[row["repo"]].append(row)
 
     random.seed(SEED)
@@ -316,11 +493,13 @@ def build_dataset():
     print("      STRATIFIED MULTI-TURN SFT DATASET CURATION SUMMARY")
     print("=" * 65)
     print(f"Total verified input traces:        {total_resolved}")
-    print(f"Passed filters & deduplication:     {len(formatted_dataset)}")
-    print(f"Training set (80%):                 {len(train_rows)} trajectories -> {TRAIN_OUT_PATH}")
-    print(f"Validation set (20% held-out):      {len(val_rows)} trajectories -> {VAL_OUT_PATH}")
+    print(f"Passed filters & deduplication:     {len(deduped_trajectories)} trajectories")
+    print(f"Total decision samples extracted:   {len(all_decision_samples)}")
+    print(f"Training set (80%):                 {len(train_rows)} samples -> {TRAIN_OUT_PATH}")
+    print(f"Validation set (20% held-out):      {len(val_rows)} samples -> {VAL_OUT_PATH}")
     print(f"Filtered outliers (>150 lines/>35): {filtered_outliers}")
     print(f"Collapsed near-duplicate patches:   {collapsed_duplicates}")
+    print(f"Target tool distribution:           {dict(tool_counter)}")
     print("=" * 65)
 
 

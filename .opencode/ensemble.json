@@ -1,0 +1,8 @@
+{
+  "dashboardPort": 4747,
+  "defaultModel": "lr-zn-rs/muse-spark-1.3-contributor-free",
+  "modelsByAgent": {
+    "explore": "lr-or/thinkingmachines/inkling-small:free",
+    "build": "agy-gemini/gemini-3.8-flash-high"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "title": "Gemma 4 Fine-Tuned Rank-8 LoRA Adapter",
+  "id": "francisclyap/gemma4-lora-adapter",
+  "licenses": [
+    {
+      "name": "apache-2.0"
+    }
+  ]
+}

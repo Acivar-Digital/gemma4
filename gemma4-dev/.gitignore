@@ -41,3 +41,5 @@ venv/
 .venv/
 env/
 test.txt
+checkpoints/
+*.bak
