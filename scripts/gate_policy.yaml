@@ -77,3 +77,23 @@ submission_quota:
   # 5-per-24h is a defect to fix. See docs/gemma-and-the-shape-of-doubt.md:136.
   per_day: 1
   source: docs/gemma-and-the-shape-of-doubt.md:136
+
+packaging:
+  # SINGLE SOURCE OF TRUTH for what the packer EXCLUDES from submission.zip.
+  #
+  # g_zip_directory_drift compares the zip's members against EVERY file under
+  # my_submission/. Without a shared exclusion filter, a file the packer
+  # CORRECTLY omits (e.g. .DS_Store) is reported as "in dir not zip" and the gate
+  # fails forever -- a permanent false FAIL that vetoes an otherwise valid
+  # submission. The gate therefore honours this list.
+  #
+  # MANDATORY CONSUMER CONTRACT — scripts/submit_safe.sh MUST derive both its
+  # junk purge (find ... -delete) and its zip -x filter from THIS list, so there
+  # is exactly one exclusion vocabulary. A second, divergent list in the packer
+  # is precisely the class of bug this whole policy file exists to prevent: the
+  # gate would silently disagree with the packer about what is junk.
+  #
+  # Matched with fnmatch against the submission-relative POSIX path, so '*'
+  # spans '/' (matching zip -x and find -name semantics for these patterns).
+  excluded_globs: .DS_Store,*/.DS_Store,._*,*/._*,*/__pycache__/*,*.pyc,*.ipynb,*/.git/*,.git/*,*.swp,*~
+  source: scripts/submit_safe.sh step-2 junk purge + zip -x (verified 2026-10-04)

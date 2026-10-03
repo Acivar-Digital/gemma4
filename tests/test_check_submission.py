@@ -58,6 +58,16 @@ def _load_check_submission():
 
 cs = _load_check_submission()
 
+# The literal label a non-gating FAIL must carry in the rendered output.
+#
+# We deliberately assert on the LITERAL STRING, never on cs.NON_GATING_LABEL:
+# a test that reads the expected token back out of the module under test is
+# tautological -- renaming the constant would move the expectation with it and
+# the assertion would keep passing while the operator-visible contract silently
+# changed. The literal is pinned here, and pinned separately against the module
+# constant in test_every_gate_is_classified_into_exactly_one_valid_category.
+_NON_GATING = "NON-GATING"
+
 # Snapshot the real, immutable path constants so each test can be restored.
 _REAL_PATHS = {
     name: getattr(cs, name)
@@ -636,38 +646,302 @@ def test_gates_run_without_traceback_when_artifacts_missing(tmp_path, monkeypatc
         assert r.message, f"{r.name} produced an empty message"
 
 
-def test_summary_and_exit_semantics(policy):
-    """A FAIL makes the run exit non-zero; WARN alone does not.
+def _main_exit(argv):
+    """Drive cs.main(argv), returning (exit_code, rendered_stdout).
 
-    Drives the module's own main() --only entry points against the real current
-    artifacts: g_run_health is currently a FAIL (-> exit 1) while
-    g_sampling_output_cap is currently a WARN (-> exit 0). This is a real,
-    unmutated state, so the two outcomes genuinely differ only by severity.
+    The module prints the report to stdout and returns the exit code, so this
+    captures both -- the rendered text is what we assert the NON-GATING label
+    and the INFRASTRUCTURE FAILURE phrase on. Wraps the redirect so every test
+    exercises the real CLI entry point rather than reimplementing the policy.
     """
     import contextlib
     import io
 
-    def _exit_code(argv):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            return cs.main(argv), buf.getvalue()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        return cs.main(argv), buf.getvalue()
 
-    # Sanity on the underlying verdicts driving the exit codes.
-    run_health = dict(cs.ALL_GATES)["g_run_health"](policy)
-    assert run_health.status == cs.FAIL
+
+def test_submission_fail_sets_nonzero_exit(policy):
+    """A submission-category FAIL -> exit 1. This is the gating case.
+
+    g_adapter_declared is a real, currently-FAILing submission gate (the real
+    my_submission/agent.yaml declares no ``adapter:``). Driving it alone through
+    main() --only must return a non-zero exit code, because a defect in the
+    artifact being shipped is exactly what must veto a submission.
+
+    LOAD-BEARING: if exit_code_for treated submission FAILs as non-gating (the
+    demotion bug), this returns 0 and the assertion fires. The test therefore
+    distinguishes 'the new post_run demotion' from 'FAILs stopped gating at all'.
+    """
+    # Sanity on the underlying verdict: this really is a FAILing submission gate.
+    result = dict(cs.ALL_GATES)["g_adapter_declared"](policy)
+    assert result.status == cs.FAIL, f"precondition broken: {result.status}: {result.message}"
+    assert cs.category_of("g_adapter_declared") == cs.CAT_SUBMISSION
+
+    rc, out = _main_exit(["--only", "g_adapter_declared"])
+    assert rc == 1, (
+        f"a submission-category FAIL must exit non-zero, got {rc}. Output:\n{out}"
+    )
+    # A submission FAIL is reported as a hard blocker, never labelled NON-GATING.
+    assert "[FAIL] g_adapter_declared" in out
+    assert "BLOCKING:" in out
+    assert _NON_GATING not in out, (
+        "a submission FAIL must never be labelled NON-GATING"
+    )
+
+
+def test_post_run_fail_alone_exits_zero_and_is_labelled_non_gating(policy):
+    """A post_run FAIL alone -> exit 0, but rendered with an explicit NON-GATING label.
+
+    g_run_health is a real, currently-FAILing post_run gate (the real 0/129
+    degenerate run). It is a verdict about a HISTORICAL run, not about the
+    artifact being shipped, so it must NOT veto a submission -- but it must stay
+    loud. This drives it alone via --only and asserts BOTH halves:
+
+      * the exit code is 0 (it does not block), and
+      * the output names it NON-GATING with its category, so no reader mistakes
+        it for a submission blocker.
+
+    LOAD-BEARING: if post_run FAILs still gated (the old behaviour), rc would be
+    1 and this fires. If the NON-GATING label were dropped from the renderer, the
+    label assertion fires. Both halves must hold.
+    """
+    # Sanity on the underlying verdict: this really is a FAILing post_run gate.
+    result = dict(cs.ALL_GATES)["g_run_health"](policy)
+    assert result.status == cs.FAIL, f"precondition broken: {result.status}: {result.message}"
+    assert cs.category_of("g_run_health") == cs.CAT_POST_RUN
+
+    rc, out = _main_exit(["--only", "g_run_health"])
+    assert rc == 0, (
+        f"a post_run FAIL alone must NOT block the submission (exit 0), got {rc}. "
+        f"Output:\n{out}"
+    )
+    # The verdict must still be reported, and explicitly marked non-gating with
+    # its category so a reader cannot mistake it for a submission blocker.
+    assert "[FAIL]" in out
+    assert f"{_NON_GATING}: g_run_health FAILED (post_run category)" in out
+    assert "does not block submission" in out
+    # No BLOCKING banner may be printed for a non-gating FAIL.
+    assert "BLOCKING:" not in out, (
+        "a post_run FAIL must not print a BLOCKING banner"
+    )
+    # The summary must report it as a non-gating FAIL, not a gating one.
+    assert "1 non-gating FAIL(s)" in out
+    assert "1 gating FAIL(s)" not in out
+
+
+def test_hygiene_fail_alone_exits_zero_and_is_labelled_non_gating(policy):
+    """A hygiene FAIL alone -> exit 0, with the same explicit NON-GATING label.
+
+    g_no_embedded_code_in_docs is a real, currently-FAILing hygiene gate (the
+    real docs/gemma-and-the-shape-of-doubt.md has a ~110k-char escaped literal).
+    It lints the repository's docs and says nothing about the artifact being
+    shipped, so it must not veto -- but it must still be reported and labelled
+    NON-GATING so a maintainer sees it is a real finding, not a blocker.
+
+    LOAD-BEARING: if hygiene FAILs gated, rc would be 1 and this fires. If the
+    NON-GATING label were missing, the label assertion fires.
+    """
+    # Sanity on the underlying verdict: this really is a FAILing hygiene gate.
+    result = dict(cs.ALL_GATES)["g_no_embedded_code_in_docs"](policy)
+    assert result.status == cs.FAIL, f"precondition broken: {result.status}: {result.message}"
+    assert cs.category_of("g_no_embedded_code_in_docs") == cs.CAT_HYGIENE
+
+    rc, out = _main_exit(["--only", "g_no_embedded_code_in_docs"])
+    assert rc == 0, (
+        f"a hygiene FAIL alone must NOT block the submission (exit 0), got {rc}. "
+        f"Output:\n{out}"
+    )
+    assert "[FAIL]" in out
+    assert (
+        f"{_NON_GATING}: g_no_embedded_code_in_docs FAILED (hygiene category)" in out
+    )
+    assert "does not block submission" in out
+    assert "BLOCKING:" not in out, (
+        "a hygiene FAIL must not print a BLOCKING banner"
+    )
+
+
+def test_run_health_still_says_infrastructure_failure_not_a_quality_result(policy):
+    """g_run_health keeps the loud INFRASTRUCTURE FAILURE phrase despite being non-gating.
+
+    The demotion removes g_run_health's veto power, NOT its voice. A reader must
+    still see the verbatim phrase 'INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT'
+    so nobody mistakes a broken historical run for a quality result. The message
+    is preserved verbatim inside the rendered NON-GATING line.
+
+    LOAD-BEARING: if the renderer replaced the message with a soft "skipped" style
+    line, or the gate's DEGENERATE_MESSAGE lost the phrase, this fires.
+    """
+    phrase = "INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT"
+
+    # (a) The gate's own message carries the phrase (unchanged by the demotion).
+    result = dict(cs.ALL_GATES)["g_run_health"](policy)
+    assert result.status == cs.FAIL
+    assert result.message == cs.DEGENERATE_MESSAGE
+    assert phrase in result.message
+
+    # (b) The rendered default-run line preserves the phrase verbatim.
+    rc, out = _main_exit(["--only", "g_run_health"])
+    assert rc == 0, "a post_run FAIL alone must not block (still exit 0)"
+    assert phrase in out, (
+        f"the literal {phrase!r} must survive into the rendered output even "
+        f"though g_run_health is non-gating. Output:\n{out}"
+    )
+    # It is non-gating AND loud: the phrase and the NON-GATING label coexist.
+    assert _NON_GATING in out
+    assert f"{_NON_GATING}: g_run_health FAILED (post_run category)" in out
+
+
+def test_explicit_category_post_run_selection_makes_fail_exit_nonzero(policy):
+    """--category post_run: a FAIL in the explicitly selected category -> exit 1.
+
+    This is the subtle selection-vs-default distinction. By DEFAULT (or with a
+    bare --only) a post_run FAIL exits 0. But when the operator EXPLICITLY asks
+    '--category post_run', they are asking specifically about run health, so a
+    FAIL in that category MUST be loud in the exit code too (that's how it can
+    be used as a CI signal). The SAME g_run_health FAIL gives exit 0 by default
+    and exit 1 under --category post_run -- that difference is the proof.
+
+    LOAD-BEARING: if exit_code_for ignored selected_category, or main() failed
+    to pass it through, the --category run would return 0 and this fires. The
+    default run returning 0 in the same test pins the other side.
+    """
+    # The FAILing gate really is in the post_run category and really FAILs.
+    result = dict(cs.ALL_GATES)["g_run_health"](policy)
+    assert result.status == cs.FAIL
+    assert cs.category_of("g_run_health") == cs.CAT_POST_RUN
+
+    # Default (no --category): the same FAIL does NOT set the exit code.
+    rc_default, _ = _main_exit(["--only", "g_run_health"])
+    assert rc_default == 0, "by default a post_run FAIL must exit 0"
+
+    # Explicit --category post_run: the same FAIL now DOES set the exit code.
+    rc_selected, sel_out = _main_exit(["--category", "post_run"])
+    assert rc_selected == 1, (
+        f"explicitly selecting --category post_run must make its FAIL exit "
+        f"non-zero, got {rc_selected}. Output:\n{sel_out}"
+    )
+    # Only the post_run gate ran, and it is the one that drove the exit code.
+    assert "0 passed, 1 failed" in sel_out, (
+        f"--category post_run must run exactly the one FAILing post_run gate. "
+        f"Output:\n{sel_out}"
+    )
+    # Note: even when it blocks, the gate is still reported as post_run/non-gating
+    # in content; the exit code is what changes, not the finding itself.
+    assert f"{_NON_GATING}: g_run_health FAILED (post_run category)" in sel_out
+
+
+def test_category_and_only_compose_including_empty_intersection(policy):
+    """--category and --only compose: a gate must satisfy BOTH filters to run.
+
+    Three cases, all against the real policy:
+      1. --category post_run alone -> runs exactly the post_run gate(s).
+      2. --category submission + --only g_run_health (an EMPTY intersection,
+         since g_run_health is post_run) -> runs NOTHING and exits 0 (no gate
+         selected => no verdict => nothing to block on).
+      3. --category submission + --only g_adapter_declared (a real intersection)
+         -> runs exactly that one gate and, because it FAILs, exits 1.
+
+    LOAD-BEARING: if --only were ignored under a category filter, case 1 would run
+    everything and case 2 would run (and fail on) g_run_health instead of running
+    nothing -- the empty-intersection assertions would fire.
+    """
+    # (1) category alone selects the whole category.
+    post_run_names = [n for n, _f in cs.ALL_GATES if cs.category_of(n) == cs.CAT_POST_RUN]
+    assert post_run_names, "post_run category must be non-empty for this test to be meaningful"
+    res1 = cs.run_all(policy, category=cs.CAT_POST_RUN)
+    assert [r.name for r in res1] == post_run_names
+
+    # (2) EMPTY intersection: post_run gate + submission category -> runs nothing.
+    empty_res = cs.run_all(policy, only=["g_run_health"], category=cs.CAT_SUBMISSION)
+    assert empty_res == [], f"expected no gates to run, got {[r.name for r in empty_res]}"
+    assert cs.exit_code_for(empty_res, selected_category=cs.CAT_SUBMISSION) == 0
+
+    # Drive the same empty intersection through the CLI for the end-to-end check.
+    rc_empty, out_empty = _main_exit(["--only", "g_run_health", "--category", "submission"])
+    assert rc_empty == 0, f"empty intersection must exit 0, got {rc_empty}"
+    assert "0 passed, 0 failed" in out_empty, (
+        f"empty intersection must run zero gates. Output:\n{out_empty}"
+    )
+
+    # (3) A real intersection runs exactly the one named gate and gates the exit.
+    res3 = cs.run_all(policy, only=["g_adapter_declared"], category=cs.CAT_SUBMISSION)
+    assert [r.name for r in res3] == ["g_adapter_declared"]
+    rc3, out3 = _main_exit(["--only", "g_adapter_declared", "--category", "submission"])
+    assert rc3 == 1, f"a FAILing submission gate under its own category must exit 1, got {rc3}"
+    # Exactly one gate ran and it FAILed -- so the filters narrowed to 1, not 14.
+    assert "0 passed, 1 failed, 0 warnings (of 1 gates)" in out3, (
+        f"--category submission + --only must run exactly the one named gate. "
+        f"Output:\n{out3}"
+    )
+
+
+def test_every_gate_is_classified_into_exactly_one_valid_category():
+    """All 14 gates are classified; none uncategorized; valid set is exactly the 3.
+
+    Proves the classification registry is a total, well-typed mapping: every
+    registered gate has exactly one category, no category names a non-existent
+    gate, and every category value is one of the three valid ones. The module
+    already self-checks this at import time (_assert_gate_categories), but that
+    raises during import -- this test pins the SAME invariant as an assertion
+    against the loaded registry, so a future edit that weakens the check is
+    caught here too, with the offending gate named.
+
+    LOAD-BEARING: if a gate were added to ALL_GATES without a GATE_CATEGORY entry,
+    the uncategorized assertion fires and names it. If a category were typo'd,
+    the valid-set assertion fires.
+    """
+    # Every registered gate is classified.
+    registered = {name for name, _fn in cs.ALL_GATES}
+    classified = set(cs.GATE_CATEGORY)
+    assert registered <= classified, (
+        f"uncategorized gate(s): {sorted(registered - classified)}"
+    )
+    # No category names a gate that does not exist (no orphans).
+    assert classified <= registered, (
+        f"category names non-registered gate(s): {sorted(classified - registered)}"
+    )
+    # The mapping is exactly one-category-per-gate with the right total size.
+    assert len(cs.ALL_GATES) == 14, f"expected 14 registered gates, got {len(cs.ALL_GATES)}"
+    assert len(cs.GATE_CATEGORY) == 14, (
+        f"expected 14 classified gates, got {len(cs.GATE_CATEGORY)}"
+    )
+    # The valid category set is exactly {submission, post_run, hygiene}.
+    assert set(cs.GATE_CATEGORIES) == {"submission", "post_run", "hygiene"}
+    for name, cat in cs.GATE_CATEGORY.items():
+        assert cat in cs.GATE_CATEGORIES, f"gate {name} has invalid category {cat!r}"
+    # The operator-visible non-gating label is pinned as a LITERAL, not read back
+    # from the constant, so renaming it is caught here instead of silently
+    # changing what the reader sees in the report.
+    assert cs.NON_GATING_LABEL == "NON-GATING", (
+        f"the non-gating label must stay the literal 'NON-GATING' so operators "
+        f"and CI greps keep working, got {cs.NON_GATING_LABEL!r}"
+    )
+
+
+def test_warning_and_unknown_gate_exit_semantics_unchanged(policy):
+    """The pre-existing, category-independent exit rules still hold.
+
+    Two unchanged rules, kept in their own test so a failure localises:
+      * a WARN alone never affects the exit code (g_sampling_output_cap is a real
+        WARN on the real tree), and
+      * an unknown --only gate name is a hard error (guards --only typos
+        silently "passing" by running nothing).
+    """
+    # WARN alone -> exit 0.
     output_cap = dict(cs.ALL_GATES)["g_sampling_output_cap"](policy)
-    assert output_cap.status == cs.WARN
-
-    rc_fail, _ = _exit_code(["--only", "g_run_health"])
-    assert rc_fail == 1, "a FAILing gate must exit non-zero"
-
-    rc_warn, warn_out = _exit_code(["--only", "g_sampling_output_cap"])
+    assert output_cap.status == cs.WARN, (
+        f"precondition broken: expected the real tree to WARN, got {output_cap.status}"
+    )
+    rc_warn, warn_out = _main_exit(["--only", "g_sampling_output_cap"])
     assert rc_warn == 0, "a WARN alone must NOT affect the exit code"
     assert "[WARN]" in warn_out
 
-    # An unknown gate name is a hard error (guards --only typos silently passing).
-    rc_unknown, _ = _exit_code(["--only", "g_does_not_exist"])
-    assert rc_unknown == 1
+    # Unknown gate name -> hard error.
+    rc_unknown, _ = _main_exit(["--only", "g_does_not_exist"])
+    assert rc_unknown == 1, "an unknown --only gate name must be a hard error"
 
 
 # ===========================================================================

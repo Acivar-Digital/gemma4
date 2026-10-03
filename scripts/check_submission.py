@@ -7,10 +7,35 @@ decision D13). This module is both an importable library and a runnable CLI:
     python3 scripts/check_submission.py            # human-readable summary
     python3 scripts/check_submission.py --json     # machine-readable JSON
     python3 scripts/check_submission.py --only g_zip_root_layout
+    python3 scripts/check_submission.py --category submission
 
-Exit code is ``0`` when no gate FAILs, ``1`` when any gate FAILs. WARN never
-affects the exit code; only FAIL does (a false-negative gate can burn the
-single daily submission slot, so WARNs are informational, FAILs are blocking).
+Exit code is ``0`` unless a gate in the ``submission`` category FAILs. WARN never
+affects the exit code, in any category (a false-negative gate can burn the
+single daily submission slot, so WARNs are informational, FAILs are blocking --
+but "blocking" means blocking *for the category that owns the verdict*).
+
+Gate categories -- every gate is EXACTLY ONE of these, and the registry asserts
+at load time that none is uncategorized (see ``GATE_CATEGORIES``):
+
+    submission  Asserts a property of the artifact being shipped. A FAIL here is
+                a real defect in ``my_submission/`` / ``submission.zip``, so it
+                blocks the submission and sets a non-zero exit code.
+    post_run    Analyzes COMPLETED-RUN artifacts (``cloud_results/results/``). A
+                FAIL is a verdict about a HISTORICAL RUN's health, not about
+                whether the artifact being submitted is valid: an old bad run must
+                never veto a corrected submission. Still RUNS by default and still
+                prints loudly, labelled ``NON-GATING``, but does not set the exit
+                code unless the operator explicitly selects ``--category post_run``.
+    hygiene     Repository/code hygiene (e.g. a ``docs/*.md`` lint) with no bearing
+                on the submitted artifact. Same treatment as ``post_run``: runs,
+                reports, labels ``NON-GATING``, does not block by default.
+
+``--category`` and ``--only`` compose: a gate must satisfy both filters to run.
+
+The gate that reports ``INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT`` is
+``g_run_health``, a ``post_run`` gate. That phrase is preserved verbatim precisely
+BECAUSE the gate no longer blocks: demoting its veto power must not cost it its
+voice.
 
 Submission modes (which obligation the adapter gates enforce):
     submit       (DEFAULT) This tree is what gets uploaded to Kaggle, so an
@@ -90,6 +115,36 @@ ALLOWED_SUBMISSION_EXTENSIONS = {
 PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
+
+# ---------------------------------------------------------------------------
+# Gate categories — WHY a gate exists, which decides WHETHER it may veto a
+# submission. Exactly one category per gate; the registry is the single source
+# of truth and :func:`_assert_gate_categories` proves at load time that none of
+# the 14 gates is left uncategorized.
+#
+#   submission  Asserts a property OF THE ARTIFACT BEING SHIPPED. A FAIL here is
+#               a genuine defect in submission.zip / my_submission/, so it MUST
+#               block the submission and sets a non-zero exit code.
+#   post_run    Analyzes COMPLETED-RUN artifacts (cloud_results/results/).
+#               A FAIL here is a verdict about a HISTORICAL RUN's infrastructure
+#               health, not about whether the artifact being submitted is valid.
+#               It must stay LOUD but must never veto a submission.
+#   hygiene     Repository / code hygiene that has no bearing on the submitted
+#               artifact at all (e.g. a docs/*.md lint). Must never veto a
+#               submission.
+#
+# post_run and hygiene still RUN by default and still print their FAILs
+# prominently -- a silent demotion would hide a real problem. Only their POWER
+# over the exit code changes, and only when they are not explicitly selected.
+# ---------------------------------------------------------------------------
+CAT_SUBMISSION = "submission"
+CAT_POST_RUN = "post_run"
+CAT_HYGIENE = "hygiene"
+GATE_CATEGORIES: Tuple[str, ...] = (CAT_SUBMISSION, CAT_POST_RUN, CAT_HYGIENE)
+
+# The prefix used to label a non-gating FAIL in the rendered output. A reader
+# must never see INFRASTRUCTURE FAILURE and be left guessing whether it blocks.
+NON_GATING_LABEL = "NON-GATING"
 
 # ---------------------------------------------------------------------------
 # Submission-mode constants (adapter obligations; see the module docstring).
@@ -229,6 +284,43 @@ def _policy_get(policy: Dict[str, Dict[str, Any]], section: str, key: str) -> An
 
 def _resolve_serve_model_name(policy) -> str:
     return str(_policy_get(policy, "served_model", "name"))
+
+
+def resolve_excluded_globs(policy: Dict[str, Dict[str, Any]]) -> Tuple[str, ...]:
+    """Packaging exclusion globs, read from ``packaging.excluded_globs``.
+
+    The policy file is FLAT, so this arrives as one comma-separated STRING; we
+    split it here. This is the ONLY exclusion vocabulary in the codebase: the
+    packer (scripts/submit_safe.sh) MUST consume the same key, and
+    :func:`g_zip_directory_drift` MUST honour it, so the gate and the packer can
+    never disagree about which files are junk. A second, divergent list would
+    reintroduce exactly the drift bug this key exists to fix.
+    """
+    section = policy.get("packaging") or {}
+    raw = section.get("excluded_globs")
+    if raw is None:
+        return ()
+    if isinstance(raw, (list, tuple)):
+        parts = [str(p) for p in raw]
+    else:
+        parts = str(raw).split(",")
+    return tuple(p.strip() for p in parts if p.strip())
+
+
+def _is_excluded(rel_path: str, globs: Sequence[str]) -> bool:
+    """True when ``rel_path`` matches ANY exclusion glob (fnmatch semantics).
+
+    ``fnmatch`` is used rather than ``PurePath.match`` because we need ``*`` to
+    span ``/`` -- the same way the packer's ``zip -x`` and ``find -name`` filters
+    behave for these patterns. The path is normalized to POSIX separators first
+    so a Windows-style walk still compares cleanly.
+    """
+    from fnmatch import fnmatch
+    normalized = rel_path.replace(os.sep, "/")
+    for pattern in globs:
+        if fnmatch(normalized, pattern):
+            return True
+    return False
 
 
 def _resolve_allowed_modes(policy: Dict[str, Dict[str, Any]]) -> Tuple[str, ...]:
@@ -900,33 +992,49 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _dir_hashes(root: str) -> Dict[str, str]:
-    """Map relative path -> sha256 for every file under root (files only)."""
+def _dir_hashes(root: str, exclude: Sequence[str] = ()) -> Tuple[Dict[str, str], List[str]]:
+    """Map relative path -> sha256 for every file under root (files only).
+
+    Files matching ANY glob in ``exclude`` are SKIPPED and their relative paths
+    returned separately, so the drift gate can say what it ignored instead of
+    silently dropping the evidence. ``exclude`` comes from
+    ``packaging.excluded_globs`` (see :func:`resolve_excluded_globs`) -- the same
+    list the packer uses, which is what stops a correctly-excluded .DS_Store
+    from being reported as a permanent "in dir not zip" drift.
+    """
     out: Dict[str, str] = {}
+    skipped: List[str] = []
     for dirpath, _dirs, files in os.walk(root):
         for name in files:
             full = os.path.join(dirpath, name)
             rel = os.path.relpath(full, root)
+            if exclude and _is_excluded(rel, exclude):
+                skipped.append(rel)
+                continue
             try:
                 with open(full, "rb") as fh:
                     out[rel] = _sha256_bytes(fh.read())
             except OSError:
                 out[rel] = "<unreadable>"
-    return out
+    return out, sorted(skipped)
 
 
-def _zip_hashes(zf: zipfile.ZipFile) -> Dict[str, str]:
+def _zip_hashes(zf: zipfile.ZipFile, exclude: Sequence[str] = ()) -> Tuple[Dict[str, str], List[str]]:
     out: Dict[str, str] = {}
+    skipped: List[str] = []
     for info in zf.infolist():
         if info.is_dir():
             continue
         name = info.filename.lstrip("./")
+        if exclude and _is_excluded(name, exclude):
+            skipped.append(name)
+            continue
         try:
             with zf.open(info) as fh:
                 out[name] = _sha256_bytes(fh.read())
         except (zipfile.BadZipFile, OSError, RuntimeError):
             out[name] = "<unreadable>"
-    return out
+    return out, sorted(skipped)
 
 
 def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
@@ -935,7 +1043,15 @@ def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     A directory can be correct while the zip is stale. Walk both, compare
     relative paths and content hashes, report every differing path. Handles the
     case where the zip predates the directory.
+
+    BOTH sides are filtered through the shared ``packaging.excluded_globs`` list
+    -- the same list the packer honours when it builds the zip. Without this,
+    a file the packer CORRECTLY omitted (a stray .DS_Store) would be reported as
+    "in dir not zip" and the gate would FAIL forever, blocking an otherwise
+    valid submission. Files matched by the exclusion list are named in the
+    evidence as ignored, so the filter is visible rather than silent.
     """
+    exclude = resolve_excluded_globs(policy)
     if not os.path.isdir(SUBMISSION_DIR):
         return GateResult("g_zip_directory_drift", FAIL, "submission directory missing",
                           os.path.relpath(SUBMISSION_DIR, REPO_ROOT), "Restore my_submission/.")
@@ -945,20 +1061,29 @@ def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                           "submission.zip not found", "Pack submission.zip then re-check drift.")
     try:
         with zipfile.ZipFile(SUBMISSION_ZIP, "r") as zf:
-            zh = _zip_hashes(zf)
+            zh, zip_skipped = _zip_hashes(zf, exclude)
     except (zipfile.BadZipFile, OSError) as exc:
         return GateResult("g_zip_directory_drift", FAIL, "submission.zip unreadable", str(exc),
                           "Repack a valid submission.zip.")
-    dh = _dir_hashes(SUBMISSION_DIR)
+    dh, dir_skipped = _dir_hashes(SUBMISSION_DIR, exclude)
 
     only_zip = sorted(set(zh) - set(dh))
     only_dir = sorted(set(dh) - set(zh))
     differing = sorted(k for k in set(zh) & set(dh) if zh[k] != dh[k])
 
+    ignored_note = (
+        f"; excluded {len(set(dir_skipped) | set(zip_skipped))} file(s) via "
+        f"packaging.excluded_globs ({len(exclude)} globs): "
+        + ", ".join(sorted(set(dir_skipped) | set(zip_skipped))[:8])
+        + (" ..." if len(set(dir_skipped) | set(zip_skipped)) > 8 else "")
+        if (dir_skipped or zip_skipped) else "; excluded 0 files (no junk present)"
+    )
+
     if not (only_zip or only_dir or differing):
         return GateResult("g_zip_directory_drift", PASS,
                           f"zip and directory byte-identical ({len(dh)} files)",
-                          f"compared {len(dh)} dir files vs {len(zh)} zip members; no diff", "")
+                          f"compared {len(dh)} dir files vs {len(zh)} zip members; no diff"
+                          + ignored_note, "")
 
     parts = []
     if only_dir:
@@ -969,7 +1094,7 @@ def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
         parts.append(f"content differs ({len(differing)}): " + ", ".join(differing[:8]) + (" ..." if len(differing) > 8 else ""))
     return GateResult("g_zip_directory_drift", FAIL,
                       "submission.zip is out of sync with my_submission/",
-                      " | ".join(parts),
+                      " | ".join(parts) + ignored_note,
                       "Repack submission.zip from my_submission/ so the zip matches the tree.")
 
 
@@ -1168,6 +1293,12 @@ def g_no_embedded_code_in_docs(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 
 # ===========================================================================
 # Gate registry — pre-submission, then post-run (D2 separation)
+#
+# Each gate carries EXACTLY ONE category (see GATE_CATEGORIES). The category --
+# not the list a gate happens to sit in -- decides whether a FAIL may veto a
+# submission. That is why g_no_embedded_code_in_docs, which is physically listed
+# under POST_RUN_GATES for output-sectioning reasons, is categorized 'hygiene':
+# it lints docs/*.md and says nothing about the artifact being shipped.
 # ===========================================================================
 
 PRE_SUBMISSION_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]] = [
@@ -1192,6 +1323,85 @@ POST_RUN_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult
 
 ALL_GATES = PRE_SUBMISSION_GATES + POST_RUN_GATES
 
+# --- THE classification: gate name -> category ------------------------------
+# Exactly one category per gate. Keys here are asserted to be a bijection onto
+# the 14 registered gates by _assert_gate_categories() at import time, so
+# adding a gate without classifying it is a hard import-time failure rather
+# than a silently-uncategorized gate whose FAIL nobody knows how to weigh.
+#
+# g_adapter_base_model is categorized 'submission' even though it is WARN-only
+# by design: it inspects an artifact INSIDE my_submission/, so it is a
+# submission-category check. Categorizing it does not grant it veto power --
+# WARN never affects the exit code (unchanged semantics).
+GATE_CATEGORY: Dict[str, str] = {
+    # --- submission: a FAIL is a real defect in the artifact being shipped ---
+    "g_required_files": CAT_SUBMISSION,
+    "g_adapter_declared": CAT_SUBMISSION,
+    "g_adapter_present": CAT_SUBMISSION,
+    "g_adapter_base_model": CAT_SUBMISSION,   # WARN-only; category != veto power
+    "g_tool_budget_parity": CAT_SUBMISSION,
+    "g_prompt_ladder_consistency": CAT_SUBMISSION,
+    "g_sampling_no_thinking_level": CAT_SUBMISSION,
+    "g_sampling_output_cap": CAT_SUBMISSION,
+    "g_submission_size_unpacked": CAT_SUBMISSION,
+    "g_zip_directory_drift": CAT_SUBMISSION,
+    "g_zip_root_layout": CAT_SUBMISSION,
+    "g_disallowed_extensions": CAT_SUBMISSION,
+    # --- post_run: a verdict about a HISTORICAL run, not about this artifact ---
+    "g_run_health": CAT_POST_RUN,
+    # --- hygiene: repository hygiene, irrelevant to the shipped artifact ---
+    "g_no_embedded_code_in_docs": CAT_HYGIENE,
+}
+
+
+def _assert_gate_categories(
+    registry: Sequence[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]],
+    categories: Dict[str, str],
+) -> None:
+    """Fail loudly at LOAD time if any gate lacks exactly one valid category.
+
+    A gate that is registered but uncategorized would have undefined veto power
+    -- exactly the ambiguity this registry exists to remove -- so we raise rather
+    than guess. Also catches a category typo and a category naming a gate that
+    does not exist.
+    """
+    names = [n for n, _fn in registry]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise AssertionError(f"duplicate gate(s) in registry: {', '.join(dupes)}")
+
+    uncategorized = [n for n in names if n not in categories]
+    if uncategorized:
+        raise AssertionError(
+            "gate(s) registered without a category: "
+            + ", ".join(uncategorized)
+            + f"; every gate needs exactly one of {', '.join(GATE_CATEGORIES)}"
+        )
+    invalid = sorted({c for c in categories.values() if c not in GATE_CATEGORIES})
+    if invalid:
+        raise AssertionError(
+            f"invalid gate categor{'y' if len(invalid) == 1 else 'ies'}: "
+            + ", ".join(repr(c) for c in invalid)
+            + f"; allowed: {', '.join(GATE_CATEGORIES)}"
+        )
+    orphans = sorted(c for c in categories if c not in set(names))
+    if orphans:
+        raise AssertionError(
+            f"categor{'y' if len(orphans) == 1 else 'ies'} name gate(s) that are not "
+            f"registered: {', '.join(orphans)}"
+        )
+
+
+# Proven at import time. If this raises, the module does not load and no gate
+# can run in an undefined state.
+_assert_gate_categories(ALL_GATES, GATE_CATEGORY)
+
+
+def category_of(gate_name: str) -> str:
+    """The category of a gate name (raises if unregistered -- see the assert)."""
+    return GATE_CATEGORY[gate_name]
+
+
 # Section labels for output (D2: post-run kept clearly separate).
 _SECTION = {}
 for _n, _f in PRE_SUBMISSION_GATES:
@@ -1202,7 +1412,8 @@ for _n, _f in POST_RUN_GATES:
 
 def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
             only: Optional[Sequence[str]] = None,
-            cli_mode: Optional[str] = None) -> List[GateResult]:
+            cli_mode: Optional[str] = None,
+            category: Optional[str] = None) -> List[GateResult]:
     """Run every gate (or the subset named in ``only``) and return results.
 
     The effective submission mode (CLI > env > policy, see
@@ -1212,9 +1423,18 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
     SAME mode for the whole run without a module-level global. A gate that
     raises is converted into a FAIL result so one broken gate never aborts the
     whole run (robustness requirement).
+
+    ``category`` filters to a single category and COMPOSES with ``only``: a gate
+    must satisfy both to run (``only=None`` means no name filter, so a category
+    alone selects the whole category). Selection changes which gates RUN, never
+    a gate's verdict -- a FAIL is still a FAIL.
     """
     if policy is None:
         policy = load_policy()
+    if category is not None and category not in GATE_CATEGORIES:
+        raise ValueError(
+            f"unknown category {category!r}; allowed: {', '.join(GATE_CATEGORIES)}"
+        )
     try:
         effective_mode = resolve_submission_mode(policy, cli_mode=cli_mode)
         effective_source = _mode_source(cli_mode)
@@ -1231,6 +1451,8 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
     for name, fn in ALL_GATES:
         if wanted and name not in wanted:
             continue
+        if category is not None and category_of(name) != category:
+            continue
         try:
             results.append(fn(policy))
         except Exception as exc:  # noqa: BLE001 - deliberate: never crash the runner
@@ -1241,12 +1463,65 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
 
 
 # ---------------------------------------------------------------------------
+# Exit semantics — SEPARATED from reporting
+# ---------------------------------------------------------------------------
+def partition_fails(results: Sequence[GateResult]) -> Tuple[List[GateResult], List[GateResult]]:
+    """Split FAIL results into (gating, non_gating) by gate CATEGORY.
+
+    A FAIL is *gating* only when its gate is in the ``submission`` category.
+    ``post_run`` and ``hygiene`` FAILs are real and must be REPORTED, but they
+    are verdicts about a historical run or about repository hygiene, not about
+    whether the artifact being submitted is valid -- so they must not veto it.
+    """
+    gating: List[GateResult] = []
+    non_gating: List[GateResult] = []
+    for r in results:
+        if r.status != FAIL:
+            continue
+        # An unknown name cannot happen (the registry is asserted at load time),
+        # but default to gating rather than silently waiving an unclassifiable
+        # FAIL -- fail closed if this code ever outlives the registry.
+        if GATE_CATEGORY.get(r.name, CAT_SUBMISSION) == CAT_SUBMISSION:
+            gating.append(r)
+        else:
+            non_gating.append(r)
+    return gating, non_gating
+
+
+def exit_code_for(results: Sequence[GateResult], selected_category: Optional[str] = None) -> int:
+    """The process exit code: 1 iff a GATING FAIL is present.
+
+    ``selected_category`` is the explicit ``--category`` the operator asked for.
+    When the operator EXPLICITLY selects a non-submission category, they are
+    asking specifically about that category, so a FAIL in it MUST be loud in the
+    exit code too -- that is how ``--category post_run`` can ever be used as a
+    CI signal about run health. With no explicit selection (the default run, or a
+    bare ``--only``), the exit code is governed SOLELY by submission-category
+    FAILs, which is the whole point of the change.
+    """
+    gating, non_gating = partition_fails(results)
+    if gating:
+        return 1
+    if non_gating and selected_category is not None and selected_category != CAT_SUBMISSION:
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Output rendering
 # ---------------------------------------------------------------------------
 _STATUS_MARK = {PASS: "PASS", FAIL: "FAIL", WARN: "WARN"}
 
 
 def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
+    """Render the human-readable report.
+
+    A non-gating FAIL is labelled with an explicit ``NON-GATING:`` prefix and its
+    category, so no reader can mistake a historical-run verdict for a
+    submission blocker. The gate's own message is preserved verbatim inside the
+    line -- notably ``INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT`` -- because
+    that phrase is the signal we must not lose while demoting its veto power.
+    """
     lines: List[str] = []
     if mode:
         lines.append(f"submission mode: {mode}")
@@ -1259,27 +1534,86 @@ def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
             lines.append(f"== {section} ==")
             last_section = section
         mark = _STATUS_MARK.get(r.status, r.status)
-        lines.append(f"[{mark}] {r.name}: {r.message}")
+        category = GATE_CATEGORY.get(r.name)
+        non_gating = r.status == FAIL and category != CAT_SUBMISSION
+        if non_gating:
+            lines.append(
+                f"[{mark}] {NON_GATING_LABEL}: {r.name} FAILED ({category} category) "
+                f"-- reported, does not block submission: {r.message}"
+            )
+        else:
+            lines.append(f"[{mark}] {r.name}: {r.message}")
     n_pass = sum(1 for r in results if r.status == PASS)
     n_fail = sum(1 for r in results if r.status == FAIL)
     n_warn = sum(1 for r in results if r.status == WARN)
+    gating, non_gating = partition_fails(results)
     lines.append("")
     lines.append(f"{n_pass} passed, {n_fail} failed, {n_warn} warnings (of {len(results)} gates)")
+    lines.append(
+        f"exit code governed SOLELY by '{CAT_SUBMISSION}'-category FAILs: "
+        f"{len(gating)} gating FAIL(s), {len(non_gating)} non-gating FAIL(s) "
+        f"({', '.join(sorted(r.name for r in non_gating)) if non_gating else 'none'})"
+    )
+    if non_gating:
+        lines.append(
+            f"{NON_GATING_LABEL}: "
+            + "; ".join(
+                f"{r.name} FAILED ({GATE_CATEGORY.get(r.name, 'unclassified')} category) "
+                f"-- reported, does not block submission"
+                for r in non_gating
+            )
+        )
+    if gating:
+        lines.append("BLOCKING: " + "; ".join(f"{r.name} ({CAT_SUBMISSION})" for r in gating)
+                     + " -- submission must not proceed")
     return "\n".join(lines)
 
 
 def to_json(results: List[GateResult], mode: Optional[str] = None) -> str:
+    """Machine-readable JSON.
+
+    The per-gate result shape is UNCHANGED (``name``, ``status``, ``message``,
+    ``evidence``, ``remediation``). The category is reported as a sibling
+    ``category`` key per result and summarized in ``gating``/``non_gating`` --
+    additive only, so an existing consumer of the five original keys keeps
+    working.
+    """
+    gating, non_gating = partition_fails(results)
     payload = {
         "mode": mode,
-        "results": [asdict(r) for r in results],
+        "results": [
+            dict(asdict(r), category=GATE_CATEGORY.get(r.name, "unclassified"),
+                 gating=(r.status == FAIL and GATE_CATEGORY.get(r.name) == CAT_SUBMISSION))
+            for r in results
+        ],
         "summary": {
             "passed": sum(1 for r in results if r.status == PASS),
             "failed": sum(1 for r in results if r.status == FAIL),
             "warnings": sum(1 for r in results if r.status == WARN),
             "total": len(results),
+            "gating_failures": [r.name for r in gating],
+            "non_gating_failures": [r.name for r in non_gating],
         },
     }
     return json.dumps(payload, indent=2)
+
+
+def render_classification_table() -> str:
+    """Human-readable gate -> category table (the classification, item 5)."""
+    lines = ["gate".ljust(30) + "category".ljust(14) + "runs-by-default".ljust(17)
+             + "FAIL blocks submission"]
+    lines.append("-" * 92)
+    for name, _fn in ALL_GATES:
+        cat = GATE_CATEGORY[name]
+        blocks = "YES" if cat == CAT_SUBMISSION else "no"
+        lines.append(name.ljust(30) + cat.ljust(14) + "yes".ljust(17) + blocks)
+    lines.append("-" * 92)
+    counts: Dict[str, int] = {c: 0 for c in GATE_CATEGORIES}
+    for name, _fn in ALL_GATES:
+        counts[GATE_CATEGORY[name]] += 1
+    lines.append(f"total gates: {len(ALL_GATES)}; classified: {len(GATE_CATEGORY)}; "
+                 + ", ".join(f"{c}={counts[c]}" for c in GATE_CATEGORIES))
+    return "\n".join(lines)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1290,17 +1624,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "declared in agent.yaml AND present in adapters/, else FAIL. In "
             "'local_test', the adapter MUST be explicitly OFF (no 'adapter:' key); "
             "a still-declared adapter FAILs. Precedence: --mode > "
-            f"{MODE_ENV_VAR} env var > policy adapter.submission_mode."
+            f"{MODE_ENV_VAR} env var > policy adapter.submission_mode.\n"
+            f"\n"
+            f"Gate categories. Every gate is exactly one of: "
+            f"{', '.join(GATE_CATEGORIES)}.\n"
+            f"  {CAT_SUBMISSION}  a defect in the artifact being shipped; a FAIL "
+            f"blocks the submission and sets a non-zero exit.\n"
+            f"  {CAT_POST_RUN}  a verdict about a COMPLETED RUN's health, not "
+            f"about the artifact; reported, does not block.\n"
+            f"  {CAT_HYGIENE}  repository hygiene, irrelevant to the artifact; "
+            f"reported, does not block.\n"
+            f"With no flags, ALL gates run but the exit code is governed SOLELY by "
+            f"{CAT_SUBMISSION}-category FAILs. Passing --category for a "
+            f"non-{CAT_SUBMISSION} category makes that category's FAILs exit "
+            f"non-zero too (you asked about it specifically). --only and "
+            f"--category compose."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--only", action="append", metavar="GATE",
-                        help="run only the named gate (repeatable)")
+                        help="run only the named gate (repeatable; composes with --category)")
+    parser.add_argument("--category", choices=GATE_CATEGORIES, default=None,
+                        help=f"run only gates in this category ({', '.join(GATE_CATEGORIES)}); "
+                             f"composes with --only. Selecting a non-{CAT_SUBMISSION} "
+                             f"category makes its FAILs exit non-zero")
+    parser.add_argument("--show-categories", action="store_true",
+                        help="print the gate -> category classification table and exit 0")
     parser.add_argument("--mode", choices=ALLOWED_MODES, default=None,
                         help="submission mode (default: submit); overrides "
                              f"{MODE_ENV_VAR} and the policy default")
     args = parser.parse_args(argv)
+
+    if args.show_categories:
+        print(render_classification_table())
+        return 0
 
     try:
         policy = load_policy()
@@ -1319,16 +1677,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 1
 
-    results = run_all(policy, only=args.only, cli_mode=args.mode)
+    results = run_all(policy, only=args.only, cli_mode=args.mode,
+                      category=args.category)
 
     if args.json:
         print(to_json(results, mode=effective_mode))
     else:
         print(render_text(results, mode=effective_mode))
-        failed = [r for r in results if r.status == FAIL]
-        # Exit 1 only when a gate FAILs; WARN never blocks.
-        return 1 if failed else 0
-    return 1 if any(r.status == FAIL for r in results) else 0
+    # Exit code: governed ONLY by submission-category FAILs, unless the operator
+    # explicitly selected a non-submission category (see exit_code_for).
+    return exit_code_for(results, selected_category=args.category)
 
 
 if __name__ == "__main__":
