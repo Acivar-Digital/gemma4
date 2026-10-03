@@ -17,6 +17,7 @@
 | 7 | [07-verify-protocol.md](07-verify-protocol.md) | `/tmp` repro + single-file pytest + `submit_patch` last |
 | 8 | [08-eval-plan.md](08-eval-plan.md) | How we test: `swegemma eval --task-id` on 1–2 fastapi tasks, 50 calls / 30 min |
 | 9 | [09-roadmap.md](09-roadmap.md) | Theory → YAML draft → local test → iterate. Gates + approvals |
+| 10 | [DATA_FLOW.md](DATA_FLOW.md) | Where every artifact lives and how it moves — read this before grepping |
 
 ## Key facts (locked v1, from AGENTS.md + recon today)
 - Metric: Resolution Rate. Phase 1 Container A (`/workspace`, `git add -N . && git diff HEAD`), Phase 2 Container B (fresh snapshot + `agent_patch` + `test_patch` + hermetic pytest, JUnit `exit_code==0`).
