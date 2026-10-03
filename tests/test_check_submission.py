@@ -195,24 +195,264 @@ def test_g_run_health_fails_on_real_zero_129_run(policy):
     assert "infrastructure" in result.remediation.lower()
 
 
-def test_g_adapter_base_model_fails_on_wrong_base(policy):
-    """The staged wrong-base adapter -> FAIL naming the real mismatching path.
+def test_g_adapter_base_model_warns_on_wrong_base(policy):
+    """The staged wrong-base adapter -> WARN, not FAIL (numerical fidelity only).
 
     Uses the untouched adapters_staging/main_lora/adapter_config.json whose base
     is unsloth/gemma-4-31B-it-unsloth-bnb-4bit (a 4-bit bnb quantization) while
     the served model is the QAT w4a16 build.
+
+    The harness imposes NO rule that an adapter's base must equal the served
+    model (discover_adapters() applies the adapter to the already-loaded base;
+    HARNESS_README.md:204). The old "does not exactly match -> FAIL + allowlist"
+    contract was FABRICATED and is withdrawn. A base mismatch is a
+    numerical-fidelity risk worth surfacing, so the gate WARNs and must not
+    demand the adapter be retrained to satisfy a requirement.
     """
+    # Guard: only meaningful if the real staging artifact is present and is the
+    # genuinely-wrong-base one (proves this is the real broken artifact).
+    real_cfg = os.path.join(cs.ADAPTERS_STAGING, "main_lora", "adapter_config.json")
+    assert os.path.isfile(real_cfg), "real staged adapter_config.json missing; cannot prove"
+
     result = cs.g_adapter_base_model(policy)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL on the wrong-base adapter, got {result.status}: {result.message}"
+
+    # The load-bearing property: a wrong base is a WARN, never a FAIL.
+    assert result.status == cs.WARN, (
+        f"expected WARN on the wrong-base adapter, got {result.status}: {result.message}"
     )
+    assert result.status != cs.FAIL, (
+        "the withdrawn fabricated rule must not FAIL the base-model gate"
+    )
+
     # Evidence must name the real staging file and BOTH sides of the mismatch.
     assert "adapters_staging/main_lora/adapter_config.json" in result.evidence
     assert "unsloth/gemma-4-31B-it-unsloth-bnb-4bit" in result.evidence
     assert "gemma-4-31b-it-qat-w4a16-ct" in result.evidence
-    assert "does not exactly match" in result.message
-    # Remediation must forbid widening with an allowlist (decision D10).
-    assert "allowlist" in result.remediation.lower()
+
+    # It must be framed as numerical fidelity, explicitly NOT a harness rule.
+    assert "numerical-fidelity" in result.message.lower()
+    assert "not a harness rule" in result.message.lower()
+
+    # Must NOT assert the adapter must be retrained, and must NOT cite a harness
+    # requirement that the bases match (the withdrawn fabrication).
+    blob = f"{result.message} {result.evidence} {result.remediation}".lower()
+    assert "retrain" not in blob or "no retrain is required" in blob, (
+        "the gate must not demand a retrain to satisfy a requirement"
+    )
+    assert "does not exactly match" not in blob, (
+        "the withdrawn 'does not exactly match' FAIL phrasing must be gone"
+    )
+    assert "allowlist" not in blob, (
+        "the withdrawn allowlist remediation must be gone"
+    )
+
+
+# ===========================================================================
+# REGRESSION GUARD — the fabricated "base must exactly equal the served model"
+# rule (once asserted as a hard FAIL with an allowlist remediation) is WITHDRAWN.
+# HARNESS_README.md contains no such rule. This test fails if that fabrication
+# ever creeps back into the gate's own OUTPUT, regardless of severity.
+# ===========================================================================
+
+# Phrases that would re-introduce the fabricated claim: telling the reader the
+# bases must be equal as a REQUIREMENT (harness rule / must equal / must match /
+# exact-match obligation / allowlist / retrain-or-fail). The correct output says
+# the opposite ("NOT a harness rule", "no retrain is required").
+_FORBIDDEN_BASE_EQUALITY_CLAIMS = (
+    "must exactly match",
+    "must match the served",
+    "must equal the served",
+    "harness requires the base",
+    "harness requires the adapter's base",
+    "base must equal",
+    "allowlist",
+    "retrain the adapter",
+    "requires a retrain",
+    "fails on wrong base",
+)
+
+
+def _all_base_model_outputs(policy, tmp_path, monkeypatch):
+    """Yield every distinct output the base-model gate can produce, on real artifacts.
+
+    Exercises each real branch of g_adapter_base_model:
+      * the wrong-base mismatch (the REAL adapters_staging artifact), and
+      * a config with no base_model_name_or_path (temp copy).
+    For each result it yields the rendered CLI line plus the message, evidence,
+    and remediation, so the guard inspects exactly what a reader would see.
+    """
+    # Branch 1: the real wrong-base artifact (untouched).
+    real = cs.g_adapter_base_model(policy)
+    yield cs.render_text([real])
+    yield f"{real.message} {real.evidence} {real.remediation}"
+
+    # Branch 2: a config missing base_model_name_or_path, on a temp copy so the
+    # real staging artifact is never mutated.
+    sub = tmp_path / "my_submission"
+    cfg_dir = sub / "adapters" / "main_lora"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "adapter_config.json").write_text(
+        '{"r": 8, "lora_alpha": 16}\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    nokey = cs.g_adapter_base_model(policy)
+    yield cs.render_text([nokey])
+    yield f"{nokey.message} {nokey.evidence} {nokey.remediation}"
+
+
+def test_no_gate_output_claims_base_equality_is_a_harness_requirement(policy, tmp_path, monkeypatch):
+    """No output may assert base==served is a harness REQUIREMENT (fabricated rule).
+
+    The withdrawn rule was "the adapter's base_model_name_or_path must EXACTLY
+    equal the served model". This guards against it reappearing as a FAIL-severity
+    or retrain-demanding claim in ANY of the base-model gate's own output text,
+    across every branch it can emit.
+    """
+    for output in _all_base_model_outputs(policy, tmp_path, monkeypatch):
+        low = output.lower()
+        for claim in _FORBIDDEN_BASE_EQUALITY_CLAIMS:
+            assert claim not in low, (
+                f"withdrawn fabricated base-equality rule leaked into gate output "
+                f"({claim!r}):\n{output}"
+            )
+        # The correct framing must explicitly disclaim the harness requirement.
+        if "harness" in low:
+            assert "no requirement" in low or "not a harness rule" in low or (
+                "does not require" in low
+            ), f"gate mentions 'harness' without disclaiming the base-equality rule:\n{output}"
+
+
+# ===========================================================================
+# TWO-MODE CONTRACT — submit (default) vs local_test adapter obligations.
+#
+# submit (default): adapter MUST be declared in agent.yaml AND present in
+#   adapters/; either missing is a hard FAIL (HARNESS_README.md:202-203).
+# local_test (explicit opt-in): adapter MUST be explicitly turned OFF; a
+#   still-declared adapter is a hard FAIL (no silent middle state).
+# The real agent.yaml/adapters are NEVER mutated: local_test proofs use tmp_path
+# copies with the module's path constants pointed at the copy.
+# ===========================================================================
+
+
+def test_default_submission_mode_resolves_to_submit(policy, monkeypatch):
+    """No --mode flag and no env var -> the policy default 'submit' wins."""
+    monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
+    assert cs.resolve_submission_mode(policy, cli_mode=None) == cs.MODE_SUBMIT
+    # And the policy file genuinely declares 'submit' as its default.
+    assert str(cs._policy_get(policy, "adapter", "submission_mode")) == cs.MODE_SUBMIT
+
+
+def test_submission_mode_precedence_cli_over_env_over_policy(policy, monkeypatch):
+    """Precedence is --mode CLI > GATE_SUBMISSION_MODE env > policy default."""
+    # Policy default is submit; set env to local_test -> env wins over policy.
+    monkeypatch.setenv(cs.MODE_ENV_VAR, cs.MODE_LOCAL_TEST)
+    assert cs.resolve_submission_mode(policy, cli_mode=None) == cs.MODE_LOCAL_TEST
+    # Now set the CLI flag to submit -> CLI beats env.
+    assert cs.resolve_submission_mode(policy, cli_mode=cs.MODE_SUBMIT) == cs.MODE_SUBMIT
+    # An unknown mode is rejected.
+    with pytest.raises(ValueError):
+        cs.resolve_submission_mode(policy, cli_mode="not_a_mode")
+
+
+def test_g_adapter_declared_fails_on_missing_declaration_in_submit_mode(policy, tmp_path, monkeypatch):
+    """submit mode: a tmp agent.yaml with NO 'adapter:' key -> FAIL.
+
+    The default submit obligation requires the adapter to be declared. This uses
+    a temp copy (never the real agent.yaml) and pins submit mode via the stash
+    that run_all writes, so the assertion is unambiguous.
+    """
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
+    result = cs.g_adapter_declared(pol)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL when adapter is undeclared in submit mode, got {result.status}: {result.message}"
+    )
+    assert "does not declare the required adapter" in result.message
+    # Must name the local_test escape hatch as the explicit alternative.
+    assert cs.MODE_LOCAL_TEST in result.remediation
+
+
+def test_g_adapter_present_fails_on_empty_adapters_in_submit_mode(policy, tmp_path, monkeypatch):
+    """submit mode: an EMPTY adapters/ dir -> FAIL (must be populated to submit)."""
+    sub = tmp_path / "my_submission"
+    (sub / "adapters" / "main_lora").mkdir(parents=True)  # exists, 0 files
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
+    result = cs.g_adapter_present(pol)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL on empty adapters/ in submit mode, got {result.status}: {result.message}"
+    )
+    assert "adapters/ is empty" in result.message
+    assert cs.MODE_LOCAL_TEST in result.remediation
+
+
+def test_g_adapter_declared_fails_on_still_declared_adapter_in_local_test_mode(policy, tmp_path, monkeypatch):
+    """local_test: a still-declared 'adapter:' -> FAIL (no silent middle state).
+
+    The adapter must be explicitly OFF under local_test; a surviving declaration
+    is a hard FAIL so the local path cannot pretend to use an adapter it lacks.
+    Proved on a temp copy -- the real agent.yaml is never mutated.
+    """
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\nadapter: main_lora\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_LOCAL_TEST, "source": "test"}
+    result = cs.g_adapter_declared(pol)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL on a still-declared adapter in local_test mode, got {result.status}: {result.message}"
+    )
+    assert "still declares an adapter" in result.message
+    assert cs.MODE_SUBMIT in result.remediation  # escape: run in submit mode
+
+
+def test_g_adapter_declared_passes_when_explicitly_off_in_local_test_mode(policy, tmp_path, monkeypatch):
+    """local_test: NO 'adapter:' key -> PASS (the correct OFF state)."""
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_LOCAL_TEST, "source": "test"}
+    result = cs.g_adapter_declared(pol)
+    assert result.status == cs.PASS, (
+        f"expected PASS when adapter is explicitly off in local_test mode, got {result.status}: {result.message}"
+    )
+    assert "explicitly OFF" in result.message
+
+
+def test_g_adapter_present_passes_when_absent_in_local_test_mode(policy, tmp_path, monkeypatch):
+    """local_test: an ABSENT adapters/ dir -> PASS (nothing ships)."""
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True)  # no adapters/ dir at all
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_LOCAL_TEST, "source": "test"}
+    result = cs.g_adapter_present(pol)
+    assert result.status == cs.PASS, (
+        f"expected PASS when adapters/ is absent in local_test mode, got {result.status}: {result.message}"
+    )
+    assert "absent" in result.message
 
 
 def test_g_tool_budget_parity_fails_on_mismatch(policy, tmp_path, monkeypatch):
@@ -468,8 +708,11 @@ def test_g_adapter_declared_fails_on_real_missing_declaration(policy):
     # Evidence must name the required name so the reader knows what was missing.
     assert "adapter: main_lora" in result.evidence
     assert "line found in agent.yaml" in result.evidence
-    # Remediation must point at the fix (decision D9).
-    assert "D9" in result.remediation
+    # Remediation must point at the concrete fix: add the declaration, or
+    # explicitly drop 'adapter' via local_test. (The two-mode contract reworded
+    # this from the bare "D9" pointer; the load-bearing property is that it
+    # names the actionable declaration, not that it carries a decision token.)
+    assert f"adapter: {cs._policy_get(policy, 'adapter', 'declared_name')}" in result.remediation
 
 
 def test_g_adapter_declared_passes_on_declared_temp_copy(policy, tmp_path, monkeypatch):

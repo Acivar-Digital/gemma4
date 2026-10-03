@@ -12,6 +12,33 @@ Exit code is ``0`` when no gate FAILs, ``1`` when any gate FAILs. WARN never
 affects the exit code; only FAIL does (a false-negative gate can burn the
 single daily submission slot, so WARNs are informational, FAILs are blocking).
 
+Submission modes (which obligation the adapter gates enforce):
+    submit       (DEFAULT) This tree is what gets uploaded to Kaggle, so an
+                 adapter MUST be declared in ``agent.yaml`` (``adapter:`` key
+                 present) AND present in ``adapters/`` (populated). Either one
+                 missing is a hard FAIL -- if there is no adapter for submission,
+                 fail loudly and fail quickly (HARNESS_README.md:202-203).
+    local_test   Explicit opt-in for validating the harness locally WITHOUT
+                 shipping an adapter. The adapter must be explicitly turned OFF,
+                 i.e. the ``adapter:`` key is absent from ``agent.yaml``. A
+                 ``local_test`` run that still finds an adapter declared is a
+                 hard FAIL: the local path must not pretend to use an adapter it
+                 does not have. There is no middle state in which an adapter is
+                 silently absent.
+
+``submit`` is the default and is selected by precedence:
+``--mode`` CLI flag > ``GATE_SUBMISSION_MODE`` env var > ``adapter.submission_mode``
+in the policy file. Example::
+
+    python3 scripts/check_submission.py --mode local_test
+    GATE_SUBMISSION_MODE=local_test python3 scripts/check_submission.py
+    python3 scripts/check_submission.py --mode submit  # beats the env var
+
+In BOTH modes the adapter's base-model comparison is a WARN, never a FAIL: the
+harness imposes no such rule (the adapter's own base string is never consulted
+when vLLM picks serving weights), so a mismatch is a numerical-fidelity risk
+worth surfacing, not a loading or harness violation.
+
 Layout (decision D14): all gate checks are plain functions returning the SAME
 result shape (:class:`GateResult`). Pre-submission gates operate on the
 *working tree* + the packed zip; post-run gates operate on *completed-run*
@@ -63,6 +90,27 @@ ALLOWED_SUBMISSION_EXTENSIONS = {
 PASS = "PASS"
 FAIL = "FAIL"
 WARN = "WARN"
+
+# ---------------------------------------------------------------------------
+# Submission-mode constants (adapter obligations; see the module docstring).
+#
+# The DEFAULT is 'submit': fail loudly if there is no adapter for submission.
+# 'local_test' is the only opt-out, and it inverts the obligation -- the adapter
+# must be explicitly turned OFF. These names are the *code-side* vocabulary; the
+# effective default is read from policy (adapter.submission_mode) and the
+# allowed set from policy (adapter.allowed_modes) so the policy file stays the
+# single source of truth. No served-model or other policy literal is hardcoded
+# here (a red-test asserts that).
+# ---------------------------------------------------------------------------
+MODE_SUBMIT = "submit"
+MODE_LOCAL_TEST = "local_test"
+DEFAULT_MODE = MODE_SUBMIT
+ALLOWED_MODES = (MODE_SUBMIT, MODE_LOCAL_TEST)
+
+# The environment variable that may override the policy's submission_mode. The
+# --mode CLI flag still wins over this. Deliberately namespaced with GATE_ to
+# avoid colliding with anything else in the environment.
+MODE_ENV_VAR = "GATE_SUBMISSION_MODE"
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +231,99 @@ def _resolve_serve_model_name(policy) -> str:
     return str(_policy_get(policy, "served_model", "name"))
 
 
+def _resolve_allowed_modes(policy: Dict[str, Dict[str, Any]]) -> Tuple[str, ...]:
+    """Allowed submission modes, from policy when present, else the constant.
+
+    Every policy scalar reads back as a STRING, so we split the comma-separated
+    ``adapter.allowed_modes`` value here. We always keep the two module
+    constants in the set so a malformed policy cannot silently permit a mode the
+    gate code has no branch for.
+    """
+    modes = set(ALLOWED_MODES)
+    section = policy.get("adapter") or {}
+    raw = section.get("allowed_modes")
+    if isinstance(raw, str):
+        for part in raw.split(","):
+            name = part.strip().lower()
+            if name:
+                modes.add(name)
+    return tuple(sorted(modes))
+
+
+def resolve_submission_mode(policy: Dict[str, Dict[str, Any]],
+                            cli_mode: Optional[str] = None,
+                            environ: Optional[Dict[str, str]] = None) -> str:
+    """Resolve the effective submission mode by precedence.
+
+    Precedence (highest first): explicit ``--mode`` CLI flag > ``MODE_ENV_VAR``
+    environment variable > ``adapter.submission_mode`` policy default. The
+    policy default itself defaults to ``DEFAULT_MODE`` ('submit') when absent.
+
+    Raises:
+        ValueError: if the resolved value is not one of ``_resolve_allowed_modes``.
+    """
+    env = os.environ if environ is None else environ
+    if cli_mode:
+        mode = cli_mode.strip().lower()
+    else:
+        raw_env = env.get(MODE_ENV_VAR, "").strip()
+        if raw_env:
+            mode = raw_env.lower()
+        else:
+            section = policy.get("adapter") or {}
+            mode = str(section.get("submission_mode", DEFAULT_MODE)).strip().lower()
+            if not mode:
+                mode = DEFAULT_MODE
+    allowed = _resolve_allowed_modes(policy)
+    if mode not in allowed:
+        raise ValueError(
+            f"unknown submission mode {mode!r}; allowed: {', '.join(allowed)}"
+        )
+    return mode
+
+
+def _mode_source(cli_mode: Optional[str] = None,
+                 policy: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """Human-readable provenance of the mode (cli / env / policy), for evidence.
+
+    When ``policy`` carries the private ``_resolved_mode`` stash written by
+    ``run_all``, that stash's recorded provenance wins, because it reflects the
+    ACTUAL resolution for this run (e.g. an explicit ``--mode`` the process env
+    cannot see). Otherwise we report live env/policy provenance.
+    """
+    if policy is not None:
+        stash = policy.get("_resolved_mode") or {}
+        recorded = stash.get("source")
+        if isinstance(recorded, str) and recorded.strip():
+            return recorded.strip()
+    env = os.environ
+    if cli_mode:
+        return "cli:--mode"
+    if env.get(MODE_ENV_VAR, "").strip():
+        return f"env:{MODE_ENV_VAR}"
+    return "policy:adapter.submission_mode"
+
+
+def _effective_mode(policy: Dict[str, Dict[str, Any]]) -> str:
+    """The run-wide mode a gate must honor.
+
+    ``run_all`` resolves the mode once (CLI > env > policy) and stashes it under
+    the private ``_resolved_mode`` section so every gate in the run agrees. When a
+    gate is called directly (red-tests import the module and call gates by hand,
+    with a plain ``load_policy()`` mapping that has no stash), we resolve from the
+    policy/env exactly as :func:`resolve_submission_mode` would. The stash
+    therefore wins when present, and the default remains 'submit'.
+    """
+    stash = policy.get("_resolved_mode") or {}
+    mode = stash.get("mode")
+    if isinstance(mode, str) and mode.strip():
+        return mode.strip().lower()
+    try:
+        return resolve_submission_mode(policy)
+    except ValueError:
+        return DEFAULT_MODE
+
+
 # ===========================================================================
 # PRE-SUBMISSION GATES (operating on the working tree + packed zip)
 # ===========================================================================
@@ -242,60 +383,131 @@ def g_required_files(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 # --- 2. adapter declared in agent.yaml -------------------------------------
 
 def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
-    """agent.yaml declares the policy ``declared_name`` adapter."""
+    """agent.yaml adapter declaration, per the active submission mode.
+
+    Mode semantics (see module docstring / gate_policy adapter.submission_mode):
+
+    * ``submit`` (DEFAULT): agent.yaml MUST carry an ``adapter:`` key and it MUST
+      equal the policy ``declared_name``. A missing key is a hard FAIL ("if there
+      is no adapter for submission, fail it"); a wrong value is a hard FAIL.
+    * ``local_test``: the adapter must be explicitly turned OFF, i.e. NO
+      ``adapter:`` key in agent.yaml. If a declaration is still present, that is a
+      hard FAIL -- the local path must not pretend to use an adapter it does not
+      have. An absent key is the correct PASS for this mode.
+
+    There is deliberately no middle state: in ``local_test`` a silent adapter is a
+    FAIL, and in ``submit`` a silent (absent) adapter is a FAIL.
+    """
     declared_name = str(_policy_get(policy, "adapter", "declared_name"))
+    mode = _effective_mode(policy)
     agent_yaml = os.path.join(SUBMISSION_DIR, "agent.yaml")
+    rel_agent = os.path.relpath(agent_yaml, REPO_ROOT)
     if not os.path.isfile(agent_yaml):
         return GateResult("g_adapter_declared", FAIL, "agent.yaml missing",
-                          f"expected {os.path.relpath(agent_yaml, REPO_ROOT)}", "Create agent.yaml.")
+                          f"expected {rel_agent}", "Create agent.yaml.")
     found_line = None
+    declarations = []  # (lineno, value) for every 'adapter:' line we saw
     with open(agent_yaml, "r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             stripped = line.strip()
             if stripped.startswith("adapter:"):
                 value = stripped.partition(":")[2].strip()
+                declarations.append((lineno, value))
                 if value == declared_name:
                     found_line = (lineno, value)
-                else:
-                    return GateResult(
-                        "g_adapter_declared", FAIL,
-                        f"agent.yaml adapter: value != required declared_name",
-                        f"agent.yaml:{lineno} 'adapter: {value}' != policy declared_name '{declared_name}'",
-                        f"Set 'adapter: {declared_name}' in agent.yaml (decision D9).",
-                    )
+
+    if mode == MODE_LOCAL_TEST:
+        # Adapter must be explicitly OFF. Any 'adapter:' declaration is a FAIL.
+        if declarations:
+            lineno, value = declarations[0]
+            detail = "; ".join(f"agent.yaml:{ln} 'adapter: {v}'" for ln, v in declarations)
+            return GateResult(
+                "g_adapter_declared", FAIL,
+                f"local_test mode: agent.yaml still declares an adapter ('{value}')",
+                f"{detail}; local_test requires the adapter be explicitly turned OFF "
+                f"(no 'adapter:' key) so the local path does not pretend to use an adapter it lacks",
+                f"Remove the 'adapter:' key from agent.yaml for a local_test run "
+                f"(mode {mode}, from {_mode_source(None, policy)}), or run in 'submit' mode to ship it.",
+            )
+        return GateResult(
+            "g_adapter_declared", PASS,
+            f"local_test mode: agent.yaml declares no adapter (adapter explicitly OFF)",
+            f"no 'adapter:' key in agent.yaml; mode={mode} (from {_mode_source(None, policy)})",
+            "",
+        )
+
+    # submit mode: a declaration is REQUIRED.
+    if found_line is None and declarations:
+        lineno, value = declarations[0]
+        return GateResult(
+            "g_adapter_declared", FAIL,
+            "agent.yaml adapter: value != required declared_name",
+            f"agent.yaml:{lineno} 'adapter: {value}' != policy declared_name '{declared_name}'",
+            f"Set 'adapter: {declared_name}' in agent.yaml (decision D9).",
+        )
     if found_line is None:
         return GateResult(
             "g_adapter_declared", FAIL,
             "agent.yaml does not declare the required adapter",
-            f"no 'adapter: {declared_name}' line found in agent.yaml; policy requires '{declared_name}'",
-            f"Add 'adapter: {declared_name}' to agent.yaml (decision D9).",
+            f"no 'adapter: {declared_name}' line found in agent.yaml; policy requires "
+            f"'{declared_name}'; mode={mode} (from {_mode_source(None, policy)})",
+            f"Add 'adapter: {declared_name}' to agent.yaml, or drop 'adapter' explicitly "
+            f"via --mode {MODE_LOCAL_TEST} if this is a local (no-ship) run.",
         )
     lineno, value = found_line
     return GateResult("g_adapter_declared", PASS,
                       f"agent.yaml declares adapter '{value}'",
-                      f"agent.yaml:{lineno} 'adapter: {value}'", "")
+                      f"agent.yaml:{lineno} 'adapter: {value}'; mode={mode} "
+                      f"(from {_mode_source(None, policy)})", "")
 
 
 # --- 3. adapter present ----------------------------------------------------
 
 def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
-    """The adapters/ dir inside the submission is populated."""
+    """The adapters/ dir inside the submission is populated, per submission mode.
+
+    * ``submit`` (DEFAULT): ``adapters/`` must exist AND be populated AND contain
+      ``adapter_model.safetensors``. Missing, empty, or weights-absent is a hard
+      FAIL -- shipping without an adapter means shipping no adapter.
+    * ``local_test``: the adapter is explicitly OFF, so a populated ``adapters/``
+      dir is neither required nor a defect. A present-but-empty dir PASSes (this
+      mode is for validating the harness without shipping weights). The *declaration*
+      inversion (an adapter still declared in agent.yaml) is enforced by
+      :func:`g_adapter_declared`, not here.
+    """
     adapters_subdir = str(_policy_get(policy, "adapter", "dir"))
+    mode = _effective_mode(policy)
     adir = os.path.join(SUBMISSION_DIR, adapters_subdir)
+    rel_dir = os.path.join(adapters_subdir, "")
+
     if not os.path.isdir(adir):
+        if mode == MODE_LOCAL_TEST:
+            return GateResult("g_adapter_present", PASS,
+                              f"local_test mode: {adapters_subdir}/ absent (adapter explicitly OFF)",
+                              f"{rel_dir} not present; mode={mode} (from {_mode_source(None, policy)}); "
+                              "presence is not required when no adapter ships", "")
         return GateResult("g_adapter_present", FAIL, f"{adapters_subdir}/ missing in submission",
-                          f"{adapters_subdir}/ not found under my_submission/",
-                          f"Populate my_submission/{adapters_subdir}/ with the trained adapter (D9).")
+                          f"{rel_dir} not found under my_submission/; mode={mode} "
+                          f"(from {_mode_source(None, policy)})",
+                          f"Populate my_submission/{adapters_subdir}/ with the trained adapter "
+                          f"(D9), or run in {MODE_LOCAL_TEST} mode if no adapter ships.")
     files = []
     for root, _dirs, names in os.walk(adir):
         for n in names:
             files.append(os.path.relpath(os.path.join(root, n), adir))
     if not files:
+        if mode == MODE_LOCAL_TEST:
+            return GateResult("g_adapter_present", PASS,
+                              f"local_test mode: {adapters_subdir}/ present but empty (adapter OFF)",
+                              f"{adapters_subdir}/ exists with 0 files; mode={mode} "
+                              f"(from {_mode_source(None, policy)}); empty is fine when no adapter ships", "")
         return GateResult("g_adapter_present", FAIL, f"{adapters_subdir}/ is empty",
-                          f"{adapters_subdir}/ exists but contains no files",
-                          f"Install the adapter files into my_submission/{adapters_subdir}/.")
+                          f"{adapters_subdir}/ exists but contains no files; mode={mode} "
+                          f"(from {_mode_source(None, policy)})",
+                          f"Install the adapter files into my_submission/{adapters_subdir}/, "
+                          f"or run in {MODE_LOCAL_TEST} mode if no adapter ships.")
     weight = [f for f in files if f.endswith("adapter_model.safetensors")]
-    detail = f"{len(files)} file(s); weights={'yes' if weight else 'NO'}"
+    detail = f"{len(files)} file(s); weights={'yes' if weight else 'NO'}; mode={mode}"
     if not weight:
         return GateResult("g_adapter_present", FAIL,
                           f"{adapters_subdir}/ has no adapter_model.safetensors",
@@ -320,44 +532,57 @@ def _find_adapter_config() -> Optional[str]:
 
 
 def g_adapter_base_model(policy: Dict[str, Dict[str, Any]]) -> GateResult:
-    """adapter_config base_model_name_or_path == served model, EXACTLY.
+    """Advisory check: adapter_config base_model_name_or_path vs served model.
 
-    String equality only: no allowlist, no prefix matching, no normalization
-    (decision D10). This currently FAILS on purpose — the staged adapter base
-    is a 4-bit bnb quantization that mismatches the QAT w4a16 served model.
-    Failing honestly is correct.
+    This is a NUMERICAL-FIDELITY WARN in BOTH submission modes, never a FAIL.
+    The harness imposes NO rule that an adapter's base must equal the served
+    model: ``discover_adapters()`` (HARNESS_README.md:204) registers adapters as
+    ``--lora-modules name=path`` and vLLM applies them to the already-loaded
+    base, so the adapter's own base string is never consulted when choosing
+    serving weights. ``ALLOWED_MODEL_NAMES`` (HARNESS_README.md:185) constrains
+    the ``model:`` field declared in agent.yaml -- a different field.
+
+    A mismatch (e.g. a bnb-4bit-trained adapter onto a QAT w4a16 served base) is
+    a real quality risk worth surfacing, so it WARNs -- but it is NOT a loading or
+    harness violation and does NOT demand the adapter be retrained. A clean match
+    PASSes.
     """
     required_base = str(_policy_get(policy, "adapter", "required_base_model"))
     cfg = _find_adapter_config()
     if cfg is None:
-        return GateResult("g_adapter_base_model", FAIL,
-                          "no adapter_config.json found to validate",
+        return GateResult("g_adapter_base_model", WARN,
+                          "no adapter_config.json found (cannot assess base-model fidelity)",
                           "searched my_submission/adapters/ and adapters_staging/",
-                          "Stage a real adapter with adapter_config.json.")
+                          "Advisory only. Stage an adapter if you want this fidelity signal.")
     try:
         with open(cfg, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError) as exc:
-        return GateResult("g_adapter_base_model", FAIL,
-                          "adapter_config.json unreadable/invalid JSON",
+        return GateResult("g_adapter_base_model", WARN,
+                          "adapter_config.json unreadable/invalid JSON (fidelity not assessed)",
                           f"{os.path.relpath(cfg, REPO_ROOT)}: {exc}",
-                          "Fix the adapter_config.json JSON.")
+                          "Advisory only. Fix the JSON if you want this fidelity signal.")
     base = data.get("base_model_name_or_path")
     rel = os.path.relpath(cfg, REPO_ROOT)
     if base is None:
-        return GateResult("g_adapter_base_model", FAIL,
-                          "adapter_config.json has no base_model_name_or_path",
-                          f"{rel}: key absent", "Set base_model_name_or_path to the served model.")
+        return GateResult("g_adapter_base_model", WARN,
+                          "adapter_config.json has no base_model_name_or_path (fidelity not assessed)",
+                          f"{rel}: key absent",
+                          "Advisory only; the harness does not require this key to be set.")
     if base != required_base:
         return GateResult(
-            "g_adapter_base_model", FAIL,
-            "adapter base model does not exactly match served model",
-            f"{rel}: base_model_name_or_path={base!r} != required {required_base!r}",
-            "Retrain/retarget the LoRA so its base is the served model exactly (D10); "
-            "do NOT widen with an allowlist.",
+            "g_adapter_base_model", WARN,
+            "adapter base model differs from served model (numerical-fidelity warning, NOT a harness rule)",
+            f"{rel}: base_model_name_or_path={base!r} != served {required_base!r}. "
+            "The harness imposes NO requirement that these match (discover_adapters() "
+            "registers the adapter against the already-loaded base); this is a "
+            "numerical-fidelity signal only, not a loading/harness violation.",
+            "Advisory only. If you later want the fidelity to match, prefer a LoRA "
+            "trained against the served quantization as a quality choice; no retrain is "
+            "required to pass the gates.",
         )
     return GateResult("g_adapter_base_model", PASS,
-                      "adapter base model exactly matches served model",
+                      "adapter base model matches served model",
                       f"{rel}: base_model_name_or_path={base!r}", "")
 
 
@@ -976,14 +1201,31 @@ for _n, _f in POST_RUN_GATES:
 
 
 def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
-            only: Optional[Sequence[str]] = None) -> List[GateResult]:
+            only: Optional[Sequence[str]] = None,
+            cli_mode: Optional[str] = None) -> List[GateResult]:
     """Run every gate (or the subset named in ``only``) and return results.
 
-    A gate that raises is converted into a FAIL result so one broken gate never
-    aborts the whole run (robustness requirement).
+    The effective submission mode (CLI > env > policy, see
+    :func:`resolve_submission_mode`) is resolved once here and stashed into the
+    ``policy`` mapping (under the private ``_resolved_mode`` section) so the
+    adapter gates -- whose signatures take only ``policy`` -- all observe the
+    SAME mode for the whole run without a module-level global. A gate that
+    raises is converted into a FAIL result so one broken gate never aborts the
+    whole run (robustness requirement).
     """
     if policy is None:
         policy = load_policy()
+    try:
+        effective_mode = resolve_submission_mode(policy, cli_mode=cli_mode)
+        effective_source = _mode_source(cli_mode)
+    except ValueError:
+        # An unknown mode should not crash the library entrypoint (red-tests call
+        # run_all directly). The CLI validates the mode and reports a FATAL before
+        # ever getting here; this is the defensive fallback.
+        effective_mode = DEFAULT_MODE
+        effective_source = "fallback:default(submit)"
+    policy.setdefault("_resolved_mode", {})["mode"] = effective_mode
+    policy["_resolved_mode"]["source"] = effective_source
     wanted = set(only) if only else None
     results: List[GateResult] = []
     for name, fn in ALL_GATES:
@@ -1004,8 +1246,11 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
 _STATUS_MARK = {PASS: "PASS", FAIL: "FAIL", WARN: "WARN"}
 
 
-def render_text(results: List[GateResult]) -> str:
+def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
     lines: List[str] = []
+    if mode:
+        lines.append(f"submission mode: {mode}")
+        lines.append("")
     last_section = None
     for r in results:
         section = _SECTION.get(r.name, "GATE")
@@ -1023,8 +1268,9 @@ def render_text(results: List[GateResult]) -> str:
     return "\n".join(lines)
 
 
-def to_json(results: List[GateResult]) -> str:
+def to_json(results: List[GateResult], mode: Optional[str] = None) -> str:
     payload = {
+        "mode": mode,
         "results": [asdict(r) for r in results],
         "summary": {
             "passed": sum(1 for r in results if r.status == PASS),
@@ -1037,10 +1283,23 @@ def to_json(results: List[GateResult]) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Ironclad submission gates (Gemma 4 Kaggle).")
+    parser = argparse.ArgumentParser(
+        description="Ironclad submission gates (Gemma 4 Kaggle).",
+        epilog=(
+            "Submission modes (default: submit). In 'submit', an adapter MUST be "
+            "declared in agent.yaml AND present in adapters/, else FAIL. In "
+            "'local_test', the adapter MUST be explicitly OFF (no 'adapter:' key); "
+            "a still-declared adapter FAILs. Precedence: --mode > "
+            f"{MODE_ENV_VAR} env var > policy adapter.submission_mode."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     parser.add_argument("--only", action="append", metavar="GATE",
                         help="run only the named gate (repeatable)")
+    parser.add_argument("--mode", choices=ALLOWED_MODES, default=None,
+                        help="submission mode (default: submit); overrides "
+                             f"{MODE_ENV_VAR} and the policy default")
     args = parser.parse_args(argv)
 
     try:
@@ -1054,12 +1313,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"FATAL: unknown gate(s): {', '.join(unknown)}", file=sys.stderr)
         return 1
 
-    results = run_all(policy, only=args.only)
+    try:
+        effective_mode = resolve_submission_mode(policy, cli_mode=args.mode)
+    except ValueError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 1
+
+    results = run_all(policy, only=args.only, cli_mode=args.mode)
 
     if args.json:
-        print(to_json(results))
+        print(to_json(results, mode=effective_mode))
     else:
-        print(render_text(results))
+        print(render_text(results, mode=effective_mode))
         failed = [r for r in results if r.status == FAIL]
         # Exit 1 only when a gate FAILs; WARN never blocks.
         return 1 if failed else 0

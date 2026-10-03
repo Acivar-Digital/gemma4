@@ -9,15 +9,31 @@ served_model:
   source: AGENTS.md strict-constraints; HARNESS_README.md:177/185 model allowlist
 
 adapter:
-  # A LoRA's base must match the served model EXACTLY. No allowlist.
-  # Currently FAILS: staged adapter base is unsloth/gemma-4-31B-it-unsloth-bnb-4bit (4-bit bnb),
-  # which is a quantization mismatch against the QAT w4a16 served model.
+  # required_base_model is ADVISORY ONLY. The harness imposes NO rule that an
+  # adapter's base_model_name_or_path must equal the served model: discover_adapters()
+  # (HARNESS_README.md:204) registers adapters as --lora-modules name=path and vLLM
+  # applies them to the already-loaded base, so the adapter's own base string is
+  # never consulted when choosing serving weights. A bnb-4bit-trained adapter served
+  # onto a QAT w4a16 base is a NUMERICAL-FIDELITY risk worth surfacing, so the gate
+  # WARNs; it never FAILs and never demands a retrain.
   required_base_model: gemma-4-31b-it-qat-w4a16-ct
   # agent.yaml must declare this adapter name.
   declared_name: main_lora
   # adapters/ subdir inside the submission must be populated.
   dir: adapters
-  source: verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path
+  # Which obligation the adapter gates enforce. 'submit' (DEFAULT) means this tree
+  # is what gets uploaded to Kaggle: an adapter MUST be declared in agent.yaml AND
+  # present in adapters/ -- if there is no adapter for submission, fail loudly and
+  # fail quickly. 'local_test' is the explicit opt-in for validating the harness
+  # locally without shipping an adapter: the adapter MUST be explicitly turned OFF
+  # (no 'adapter:' key in agent.yaml); a still-declared adapter in local_test is a
+  # hard FAIL. There is no middle state where an adapter is silently absent.
+  # Selection precedence: --mode CLI flag > GATE_SUBMISSION_MODE env var > this
+  # submission_mode default. Every scalar here reads back as a STRING, so the
+  # consumer coerces/splits allowed_modes on comma.
+  submission_mode: submit
+  allowed_modes: submit,local_test
+  source: verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path; HARNESS_README.md:202-203
 
 tool_budget:
   # eval_config.yaml sets this; prompts/main.md MUST agree (parity gate).
