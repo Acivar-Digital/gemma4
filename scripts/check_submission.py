@@ -8,11 +8,38 @@ decision D13). This module is both an importable library and a runnable CLI:
     python3 scripts/check_submission.py --json     # machine-readable JSON
     python3 scripts/check_submission.py --only g_zip_root_layout
     python3 scripts/check_submission.py --category submission
+    python3 scripts/check_submission.py --pre-pack # skip the zip-dependent gates
 
 Exit code is ``0`` unless a gate in the ``submission`` category FAILs. WARN never
 affects the exit code, in any category (a false-negative gate can burn the
 single daily submission slot, so WARNs are informational, FAILs are blocking --
 but "blocking" means blocking *for the category that owns the verdict*).
+
+TWO-PHASE VALIDATION (``--pre-pack``) -- validating a not-yet-built artifact
+-------------------------------------------------------------------------------
+Four gates read ``submission.zip``: ``g_submission_size_unpacked``,
+``g_zip_directory_drift``, ``g_zip_root_layout`` and ``g_disallowed_extensions``.
+Before a pack has run, a verdict from any of them is a verdict about a STALE or
+ABSENT artifact -- exactly the same category error as judging last week's run
+before this week's exists. Worse, it is a DEADLOCK: drift is only *fixable* by
+the pack, so a submission-category FAIL at that point refuses to proceed to the
+very step that would resolve the refusal. (This is not hypothetical: a stale zip
+made ``submit_safe.sh`` refuse to proceed to its own step 2.)
+
+``--pre-pack`` therefore runs every gate EXCEPT those four, and prints one
+explicit ``SKIPPED (pre-pack): <gate>`` line per skipped gate -- never a silent
+drop. The summary counts and names them and states that the full check runs
+after the pack. Pre-pack mode changes only WHICH gates run, never a verdict: a
+genuine pre-pack defect (a missing adapter) still FAILs and still exits non-zero.
+It composes with ``--only`` and ``--category`` exactly as they compose with each
+other -- a gate must satisfy all applicable filters to run.
+
+The skip set is deliberately expressed as a PHASE, not as a fourth category. A
+``pack`` category would answer "may this gate veto?", and the design gives veto
+power to the category -- so demoting ``g_zip_directory_drift`` to a non-
+submission category would make its FAIL NON-GATING by default and silently
+weaken the post-pack check that is the whole point of step 3. Phase membership
+and veto power are orthogonal axes, so they are separate mechanisms.
 
 Gate categories -- every gate is EXACTLY ONE of these, and the registry asserts
 at load time that none is uncategorized (see ``GATE_CATEGORIES``):
@@ -31,6 +58,7 @@ at load time that none is uncategorized (see ``GATE_CATEGORIES``):
                 reports, labels ``NON-GATING``, does not block by default.
 
 ``--category`` and ``--only`` compose: a gate must satisfy both filters to run.
+``--pre-pack`` composes with both as a third selection filter (see above).
 
 The gate that reports ``INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT`` is
 ``g_run_health``, a ``post_run`` gate. That phrase is preserved verbatim precisely
@@ -145,6 +173,58 @@ GATE_CATEGORIES: Tuple[str, ...] = (CAT_SUBMISSION, CAT_POST_RUN, CAT_HYGIENE)
 # The prefix used to label a non-gating FAIL in the rendered output. A reader
 # must never see INFRASTRUCTURE FAILURE and be left guessing whether it blocks.
 NON_GATING_LABEL = "NON-GATING"
+
+# ---------------------------------------------------------------------------
+# Validation PHASES — WHICH gates can produce a meaningful verdict YET.
+#
+# Deliberately NOT a fourth category. The category axis answers exactly one
+# question: "may this gate's FAIL veto a submission?" (see GATE_CATEGORIES
+# above). Phase membership answers a different, orthogonal question: "does this
+# gate have the artifact it needs to have been built?" Folding the two together
+# would demote the four zip gates to a non-submission category, and
+# exit_code_for() grants veto power only to CAT_SUBMISSION -- so their FAILs
+# would silently become NON-GATING in the default full run, which is precisely
+# the check that must stay blocking AFTER the pack. Phase and veto power are
+# separate mechanisms, kept separate.
+#
+# Every gate below opens submission.zip. Before the pack has run, each of them
+# is judging an artifact that does not exist yet or is stale, and one of them
+# (drift) can only be FIXED by the very step that a drift FAIL would block.
+# ---------------------------------------------------------------------------
+PRE_PACK_PHASE = "pre-pack"
+
+#: The gates that read submission.zip and are therefore skipped in --pre-pack
+#: mode. Asserted at load time below to be a subset of the registry and to
+#: name no gate that does not exist.
+ZIP_DEPENDENT_GATES: Tuple[str, ...] = (
+    "g_submission_size_unpacked",
+    "g_zip_directory_drift",
+    "g_zip_root_layout",
+    "g_disallowed_extensions",
+)
+
+#: The reason printed on every SKIPPED line, so no reader mistakes a skipped
+#: gate for a passing one.
+PRE_PACK_SKIP_REASON = "depends on a zip that has not been built yet"
+
+#: The operator-visible label prefix for a skipped gate. Pinned as a literal for
+#: the same reason NON_GATING_LABEL is: operator greps and CI must match it.
+PRE_PACK_SKIP_LABEL = "SKIPPED (pre-pack)"
+
+#: Stated in the summary so the skip set can never read as "everything passed".
+#: The gate total is filled in by :func:`_pre_pack_phase_hint`, which can see
+#: the fully-built registry; this is the template it fills.
+PRE_PACK_PHASE_HINT_TEMPLATE = (
+    "the full check (all {total} gates, including the {n} zip-dependent ones) "
+    "runs AFTER the pack -- e.g. submit_safe.sh step 3"
+)
+
+
+def _pre_pack_phase_hint() -> str:
+    """The summary sentence that names where the skipped gates DO get checked."""
+    return PRE_PACK_PHASE_HINT_TEMPLATE.format(
+        total=len(ALL_GATES), n=len(ZIP_DEPENDENT_GATES)
+    )
 
 # ---------------------------------------------------------------------------
 # Submission-mode constants (adapter obligations; see the module docstring).
@@ -1397,6 +1477,49 @@ def _assert_gate_categories(
 _assert_gate_categories(ALL_GATES, GATE_CATEGORY)
 
 
+def _assert_pre_pack_phase() -> None:
+    """Fail loudly at LOAD time if the pre-pack skip set is inconsistent.
+
+    Three ways it could rot silently, each of which would make ``--pre-pack``
+    quietly wrong:
+      * a name in the skip set that is not a registered gate (the skip would
+        never happen, and the gate would run on a missing artifact);
+      * a duplicated name (the SKIPPED line would print twice);
+      * an EMPTY skip set (the flag would degrade to a no-op that claims to have
+        skipped something).
+    """
+    registered = {n for n, _fn in ALL_GATES}
+    unknown = sorted(set(ZIP_DEPENDENT_GATES) - registered)
+    if unknown:
+        raise AssertionError(
+            "pre-pack skip set names gate(s) that are not registered: "
+            + ", ".join(unknown)
+        )
+    dupes = sorted({g for g in ZIP_DEPENDENT_GATES if ZIP_DEPENDENT_GATES.count(g) > 1})
+    if dupes:
+        raise AssertionError(
+            "pre-pack skip set contains duplicate(s): " + ", ".join(dupes)
+        )
+    if not ZIP_DEPENDENT_GATES:
+        raise AssertionError(
+            "pre-pack skip set is empty; --pre-pack would silently degrade to a no-op"
+        )
+
+
+_assert_pre_pack_phase()
+
+
+def skipped_by_phase(gate_name: str, phase: Optional[str] = None) -> bool:
+    """True when ``gate_name`` cannot produce a meaningful verdict in ``phase``.
+
+    With no ``phase`` (the default full run) nothing is ever skipped -- the full
+    check stays the full check. Only ``PRE_PACK_PHASE`` narrows the set.
+    """
+    if phase is None or phase != PRE_PACK_PHASE:
+        return False
+    return gate_name in ZIP_DEPENDENT_GATES
+
+
 def category_of(gate_name: str) -> str:
     """The category of a gate name (raises if unregistered -- see the assert)."""
     return GATE_CATEGORY[gate_name]
@@ -1410,10 +1533,42 @@ for _n, _f in POST_RUN_GATES:
     _SECTION[_n] = "POST-RUN"
 
 
+def selected_gates(only: Optional[Sequence[str]] = None,
+                   category: Optional[str] = None,
+                   phase: Optional[str] = None,
+                   ) -> Tuple[List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]],
+                              List[str]]:
+    """Split the registry into (gates that WILL run, gates SKIPPED by phase).
+
+    A gate must satisfy all three filters to run: ``--only``, ``--category`` and
+    the phase. ``phase`` alone decides the skip, so this function is the single
+    place that knows both sets and the two can never disagree.
+
+    A gate excluded by ``only``/``category`` is NOT reported as phase-skipped:
+    it was not selected at all, and calling that "skipped" would misattribute an
+    operator's own filter choice to the pre-pack phase. Ordering follows
+    ``ALL_GATES`` so both lists render in registry order.
+    """
+    wanted = set(only) if only else None
+    will_run: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]] = []
+    skipped: List[str] = []
+    for name, fn in ALL_GATES:
+        if wanted and name not in wanted:
+            continue
+        if category is not None and category_of(name) != category:
+            continue
+        if skipped_by_phase(name, phase):
+            skipped.append(name)
+            continue
+        will_run.append((name, fn))
+    return will_run, skipped
+
+
 def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
             only: Optional[Sequence[str]] = None,
             cli_mode: Optional[str] = None,
-            category: Optional[str] = None) -> List[GateResult]:
+            category: Optional[str] = None,
+            phase: Optional[str] = None) -> List[GateResult]:
     """Run every gate (or the subset named in ``only``) and return results.
 
     The effective submission mode (CLI > env > policy, see
@@ -1428,6 +1583,14 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
     must satisfy both to run (``only=None`` means no name filter, so a category
     alone selects the whole category). Selection changes which gates RUN, never
     a gate's verdict -- a FAIL is still a FAIL.
+
+    ``phase`` additionally narrows the run to the gates that can produce a
+    meaningful verdict yet (see the module docstring). It is a third selection
+    filter with the same property: it changes which gates RUN, never a verdict,
+    and never a selected gate's status. Skipped gates are simply absent from the
+    return value; :func:`selected_gates` reports which ones and the renderer
+    prints them as labelled SKIPPED lines. ``phase=None`` (the default) skips
+    nothing, so the full run stays the full run.
     """
     if policy is None:
         policy = load_policy()
@@ -1446,13 +1609,9 @@ def run_all(policy: Optional[Dict[str, Dict[str, Any]]] = None,
         effective_source = "fallback:default(submit)"
     policy.setdefault("_resolved_mode", {})["mode"] = effective_mode
     policy["_resolved_mode"]["source"] = effective_source
-    wanted = set(only) if only else None
+    selected, _skipped = selected_gates(only=only, category=category, phase=phase)
     results: List[GateResult] = []
-    for name, fn in ALL_GATES:
-        if wanted and name not in wanted:
-            continue
-        if category is not None and category_of(name) != category:
-            continue
+    for name, fn in selected:
         try:
             results.append(fn(policy))
         except Exception as exc:  # noqa: BLE001 - deliberate: never crash the runner
@@ -1513,7 +1672,9 @@ def exit_code_for(results: Sequence[GateResult], selected_category: Optional[str
 _STATUS_MARK = {PASS: "PASS", FAIL: "FAIL", WARN: "WARN"}
 
 
-def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
+def render_text(results: List[GateResult], mode: Optional[str] = None,
+                skipped: Optional[Sequence[str]] = None,
+                phase: Optional[str] = None) -> str:
     """Render the human-readable report.
 
     A non-gating FAIL is labelled with an explicit ``NON-GATING:`` prefix and its
@@ -1521,13 +1682,44 @@ def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
     submission blocker. The gate's own message is preserved verbatim inside the
     line -- notably ``INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT`` -- because
     that phrase is the signal we must not lose while demoting its veto power.
+
+    Gates skipped by ``phase`` (``--pre-pack``) are rendered as explicit
+    ``SKIPPED (pre-pack): <gate>`` lines in their registry position, so a skip is
+    as visible as a verdict. They are counted separately from the pass/fail/warn
+    totals and NAMED in the summary together with the sentence saying where they
+    are actually checked, because "10 passed, 0 failed" must never be readable as
+    "everything was verified".
     """
     lines: List[str] = []
+    skipped = list(skipped or [])
     if mode:
         lines.append(f"submission mode: {mode}")
         lines.append("")
+    if phase == PRE_PACK_PHASE:
+        lines.append(
+            f"phase: {PRE_PACK_PHASE} -- validating the SOURCE TREE; "
+            f"{len(skipped)} zip-dependent gate(s) are deferred to the post-pack check"
+        )
+        lines.append("")
     last_section = None
-    for r in results:
+    # One ordered walk over the registry emits both verdicts and skips in
+    # registry order, so a skipped gate appears exactly where it would have run
+    # and its section header opens even when nothing in it produced a verdict.
+    by_name = {r.name: r for r in results}
+    skipped_set = set(skipped)
+    for name, _fn in ALL_GATES:
+        if name in skipped_set:
+            if name not in by_name:
+                section = _SECTION.get(name, "GATE")
+                if section != last_section:
+                    lines.append("")
+                    lines.append(f"== {section} ==")
+                    last_section = section
+                lines.append(f"[{PRE_PACK_SKIP_LABEL}] {name}: {PRE_PACK_SKIP_REASON}")
+            continue
+        r = by_name.get(name)
+        if r is None:
+            continue
         section = _SECTION.get(r.name, "GATE")
         if section != last_section:
             lines.append("")
@@ -1543,12 +1735,32 @@ def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
             )
         else:
             lines.append(f"[{mark}] {r.name}: {r.message}")
+    # Defensive: a caller may hand us a result for a gate that is not in the
+    # registry (the old renderer printed whatever it was given). Never drop a
+    # verdict just because the registry walk did not know about it.
+    _registered = {n for n, _fn in ALL_GATES}
+    for r in results:
+        if r.name in _registered:
+            continue
+        section = _SECTION.get(r.name, "GATE")
+        if section != last_section:
+            lines.append("")
+            lines.append(f"== {section} ==")
+            last_section = section
+        mark = _STATUS_MARK.get(r.status, r.status)
+        lines.append(f"[{mark}] {r.name}: {r.message}")
     n_pass = sum(1 for r in results if r.status == PASS)
     n_fail = sum(1 for r in results if r.status == FAIL)
     n_warn = sum(1 for r in results if r.status == WARN)
     gating, non_gating = partition_fails(results)
     lines.append("")
     lines.append(f"{n_pass} passed, {n_fail} failed, {n_warn} warnings (of {len(results)} gates)")
+    if skipped:
+        lines.append(
+            f"{PRE_PACK_SKIP_LABEL}: {len(skipped)} gate(s) skipped, NOT verified: "
+            + ", ".join(skipped)
+        )
+        lines.append(f"  {_pre_pack_phase_hint()}")
     lines.append(
         f"exit code governed SOLELY by '{CAT_SUBMISSION}'-category FAILs: "
         f"{len(gating)} gating FAIL(s), {len(non_gating)} non-gating FAIL(s) "
@@ -1569,18 +1781,24 @@ def render_text(results: List[GateResult], mode: Optional[str] = None) -> str:
     return "\n".join(lines)
 
 
-def to_json(results: List[GateResult], mode: Optional[str] = None) -> str:
+def to_json(results: List[GateResult], mode: Optional[str] = None,
+            skipped: Optional[Sequence[str]] = None,
+            phase: Optional[str] = None) -> str:
     """Machine-readable JSON.
 
     The per-gate result shape is UNCHANGED (``name``, ``status``, ``message``,
     ``evidence``, ``remediation``). The category is reported as a sibling
     ``category`` key per result and summarized in ``gating``/``non_gating`` --
     additive only, so an existing consumer of the five original keys keeps
-    working.
+    working. The phase keys (``phase``, ``skipped``) are likewise additive: a
+    full run emits ``phase: null`` and an empty ``skipped`` list.
     """
     gating, non_gating = partition_fails(results)
+    skipped = list(skipped or [])
     payload = {
         "mode": mode,
+        "phase": phase,
+        "skipped": skipped,
         "results": [
             dict(asdict(r), category=GATE_CATEGORY.get(r.name, "unclassified"),
                  gating=(r.status == FAIL and GATE_CATEGORY.get(r.name) == CAT_SUBMISSION))
@@ -1591,6 +1809,7 @@ def to_json(results: List[GateResult], mode: Optional[str] = None) -> str:
             "failed": sum(1 for r in results if r.status == FAIL),
             "warnings": sum(1 for r in results if r.status == WARN),
             "total": len(results),
+            "skipped_count": len(skipped),
             "gating_failures": [r.name for r in gating],
             "non_gating_failures": [r.name for r in non_gating],
         },
@@ -1599,20 +1818,28 @@ def to_json(results: List[GateResult], mode: Optional[str] = None) -> str:
 
 
 def render_classification_table() -> str:
-    """Human-readable gate -> category table (the classification, item 5)."""
+    """Human-readable gate -> category table (the classification, item 5).
+
+    Also names the PHASE column, so a reader can see at a glance which gates
+    need a packed zip and would therefore be skipped by ``--pre-pack``.
+    """
     lines = ["gate".ljust(30) + "category".ljust(14) + "runs-by-default".ljust(17)
-             + "FAIL blocks submission"]
-    lines.append("-" * 92)
+             + "FAIL blocks submission".ljust(24) + "needs zip"]
+    lines.append("-" * 104)
     for name, _fn in ALL_GATES:
         cat = GATE_CATEGORY[name]
         blocks = "YES" if cat == CAT_SUBMISSION else "no"
-        lines.append(name.ljust(30) + cat.ljust(14) + "yes".ljust(17) + blocks)
-    lines.append("-" * 92)
+        needs_zip = "yes (skipped by --pre-pack)" if name in ZIP_DEPENDENT_GATES else "no"
+        lines.append(name.ljust(30) + cat.ljust(14) + "yes".ljust(17)
+                     + blocks.ljust(24) + needs_zip)
+    lines.append("-" * 104)
     counts: Dict[str, int] = {c: 0 for c in GATE_CATEGORIES}
     for name, _fn in ALL_GATES:
         counts[GATE_CATEGORY[name]] += 1
     lines.append(f"total gates: {len(ALL_GATES)}; classified: {len(GATE_CATEGORY)}; "
                  + ", ".join(f"{c}={counts[c]}" for c in GATE_CATEGORIES))
+    lines.append(f"zip-dependent (skipped in --pre-pack): {len(ZIP_DEPENDENT_GATES)}; "
+                 f"pre-pack runs {len(ALL_GATES) - len(ZIP_DEPENDENT_GATES)}")
     return "\n".join(lines)
 
 
@@ -1638,7 +1865,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{CAT_SUBMISSION}-category FAILs. Passing --category for a "
             f"non-{CAT_SUBMISSION} category makes that category's FAILs exit "
             f"non-zero too (you asked about it specifically). --only and "
-            f"--category compose."
+            f"--category compose.\n"
+            f"\n"
+            f"TWO PHASES (--pre-pack). Four gates read submission.zip: "
+            f"{', '.join(ZIP_DEPENDENT_GATES)}. Before a pack, their verdict is about "
+            f"an artifact that does not exist yet, and g_zip_directory_drift can only "
+            f"be FIXED by the pack -- so judging it early can refuse to proceed to the "
+            f"very step that would resolve the refusal. --pre-pack therefore skips "
+            f"exactly those four, printing an explicit '{PRE_PACK_SKIP_LABEL}' line "
+            f"and a summary count for each; every other gate runs and keeps its verdict, "
+            f"so a genuine pre-pack {CAT_SUBMISSION} FAIL still exits non-zero. Use it "
+            f"to validate the SOURCE TREE, then run the full check on the FINISHED zip."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1651,6 +1888,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              f"category makes its FAILs exit non-zero")
     parser.add_argument("--show-categories", action="store_true",
                         help="print the gate -> category classification table and exit 0")
+    parser.add_argument("--pre-pack", action="store_true",
+                        help="validate the SOURCE TREE only: run every gate EXCEPT the "
+                             f"{len(ZIP_DEPENDENT_GATES)} that read submission.zip "
+                             f"({', '.join(ZIP_DEPENDENT_GATES)}), printing one "
+                             f"'{PRE_PACK_SKIP_LABEL}' line per skipped gate. Use this "
+                             "BEFORE packing (step 1 of submit_safe.sh); the full check "
+                             "runs after the pack (step 3) and is what validates the "
+                             "artifact that will be uploaded. A genuine pre-pack "
+                             f"{CAT_SUBMISSION} FAIL still exits non-zero.")
     parser.add_argument("--mode", choices=ALLOWED_MODES, default=None,
                         help="submission mode (default: submit); overrides "
                              f"{MODE_ENV_VAR} and the policy default")
@@ -1677,13 +1923,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"FATAL: {exc}", file=sys.stderr)
         return 1
 
+    phase = PRE_PACK_PHASE if args.pre_pack else None
+    # selected_gates and run_all must agree on what runs, so derive the skip set
+    # from the SAME predicate (run_all applies it identically).
+    _selected, skipped = selected_gates(only=args.only, category=args.category,
+                                         phase=phase)
     results = run_all(policy, only=args.only, cli_mode=args.mode,
-                      category=args.category)
+                      category=args.category, phase=phase)
 
     if args.json:
-        print(to_json(results, mode=effective_mode))
+        print(to_json(results, mode=effective_mode, skipped=skipped, phase=phase))
     else:
-        print(render_text(results, mode=effective_mode))
+        print(render_text(results, mode=effective_mode, skipped=skipped,
+                          phase=phase))
     # Exit code: governed ONLY by submission-category FAILs, unless the operator
     # explicitly selected a non-submission category (see exit_code_for).
     return exit_code_for(results, selected_category=args.category)

@@ -7,16 +7,24 @@ hand-made solely to trip a code path. A gate that cannot be shown red is
 skipped and reported as unproven, not quietly passed.
 
 Real broken artifacts used (none are created or mutated by this suite):
-  * adapters_staging/main_lora/adapter_config.json -> wrong base model
+  * adapters_staging/main_lora/adapter_config.json AND the byte-identical shipped
+    copy at my_submission/adapters/main_lora/adapter_config.json -> wrong base model
     (unsloth/gemma-4-31B-it-unsloth-bnb-4bit != served gemma-4-31b-it-qat-w4a16-ct).
+    This is STILL genuinely broken in the live tree; the gate WARNs on it for real.
   * cloud_results/results/ -> the real 0/129 degenerate Gemma run
-    (129 rows, 0 resolved, 117 empty patches, 77/95 zero-completion traces).
-  * submission.zip -> genuinely stale vs my_submission/ (extra root skill
-    copies, stale prompts/main.md).
+    (129 rows, 0 resolved, 117 empty patches, 77/95 zero-completion traces). STILL
+    genuinely broken in the live tree.
   * docs/gemma-and-the-shape-of-doubt.md -> a real ~110k-char escaped code
-    literal.
+    literal. STILL genuinely broken in the live tree.
   * The historical main.md turn-ladder contradiction (Turn 11 vs Turn 13) is
     reproduced verbatim in a tmp file from the known past text.
+  * The historical zip drift (extra root skill copies + a prompts/main.md reading
+    "50 tool calls") was a REAL defect but has since been fixed -- submission.zip is
+    now byte-identical to my_submission/ -- so it is reconstructed on tmp_path from
+    the real current files rather than taken from the live tree.
+  * The historical adapter-less submission (my_submission/agent.yaml with no
+    ``adapter:`` line, and an empty adapters/main_lora/) was a REAL defect but has
+    since been fixed, so both are reconstructed on tmp_path from the real files.
 
 The suite NEVER writes to my_submission/, submission.zip, adapters_staging/ or
 cloud_results/. Any artifact that must be varied is copied into ``tmp_path``
@@ -31,7 +39,9 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
 import os
+import shutil
 import sys
 import zipfile
 
@@ -112,6 +122,37 @@ def _point_all_at_empty(empty_root, monkeypatch):
         "DOCS_DIR": os.path.join(empty_root, "docs"),
     }.items():
         monkeypatch.setattr(cs, name, value)
+
+
+def _make_adapterless_submission(tmp_path, monkeypatch):
+    """Reconstruct the historically-broken (adapter-less) submission on tmp_path.
+
+    Copies the REAL current my_submission/agent.yaml verbatim, then deletes the
+    ``adapter:`` line to reproduce the exact overnight defect this gate proved
+    red on (agent.yaml declared no adapter). ``SUBMISSION_DIR`` is pointed at the
+    copy; the real my_submission/ is never written.
+
+    Returns the tmp submission dir. Also copies the real adapters/ tree so the
+    reconstruction is faithful (the historical defect was declaration-only).
+    """
+    sub = tmp_path / "my_submission"
+    sub.mkdir()
+    real_agent = os.path.join(cs.SUBMISSION_DIR, "agent.yaml")
+    assert os.path.isfile(real_agent), "real agent.yaml missing; cannot reconstruct"
+    with open(real_agent, "r", encoding="utf-8") as fh:
+        lines = fh.readlines()
+    kept = [ln for ln in lines if not ln.strip().startswith("adapter:")]
+    assert len(kept) == len(lines) - 1, (
+        "expected the real agent.yaml to carry exactly one 'adapter:' line to remove"
+    )
+    (sub / "agent.yaml").write_text("".join(kept), encoding="utf-8")
+
+    # Faithful reconstruction: carry the real (now-populated) adapters/ over too.
+    real_adapters = os.path.join(cs.SUBMISSION_DIR, "adapters")
+    if os.path.isdir(real_adapters):
+        shutil.copytree(real_adapters, sub / "adapters")
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    return sub
 
 
 # ===========================================================================
@@ -205,12 +246,18 @@ def test_g_run_health_fails_on_real_zero_129_run(policy):
     assert "infrastructure" in result.remediation.lower()
 
 
-def test_g_adapter_base_model_warns_on_wrong_base(policy):
-    """The staged wrong-base adapter -> WARN, not FAIL (numerical fidelity only).
+def test_g_adapter_base_model_warns_on_wrong_base(policy, tmp_path, monkeypatch):
+    """The wrong-base adapter -> WARN, not FAIL (numerical fidelity only).
 
-    Uses the untouched adapters_staging/main_lora/adapter_config.json whose base
-    is unsloth/gemma-4-31B-it-unsloth-bnb-4bit (a 4-bit bnb quantization) while
-    the served model is the QAT w4a16 build.
+    The adapter shipped in my_submission/adapters/main_lora/adapter_config.json is
+    a byte-copy of the staged adapters_staging/main_lora/adapter_config.json; both
+    declare base unsloth/gemma-4-31B-it-unsloth-bnb-4bit (a 4-bit bnb quantization)
+    while the served model is the QAT w4a16 build. The gate resolves the config
+    SUBMISSION-FIRST (scripts/check_submission.py::_find_adapter_config), so against
+    the untouched live tree it reads my_submission/adapters/main_lora/ and WARNs --
+    the real, still-genuinely-wrong-base artifact, no mutation. The staging
+    fallback branch is proven separately below on a tmp copy of the real staged
+    file (never mutating adapters_staging/).
 
     The harness imposes NO rule that an adapter's base must equal the served
     model (discover_adapters() applies the adapter to the already-loaded base;
@@ -219,10 +266,26 @@ def test_g_adapter_base_model_warns_on_wrong_base(policy):
     numerical-fidelity risk worth surfacing, so the gate WARNs and must not
     demand the adapter be retrained to satisfy a requirement.
     """
-    # Guard: only meaningful if the real staging artifact is present and is the
-    # genuinely-wrong-base one (proves this is the real broken artifact).
-    real_cfg = os.path.join(cs.ADAPTERS_STAGING, "main_lora", "adapter_config.json")
-    assert os.path.isfile(real_cfg), "real staged adapter_config.json missing; cannot prove"
+    # The served model name is pinned as a LITERAL, never read back out of the
+    # policy/module, so a rename of the served-model constant cannot move the
+    # expectation with it and leave this green while the operator-visible
+    # evidence silently changed.
+    served = "gemma-4-31b-it-qat-w4a16-ct"
+    # Sanity: the policy really does still declare that same served model, so the
+    # literal above cannot drift away from reality without this firing.
+    assert str(cs._policy_get(policy, "adapter", "required_base_model")) == served, (
+        "policy adapter.required_base_model no longer matches the pinned literal"
+    )
+
+    # --- Real artifact (submission path, submission-first resolution). ---------
+    real_cfg = os.path.join(cs.SUBMISSION_DIR, "adapters", "main_lora", "adapter_config.json")
+    assert os.path.isfile(real_cfg), "real submission adapter_config.json missing; cannot prove"
+    # Guard: the live config must really be the wrong-base one, or this proof dies.
+    with open(real_cfg, "r", encoding="utf-8") as fh:
+        assert json.load(fh).get("base_model_name_or_path") != served, (
+            "real submission adapter_config.json now declares the served base; "
+            "this red-proof is stale"
+        )
 
     result = cs.g_adapter_base_model(policy)
 
@@ -234,10 +297,10 @@ def test_g_adapter_base_model_warns_on_wrong_base(policy):
         "the withdrawn fabricated rule must not FAIL the base-model gate"
     )
 
-    # Evidence must name the real staging file and BOTH sides of the mismatch.
-    assert "adapters_staging/main_lora/adapter_config.json" in result.evidence
+    # Evidence must name the resolved real file and BOTH sides of the mismatch.
+    assert "my_submission/adapters/main_lora/adapter_config.json" in result.evidence
     assert "unsloth/gemma-4-31B-it-unsloth-bnb-4bit" in result.evidence
-    assert "gemma-4-31b-it-qat-w4a16-ct" in result.evidence
+    assert served in result.evidence
 
     # It must be framed as numerical fidelity, explicitly NOT a harness rule.
     assert "numerical-fidelity" in result.message.lower()
@@ -255,6 +318,33 @@ def test_g_adapter_base_model_warns_on_wrong_base(policy):
     assert "allowlist" not in blob, (
         "the withdrawn allowlist remediation must be gone"
     )
+
+    # --- Staging-fallback branch: faithful copy of the real staged config. -----
+    staged = os.path.join(cs.ADAPTERS_STAGING, "main_lora", "adapter_config.json")
+    assert os.path.isfile(staged), "real staged adapter_config.json missing; cannot prove"
+    # Copy the REAL staged config verbatim into a tmp tree, then blank out the
+    # submission's own adapters/ so _find_adapter_config must fall back to staging.
+    tmp_sub = tmp_path / "my_submission"
+    (tmp_sub / "adapters").mkdir(parents=True)
+    (tmp_sub / "adapters" / "main_lora").mkdir()
+    with open(staged, "r", encoding="utf-8") as fh:
+        staged_text = fh.read()
+    assert json.loads(staged_text).get("base_model_name_or_path") != served, (
+        "real staged adapter_config.json is no longer the wrong-base one"
+    )
+    tmp_sub.joinpath("adapters", "main_lora", "adapter_config.json").write_text(
+        staged_text, encoding="utf-8"
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(tmp_sub))
+
+    fallback = cs.g_adapter_base_model(policy)
+    assert fallback.status == cs.WARN, (
+        f"expected WARN from the staging fallback on the wrong-base copy, got "
+        f"{fallback.status}: {fallback.message}"
+    )
+    # The staging-fallback evidence must still name both sides of the real mismatch.
+    assert "unsloth/gemma-4-31B-it-unsloth-bnb-4bit" in fallback.evidence
+    assert served in fallback.evidence
 
 
 # ===========================================================================
@@ -535,23 +625,88 @@ def test_g_prompt_ladder_consistency_fails_on_historical_contradiction(policy, t
     assert "Turn 11" in result.evidence
 
 
-def test_g_zip_directory_drift_fails_on_stale_zip(policy):
-    """The current genuinely-stale submission.zip -> FAIL.
+def _make_stale_zip_pair(tmp_path, monkeypatch):
+    """Build a genuinely stale submission directory + zip pair on tmp_path.
 
-    The zip contains 5 root skill copies (skills/code-map/map.py etc.) that were
-    deleted from my_submission/, and its prompts/main.md differs from the tree.
+    Reconstructs the SHAPE of the real historical defect (a zip that lagged the
+    working tree) from the real, current files:
+
+      * the directory holds the CURRENT prompts/main.md (the corrected 40-call
+        text), while the zip is packed with the OLD "50 tool calls" prompt, so
+        the pair is in genuine content disagreement on a file both sides have;
+      * the directory has a file the zip lacks (`prompts/only-in-dir.md`), so the
+        "in dir not zip" half of the gate also fires; and
+      * the zip carries an extra root member the directory does not have
+        (`skills/code-map/map.py`), reproducing the deleted-root-skill-copy half.
+
+    Both SUBMISSION_DIR and SUBMISSION_ZIP are pointed at the tmp copies; the real
+    my_submission/ and submission.zip are never written.
     """
-    # Guard: only meaningful if the real zip is present and actually stale.
-    assert os.path.isfile(cs.SUBMISSION_ZIP), "real submission.zip missing; cannot prove red"
+    real_dir = cs.SUBMISSION_DIR
+    sub = tmp_path / "my_submission"
+    sub.mkdir()
+    # Real, current prompts/main.md copied verbatim (the corrected prompt).
+    with open(os.path.join(real_dir, "prompts", "main.md"), "r", encoding="utf-8") as fh:
+        current_main = fh.read()
+    (sub / "prompts").mkdir()
+    (sub / "prompts" / "main.md").write_text(current_main, encoding="utf-8")
+    (sub / "prompts" / "only-in-dir.md").write_text("present in dir, absent from zip\n", encoding="utf-8")
+
+    # Zip: stale main.md (the historical 50-call text) + an extra root member.
+    stale_main = (
+        "# Prompt\n"
+        "You have a total budget of 50 tool calls per task.\n"
+    )
+    assert "50 tool calls" not in current_main, (
+        "the real current prompt already says 50; cannot build a distinct stale side"
+    )
+    zip_path = tmp_path / "submission.zip"
+    with zipfile.ZipFile(zip_path, "w") as zf:
+        zf.writestr("prompts/main.md", stale_main)
+        zf.writestr("skills/code-map/map.py", "# deleted root skill copy\n")
+
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    monkeypatch.setattr(cs, "SUBMISSION_ZIP", str(zip_path))
+    return sub, zip_path
+
+
+def test_g_zip_directory_drift_fails_on_stale_zip(policy, tmp_path, monkeypatch):
+    """A genuinely stale submission.zip -> FAIL (reconstructed on tmp_path).
+
+    The live zip is now byte-identical to my_submission/ (repacked after the
+    overnight fix), so it can no longer serve as the broken artifact. This test
+    therefore reconstructs the real historical defect faithfully on tmp_path --
+    a directory that has a file the zip lacks AND a prompt whose content differs
+    -- and proves the gate still goes red and names BOTH drift categories.
+
+    The live tree's CURRENT correct verdict is asserted separately below, so the
+    fix did not silently neuter the gate.
+    """
+    # Guard: the real zip must still exist for the live-tree half of the proof.
+    assert os.path.isfile(cs.SUBMISSION_ZIP), "real submission.zip missing; cannot prove"
+
+    # --- Red half: genuinely stale pair built from the real current files. -----
+    _make_stale_zip_pair(tmp_path, monkeypatch)
     result = cs.g_zip_directory_drift(policy)
     assert result.status == cs.FAIL, (
         f"expected FAIL on the stale zip, got {result.status}: {result.message} | {result.evidence}"
     )
     assert "out of sync" in result.message
-    # Evidence must name the real drift categories present in the current zip:
-    # extra members that no longer exist in the directory, and a differing prompt.
+    # Evidence must name ALL drift categories present in the reconstructed pair:
+    # extra members no longer in the directory, a directory-only file, and the
+    # differing prompt (the exact false-50 case this gate exists to catch).
     assert "in zip not dir" in result.evidence
+    assert "in dir not zip" in result.evidence
+    assert "content differs" in result.evidence
     assert "prompts/main.md" in result.evidence
+
+    # --- Green half: the live tree's real, current verdict is byte-identity. ---
+    monkeypatch.undo()
+    live = cs.g_zip_directory_drift(policy)
+    assert live.status == cs.PASS, (
+        f"the live zip is now in sync and must PASS, got {live.status}: {live.message}"
+    )
+    assert "byte-identical" in live.message
 
 
 def test_g_no_embedded_code_in_docs_fails_on_real_doc(policy):
@@ -662,19 +817,24 @@ def _main_exit(argv):
         return cs.main(argv), buf.getvalue()
 
 
-def test_submission_fail_sets_nonzero_exit(policy):
+def test_submission_fail_sets_nonzero_exit(policy, tmp_path, monkeypatch):
     """A submission-category FAIL -> exit 1. This is the gating case.
 
-    g_adapter_declared is a real, currently-FAILing submission gate (the real
-    my_submission/agent.yaml declares no ``adapter:``). Driving it alone through
-    main() --only must return a non-zero exit code, because a defect in the
-    artifact being shipped is exactly what must veto a submission.
+    g_adapter_declared is a submission gate that is genuinely red on the adapter-
+    less agent.yaml. The live agent.yaml now declares its adapter (the overnight
+    fix), so the FAIL is reproduced on a faithful tmp copy of the real agent.yaml
+    with the ``adapter:`` line removed; the real my_submission/ is never mutated.
+    Driving that reconstruction alone through main() --only must return a non-zero
+    exit code, because a defect in the artifact being shipped is exactly what must
+    veto a submission. The live tree's real (now-PASS) verdict is asserted too, so
+    this test also tracks the current healthy state.
 
     LOAD-BEARING: if exit_code_for treated submission FAILs as non-gating (the
     demotion bug), this returns 0 and the assertion fires. The test therefore
     distinguishes 'the new post_run demotion' from 'FAILs stopped gating at all'.
     """
-    # Sanity on the underlying verdict: this really is a FAILing submission gate.
+    # --- Red half: reconstruct the adapter-less submission so the gate FAILs. ---
+    _make_adapterless_submission(tmp_path, monkeypatch)
     result = dict(cs.ALL_GATES)["g_adapter_declared"](policy)
     assert result.status == cs.FAIL, f"precondition broken: {result.status}: {result.message}"
     assert cs.category_of("g_adapter_declared") == cs.CAT_SUBMISSION
@@ -688,6 +848,17 @@ def test_submission_fail_sets_nonzero_exit(policy):
     assert "BLOCKING:" in out
     assert _NON_GATING not in out, (
         "a submission FAIL must never be labelled NON-GATING"
+    )
+
+    # --- Green half: the live agent.yaml is healthy and must not block. ----------
+    monkeypatch.undo()
+    live = dict(cs.ALL_GATES)["g_adapter_declared"](policy)
+    assert live.status == cs.PASS, (
+        f"the live agent.yaml declares its adapter and must PASS, got {live.status}: {live.message}"
+    )
+    rc_live, out_live = _main_exit(["--only", "g_adapter_declared"])
+    assert rc_live == 0, (
+        f"a PASSing submission gate must exit 0, got {rc_live}. Output:\n{out_live}"
     )
 
 
@@ -833,7 +1004,7 @@ def test_explicit_category_post_run_selection_makes_fail_exit_nonzero(policy):
     assert f"{_NON_GATING}: g_run_health FAILED (post_run category)" in sel_out
 
 
-def test_category_and_only_compose_including_empty_intersection(policy):
+def test_category_and_only_compose_including_empty_intersection(policy, tmp_path, monkeypatch):
     """--category and --only compose: a gate must satisfy BOTH filters to run.
 
     Three cases, all against the real policy:
@@ -842,11 +1013,16 @@ def test_category_and_only_compose_including_empty_intersection(policy):
          since g_run_health is post_run) -> runs NOTHING and exits 0 (no gate
          selected => no verdict => nothing to block on).
       3. --category submission + --only g_adapter_declared (a real intersection)
-         -> runs exactly that one gate and, because it FAILs, exits 1.
+         -> runs exactly that one gate and, because it FAILs on the reconstructed
+         adapter-less agent.yaml, exits 1. (The live agent.yaml now declares its
+         adapter and PASSes, so the FAIL is reproduced on a faithful tmp copy so
+         the exit-1 half of the composition contract stays proven.)
 
     LOAD-BEARING: if --only were ignored under a category filter, case 1 would run
     everything and case 2 would run (and fail on) g_run_health instead of running
-    nothing -- the empty-intersection assertions would fire.
+    nothing -- the empty-intersection assertions would fire. In case 3, if the
+    filters did not narrow to exactly the one named gate, the "(of 1 gates)"
+    assertion would fire.
     """
     # (1) category alone selects the whole category.
     post_run_names = [n for n, _f in cs.ALL_GATES if cs.category_of(n) == cs.CAT_POST_RUN]
@@ -867,8 +1043,14 @@ def test_category_and_only_compose_including_empty_intersection(policy):
     )
 
     # (3) A real intersection runs exactly the one named gate and gates the exit.
+    # Reconstruct the adapter-less submission so g_adapter_declared genuinely FAILs.
+    _make_adapterless_submission(tmp_path, monkeypatch)
     res3 = cs.run_all(policy, only=["g_adapter_declared"], category=cs.CAT_SUBMISSION)
     assert [r.name for r in res3] == ["g_adapter_declared"]
+    assert res3[0].status == cs.FAIL, (
+        f"precondition broken: g_adapter_declared must FAIL on the reconstruction, "
+        f"got {res3[0].status}"
+    )
     rc3, out3 = _main_exit(["--only", "g_adapter_declared", "--category", "submission"])
     assert rc3 == 1, f"a FAILing submission gate under its own category must exit 1, got {rc3}"
     # Exactly one gate ran and it FAILed -- so the filters narrowed to 1, not 14.
@@ -945,33 +1127,35 @@ def test_warning_and_unknown_gate_exit_semantics_unchanged(policy):
 
 
 # ===========================================================================
-# ADAPTER-DECLARATION gates (2 & 3) — red-proof on the REAL shipped artifacts.
+# ADAPTER-DECLARATION gates (2 & 3) — red-proofs for the two historical defects.
 #
-# Both of these gates are genuinely red in this repo right now, with no
-# synthetic fixture required:
-#   * my_submission/agent.yaml has NO ``adapter:`` line at all, so
-#     g_adapter_declared FAILs with "does not declare the required adapter".
-#   * my_submission/adapters/main_lora/ exists but is EMPTY (0 files), so
-#     g_adapter_present FAILs with "adapters/ is empty".
-# The FAIL halves below are the load-bearing half; the PASS halves use tmp_path
-# copies and exist only to prove the gates are not stuck-red.
+# Both were genuinely red in this repo and both have since been FIXED:
+#   * my_submission/agent.yaml now carries ``adapter: main_lora`` (line 3), and
+#   * my_submission/adapters/main_lora/ now holds the real installed LoRA
+#     (adapter_config.json + adapter_model.safetensors).
+# The live tree is therefore healthy and can no longer carry the FAIL halves, so
+# each test below reconstructs the exact historical defect on tmp_path from the
+# real files and points the gate at the copy. Each also asserts the live tree's
+# CURRENT correct verdict, so the fix is tracked rather than assumed. The PASS
+# halves use tmp_path copies and exist only to prove the gates are not stuck-red.
 # ===========================================================================
 
-def test_g_adapter_declared_fails_on_real_missing_declaration(policy):
-    """The real agent.yaml declares no adapter -> FAIL.
+def test_g_adapter_declared_fails_on_real_missing_declaration(policy, tmp_path, monkeypatch):
+    """agent.yaml with the 'adapter:' line removed -> FAIL (reconstructed).
 
-    This is the real shipped artifact: my_submission/agent.yaml (16 lines) has
-    no ``adapter:`` key anywhere, so the gate cannot find a declaration matching
-    policy adapter.declared_name (main_lora) and goes red. Nothing is mocked or
-    mutated; this proves the gate is red on what would actually be submitted.
+    HISTORY: this red-proof originally ran against the live my_submission/agent.yaml
+    when it genuinely declared no adapter. The overnight fix added ``adapter: main_lora``
+    (agent.yaml line 3), so the live tree is now HEALTHY and can no longer carry the
+    red half. This test therefore reconstructs the exact historical defect: it copies
+    the REAL current agent.yaml verbatim to tmp_path and deletes the single ``adapter:``
+    line, then proves the gate is red on that faithful copy. Nothing in my_submission/
+    is mutated. The live tree's correct PASS is asserted separately below.
     """
-    # Guard: only meaningful if the real agent.yaml exists AND truly omits it.
-    real_agent_yaml = os.path.join(cs.SUBMISSION_DIR, "agent.yaml")
-    assert os.path.isfile(real_agent_yaml), "real agent.yaml missing; cannot prove red"
-    with open(real_agent_yaml, "r", encoding="utf-8") as fh:
-        assert not any(ln.strip().startswith("adapter:") for ln in fh), (
-            "real agent.yaml now declares an adapter; this red-proof is stale"
-        )
+    # --- Red half: faithful reconstruction of the real adapter-less agent.yaml. --
+    sub = _make_adapterless_submission(tmp_path, monkeypatch)
+    assert not any(
+        ln.strip().startswith("adapter:") for ln in (sub / "agent.yaml").read_text().splitlines()
+    ), "reconstruction failed to remove the adapter: line"
 
     result = cs.g_adapter_declared(policy)
     assert result.status == cs.FAIL, (
@@ -983,10 +1167,22 @@ def test_g_adapter_declared_fails_on_real_missing_declaration(policy):
     assert "adapter: main_lora" in result.evidence
     assert "line found in agent.yaml" in result.evidence
     # Remediation must point at the concrete fix: add the declaration, or
-    # explicitly drop 'adapter' via local_test. (The two-mode contract reworded
-    # this from the bare "D9" pointer; the load-bearing property is that it
-    # names the actionable declaration, not that it carries a decision token.)
+    # explicitly drop 'adapter' via local_test.
     assert f"adapter: {cs._policy_get(policy, 'adapter', 'declared_name')}" in result.remediation
+
+    # --- Green half: the live tree is healthy and must PASS. --------------------
+    monkeypatch.undo()
+    real_agent_yaml = os.path.join(cs.SUBMISSION_DIR, "agent.yaml")
+    assert os.path.isfile(real_agent_yaml), "real agent.yaml missing; cannot prove green"
+    with open(real_agent_yaml, "r", encoding="utf-8") as fh:
+        assert any(ln.strip().startswith("adapter:") for ln in fh), (
+            "live agent.yaml should now declare an adapter; if this regresses the "
+            "red-proof premise above no longer matches the real artifact"
+        )
+    live = cs.g_adapter_declared(policy)
+    assert live.status == cs.PASS, (
+        f"the live agent.yaml declares its adapter and must PASS, got {live.status}: {live.message}"
+    )
 
 
 def test_g_adapter_declared_passes_on_declared_temp_copy(policy, tmp_path, monkeypatch):
@@ -1006,19 +1202,21 @@ def test_g_adapter_declared_passes_on_declared_temp_copy(policy, tmp_path, monke
     assert "adapter: main_lora" in result.evidence
 
 
-def test_g_adapter_present_fails_on_empty_adapters_dir(policy):
-    """The real adapters/main_lora/ is empty -> FAIL.
+def test_g_adapter_present_fails_on_empty_adapters_dir(policy, tmp_path, monkeypatch):
+    """adapters/ exists but is EMPTY -> FAIL (reconstructed on tmp_path).
 
-    my_submission/adapters/main_lora/ genuinely exists but contains zero files
-    (the LoRA has not been trained/installed yet), so the gate finds no
-    adapter_model.safetensors and goes red on the real, unmutated tree.
+    HISTORY: this red-proof originally ran against the live my_submission/adapters/
+    main_lora/ when it genuinely existed but contained zero files. The overnight fix
+    installed the real LoRA (adapter_config.json + adapter_model.safetensors, 90 MB)
+    there, so the live tree is now HEALTHY. This test reconstructs the historical
+    empty-but-present adapters/ dir on tmp_path and proves the gate is red on it.
+    Nothing in my_submission/ is mutated. The live tree's correct PASS is asserted
+    separately below.
     """
-    # Guard: only meaningful if the real dir exists AND is genuinely empty.
-    real_dir = os.path.join(cs.SUBMISSION_DIR, "adapters", "main_lora")
-    assert os.path.isdir(real_dir), "real adapters/main_lora/ missing; cannot prove red"
-    assert not any(names for _r, _d, names in os.walk(real_dir)), (
-        "real adapters/main_lora/ now has files; this red-proof is stale"
-    )
+    # --- Red half: a faithful empty-but-present adapters/ dir on tmp_path. -------
+    sub = tmp_path / "my_submission"
+    (sub / "adapters" / "main_lora").mkdir(parents=True)  # exists, 0 files
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
 
     result = cs.g_adapter_present(policy)
     assert result.status == cs.FAIL, (
@@ -1029,6 +1227,16 @@ def test_g_adapter_present_fails_on_empty_adapters_dir(policy):
     assert "exists but contains no files" in result.evidence
     # Remediation must tell a human to install the adapter files.
     assert "Install the adapter files" in result.remediation
+
+    # --- Green half: the live tree now ships the real weights and must PASS. ----
+    monkeypatch.undo()
+    real_dir = os.path.join(cs.SUBMISSION_DIR, "adapters", "main_lora")
+    assert os.path.isdir(real_dir), "real adapters/main_lora/ missing; cannot prove green"
+    live = cs.g_adapter_present(policy)
+    assert live.status == cs.PASS, (
+        f"the live adapters dir now ships weights and must PASS, got {live.status}: {live.message}"
+    )
+    assert "weights=yes" in live.evidence
 
 
 def test_g_adapter_present_passes_on_populated_temp_dir(policy, tmp_path, monkeypatch):
