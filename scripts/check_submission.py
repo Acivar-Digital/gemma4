@@ -1331,6 +1331,46 @@ def g_run_health(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 
 # --- 14. no embedded code literals in docs ----------------------------------
 
+def resolve_embedded_code_doc_exemptions(policy: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    """Map of docs/*.md filename -> recorded exemption reason.
+
+    Read from ``hygiene.embedded_code_doc_exemptions`` (a comma-separated
+    filename list) and ``hygiene.embedded_code_doc_exemption_reasons`` (a
+    comma-separated ``<filename>=<reason>`` list). The policy file is FLAT, so
+    both arrive as single comma-separated STRINGs, exactly like
+    ``packaging.excluded_globs`` -- see :func:`resolve_excluded_globs` for the
+    same idiom. The REASON TEXT LIVES IN THE POLICY FILE, never in this logic;
+    this function only splits it. Removing a filename from the policy
+    immediately re-arms the gate for that doc.
+
+    A filename present in the exemption list with no matching reason still gets
+    a generic note, so an exemption can never become invisible -- but such an
+    entry is under-documented and should be fixed in policy, not here.
+    """
+    section = policy.get("hygiene") or {}
+    names_raw = section.get("embedded_code_doc_exemptions")
+    if names_raw is None:
+        return {}
+    if isinstance(names_raw, (list, tuple)):
+        names = [str(n) for n in names_raw]
+    else:
+        names = str(names_raw).split(",")
+    reasons: Dict[str, str] = {}
+    reasons_raw = section.get("embedded_code_doc_exemption_reasons")
+    if reasons_raw is not None:
+        parts = reasons_raw if isinstance(reasons_raw, (list, tuple)) else str(reasons_raw).split(",")
+        for part in parts:
+            doc, sep, why = str(part).partition("=")
+            if sep and doc.strip():
+                reasons[doc.strip()] = why.strip()
+    out: Dict[str, str] = {}
+    for name in names:
+        doc = name.strip()
+        if doc:
+            out[doc] = reasons.get(doc, "recorded policy exemption (no reason recorded)")
+    return out
+
+
 def g_no_embedded_code_in_docs(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     """No docs/*.md may hide a large escaped code literal.
 
@@ -1340,32 +1380,55 @@ def g_no_embedded_code_in_docs(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     markdown line longer than EMBED_THRESHOLD chars (a large escaped literal).
     Ordinary prose and short fenced snippets are far below this; the real
     offending doc has lines up to ~110k chars.
+
+    A doc named in ``hygiene.embedded_code_doc_exemptions`` is still SCANNED, but
+    its long lines are not counted as offenders -- and the exemption is always
+    REPORTED (doc name + the reason recorded in policy) so it reads as a
+    deliberate decision, never a silent skip.
     """
     EMBED_THRESHOLD = 5000
     if not os.path.isdir(DOCS_DIR):
         return GateResult("g_no_embedded_code_in_docs", WARN, "docs/ directory missing",
                           os.path.relpath(DOCS_DIR, REPO_ROOT), "No docs to scan.")
+    exempt = resolve_embedded_code_doc_exemptions(policy)
     offenders = []
+    exempt_seen = []
     for name in sorted(os.listdir(DOCS_DIR)):
         if not name.endswith(".md"):
             continue
         path = os.path.join(DOCS_DIR, name)
+        is_exempt = name in exempt
+        hit = 0
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 for lineno, line in enumerate(fh, 1):
                     if len(line.rstrip("\n")) > EMBED_THRESHOLD:
-                        offenders.append((name, lineno, len(line.rstrip("\n"))))
+                        hit += 1
+                        if not is_exempt:
+                            offenders.append((name, lineno, len(line.rstrip("\n"))))
         except OSError:
             continue
+        if is_exempt and hit:
+            exempt_seen.append(f"docs/{name}: EXEMPT by hygiene.embedded_code_doc_exemptions "
+                               f"({hit} line(s) over threshold) -- {exempt[name]}")
+    notes = "; ".join(exempt_seen)
     if offenders:
         detail = ", ".join(f"docs/{n}:{ln} ({sz} chars)" for n, ln, sz in offenders[:8])
         if len(offenders) > 8:
             detail += f" ... (+{len(offenders) - 8} more)"
+        evidence = f"threshold={EMBED_THRESHOLD} chars; {detail}"
+        if notes:
+            evidence = f"{notes}; {evidence}"
         return GateResult("g_no_embedded_code_in_docs", FAIL,
                           f"{len(offenders)} line(s) contain a large escaped code literal",
-                          f"threshold={EMBED_THRESHOLD} chars; {detail}",
+                          evidence,
                           "Extract embedded code literals into real .py files (D20/D21) and "
                           "annotate the doc to point at them.")
+    if notes:
+        return GateResult("g_no_embedded_code_in_docs", PASS,
+                          "no docs/*.md contains a large embedded code literal "
+                          "(policy-exempt doc(s) intentionally embed source)",
+                          f"threshold={EMBED_THRESHOLD} chars; scanned {DOCS_DIR}; {notes}", "")
     return GateResult("g_no_embedded_code_in_docs", PASS,
                       "no docs/*.md contains a large embedded code literal",
                       f"threshold={EMBED_THRESHOLD} chars; scanned {DOCS_DIR}", "")

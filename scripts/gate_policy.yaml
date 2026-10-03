@@ -97,3 +97,32 @@ packaging:
   # spans '/' (matching zip -x and find -name semantics for these patterns).
   excluded_globs: .DS_Store,*/.DS_Store,._*,*/._*,*/__pycache__/*,*.pyc,*.ipynb,*/.git/*,.git/*,*.swp,*~
   source: scripts/submit_safe.sh step-2 junk purge + zip -x (verified 2026-10-04)
+
+hygiene:
+  # SINGLE SOURCE OF TRUTH for docs that are ALLOWED to contain large embedded
+  # source literals, so gate g_no_embedded_code_in_docs does not FAIL forever on
+  # a deliberate design choice.
+  #
+  # gemma-and-the-shape-of-doubt.md is a RESEARCH EVIDENCE LOG: its whole point is
+  # to embed source verbatim (15 literal lines, up to ~110k chars) with sha256
+  # provenance so every claim stays reproducible. Rewriting it to satisfy a lint
+  # would destroy the evidence it exists to preserve, and its line-2818
+  # SAMPLING_HEALTH_RUNNER block is load-bearing prior art that
+  # scripts/build_kaggle_kernel.py derives from.
+  #
+  # The exemption is EXPLICIT, NOT a silent skip: the gate still scans the doc and
+  # prints an 'EXEMPT' line naming the file and this recorded reason, so a
+  # maintainer can see the pass was a deliberate decision, not a blind spot.
+  # Removing a name here immediately re-arms the gate for that doc.
+  #
+  # Comma-separated docs/*.md filenames (flat policy; the gate splits on ',').
+  embedded_code_doc_exemptions: gemma-and-the-shape-of-doubt.md
+  # Comma-separated '<filename>=<reason>' entries. The gate splits on ',' then on
+  # the FIRST '=' (str.partition), so a reason MAY contain '=' but MUST NOT
+  # contain ',' -- the flat format has no quoting, so a comma would truncate the
+  # reason. Semicolons are the intended in-reason separator.
+  embedded_code_doc_exemption_reasons: gemma-and-the-shape-of-doubt.md=research evidence log; intentionally embeds source verbatim with sha256 provenance for reproducibility; its SAMPLING_HEALTH_RUNNER block is load-bearing prior art for scripts/build_kaggle_kernel.py
+  # A doc listed in embedded_code_doc_exemptions with NO matching reason here
+  # still gets a generic 'recorded policy exemption' note (never a silent skip),
+  # but such an entry is under-documented: give every exemption a real reason.
+  source: deliberate decision 2026-10-04; see docs/gemma-and-the-shape-of-doubt.md header note

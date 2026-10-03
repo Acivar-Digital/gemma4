@@ -709,23 +709,63 @@ def test_g_zip_directory_drift_fails_on_stale_zip(policy, tmp_path, monkeypatch)
     assert "byte-identical" in live.message
 
 
-def test_g_no_embedded_code_in_docs_fails_on_real_doc(policy):
-    """docs/gemma-and-the-shape-of-doubt.md contains a ~110k-char literal -> FAIL.
+def test_g_no_embedded_code_in_docs_fails_on_real_doc(policy, monkeypatch):
+    """A docs/*.md line over the 5000-char threshold -> FAIL.
 
-    This is a real embedded code literal in a real doc, not a synthetic fixture.
+    The offender is the committed fixture tests/fixtures/hygiene_offender_doc.md,
+    a REAL markdown file on disk (not an in-memory string) whose single padded
+    line exceeds the threshold. DOCS_DIR is redirected at the directory holding
+    it, mirroring how sibling tests redirect SUBMISSION_DIR.
+
+    The live docs/gemma-and-the-shape-of-doubt.md is deliberately NOT used here:
+    it is a research evidence log that intentionally embeds source verbatim, and
+    it is exempt by recorded decision (hygiene.embedded_code_doc_exemptions in
+    scripts/gate_policy.yaml). Depending on it would make this test assert the
+    ABSENCE of a deliberate exemption. Gate logic is what this proves, and a
+    committed fixture proves it without entangling the gate's policy.
     """
-    doc = "docs/gemma-and-the-shape-of-doubt.md"
-    assert os.path.isfile(os.path.join(cs.DOCS_DIR, "gemma-and-the-shape-of-doubt.md")), (
-        "real offender doc missing; cannot prove red"
-    )
+    fixture_dir = os.path.join(REPO_ROOT, "tests", "fixtures")
+    fixture = os.path.join(fixture_dir, "hygiene_offender_doc.md")
+    assert os.path.isfile(fixture), f"red-proof fixture missing: {fixture}"
+    monkeypatch.setattr(cs, "DOCS_DIR", fixture_dir)
+
     result = cs.g_no_embedded_code_in_docs(policy)
     assert result.status == cs.FAIL, (
         f"expected FAIL on the doc with an embedded literal, got {result.status}: {result.message}"
     )
     assert "escaped code literal" in result.message
-    # Evidence must name the real offender file (and the threshold that tripped).
-    assert "docs/gemma-and-the-shape-of-doubt.md" in result.evidence
+    # Evidence must name the offending file (and the threshold that tripped).
+    assert "docs/hygiene_offender_doc.md" in result.evidence
     assert "threshold=5000" in result.evidence
+
+
+def test_g_no_embedded_code_in_docs_exempts_policy_named_doc(policy):
+    """A doc named in policy is exempt, and the exemption is NOT a silent skip.
+
+    This is the GREEN half of the pair above: the live
+    docs/gemma-and-the-shape-of-doubt.md embeds source on purpose, so it must
+    PASS -- but only because scripts/gate_policy.yaml says so, and the evidence
+    must NAME the doc and the recorded reason so a maintainer sees a deliberate
+    decision rather than a blind spot.
+    """
+    assert os.path.isfile(os.path.join(cs.DOCS_DIR, "gemma-and-the-shape-of-doubt.md")), (
+        "the exempt evidence doc is missing; this test would be vacuous"
+    )
+    # The exemption and its reason come from POLICY, not from gate logic.
+    exempt = cs.resolve_embedded_code_doc_exemptions(policy)
+    assert "gemma-and-the-shape-of-doubt.md" in exempt, (
+        f"policy must list the evidence doc as exempt; got {sorted(exempt)}"
+    )
+    assert exempt["gemma-and-the-shape-of-doubt.md"], "exemption must carry a reason"
+
+    result = cs.g_no_embedded_code_in_docs(policy)
+    assert result.status == cs.PASS, (
+        f"the policy-exempt doc must not FAIL the gate, got {result.status}: {result.message}"
+    )
+    # Visible, not silent: the exempt doc AND its recorded reason are in evidence.
+    assert "gemma-and-the-shape-of-doubt.md" in result.evidence
+    assert exempt["gemma-and-the-shape-of-doubt.md"] in result.evidence
+    assert "EXEMPT" in result.evidence
 
 
 # ===========================================================================
@@ -902,19 +942,27 @@ def test_post_run_fail_alone_exits_zero_and_is_labelled_non_gating(policy):
     assert "1 gating FAIL(s)" not in out
 
 
-def test_hygiene_fail_alone_exits_zero_and_is_labelled_non_gating(policy):
+def test_hygiene_fail_alone_exits_zero_and_is_labelled_non_gating(policy, monkeypatch):
     """A hygiene FAIL alone -> exit 0, with the same explicit NON-GATING label.
 
-    g_no_embedded_code_in_docs is a real, currently-FAILing hygiene gate (the
-    real docs/gemma-and-the-shape-of-doubt.md has a ~110k-char escaped literal).
-    It lints the repository's docs and says nothing about the artifact being
-    shipped, so it must not veto -- but it must still be reported and labelled
-    NON-GATING so a maintainer sees it is a real finding, not a blocker.
+    g_no_embedded_code_in_docs is a real, FAILing hygiene gate: the committed
+    fixture tests/fixtures/hygiene_offender_doc.md has a padded line over the
+    5000-char threshold. It lints the repository's docs and says nothing about
+    the artifact being shipped, so it must not veto -- but it must still be
+    reported and labelled NON-GATING so a maintainer sees it is a real finding,
+    not a blocker.
+
+    The FAIL precondition is produced from the FIXTURE (DOCS_DIR redirected),
+    not from the live docs/: the real evidence doc is exempt by recorded policy
+    decision and would PASS. Everything asserted below -- exit 0, [FAIL], the
+    NON-GATING label, the hygiene category, and the absence of a BLOCKING
+    banner -- is the actual subject of this test and is unchanged.
 
     LOAD-BEARING: if hygiene FAILs gated, rc would be 1 and this fires. If the
     NON-GATING label were missing, the label assertion fires.
     """
     # Sanity on the underlying verdict: this really is a FAILing hygiene gate.
+    monkeypatch.setattr(cs, "DOCS_DIR", os.path.join(REPO_ROOT, "tests", "fixtures"))
     result = dict(cs.ALL_GATES)["g_no_embedded_code_in_docs"](policy)
     assert result.status == cs.FAIL, f"precondition broken: {result.status}: {result.message}"
     assert cs.category_of("g_no_embedded_code_in_docs") == cs.CAT_HYGIENE

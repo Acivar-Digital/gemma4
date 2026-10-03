@@ -1,6 +1,14 @@
 # Gemma and the Shape of Doubt
 ### A reproducible developer agent, built around evidence
 
+> **Note — this file intentionally embeds large source/evidence literals.** It is
+> a research evidence log: 15 lines below embed source verbatim (up to ~110k
+> chars) with sha256 provenance so every claim here stays reproducible. Gate
+> `g_no_embedded_code_in_docs` (5000-char threshold) is **exempt for this file by
+> recorded decision** — see `hygiene.embedded_code_doc_exemptions` in
+> `scripts/gate_policy.yaml` for the rationale. Do not "fix" the gate by
+> reflowing these lines; that would destroy the evidence they exist to preserve.
+
 *A useful doubt asks for an observation. A useful observation changes the patch.*
 
 This notebook contains a complete original agent, a bounded source-search skill, explanatory figures and reproducible submission packaging for the Google Gemma 4 Developer Agent Competition.
