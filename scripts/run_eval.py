@@ -37,8 +37,8 @@ class EvalRunConfig(BaseModel):
         description="API Base URL (default: http://literouter.lan:7766/v1)",
     )
     api_key: str = Field(
-        default_factory=lambda: os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
-        description="API Key (default: EMPTY or SWEGEMMA_API_KEY env var)",
+        default_factory=lambda: os.getenv("SWEGEMMA_API_KEY", "lr-or-oa-ch-no"),
+        description="API Key (default: lr-or-oa-ch-no or SWEGEMMA_API_KEY env var)",
     )
     concurrency: int = Field(
         default_factory=lambda: int(os.getenv("SWEGEMMA_CONCURRENCY", "15")),
@@ -297,8 +297,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--api-key",
         type=str,
-        default=os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
-        help="API Key (default: EMPTY or SWEGEMMA_API_KEY env var)",
+        default=os.getenv("SWEGEMMA_API_KEY", "lr-or-oa-ch-no"),
+        help="API Key (default: lr-or-oa-ch-no or SWEGEMMA_API_KEY env var)",
     )
     parser.add_argument(
         "--max-tool-calls",

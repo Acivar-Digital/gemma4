@@ -1,6 +1,6 @@
-temperature: 0.1
+temperature: 0.15
 top_p: 0.95
-max_output_tokens: 4096
+max_output_tokens: 16384
 thinking_config:
-  include_thoughts: false
-  thinking_budget: 0
+  thinking_budget: 4096
+  include_thoughts: true

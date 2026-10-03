@@ -220,9 +220,9 @@ def check_submission_compilation() -> tuple[bool, str]:
         from swegemma.sandbox.subprocess import SubprocessManager
 
         models = setup_gemma_model_registry(
-            api_base="http://literouter.lan:7766/v1",
-            api_key=os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
-            served_model="stealth/space-bunny-alpha",
+            api_base=os.getenv("SWEGEMMA_API_BASE", "http://literouter.lan:7766/v1"),
+            api_key=os.getenv("SWEGEMMA_API_KEY", "lr-or-oa-ch-no"),
+            served_model=os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
         )
         mgr = SubprocessManager(system_site_packages=True)
         sb_id = mgr.start()
@@ -391,9 +391,9 @@ def check_live_agent_diagnostics() -> tuple[bool, str]:
 
     try:
         models = setup_gemma_model_registry(
-            api_base='http://literouter.lan:7766/v1',
-            api_key=os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
-            served_model='stealth/space-bunny-alpha',
+            api_base=os.getenv("SWEGEMMA_API_BASE", "http://literouter.lan:7766/v1"),
+            api_key=os.getenv("SWEGEMMA_API_KEY", "lr-or-oa-ch-no"),
+            served_model=os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
         )
         mgr = SubprocessManager(system_site_packages=True)
         sb_id = mgr.start()

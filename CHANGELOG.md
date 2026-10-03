@@ -2,7 +2,18 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-03 (Declarative Skill Hardening, Monotone Governor Ladder, Track 1 Repackaging & Multi-Turn SFT Dataset)
+## [Unreleased] - 2026-10-03 (ADK Schema Validation Fix, LiteRouter Directive Configuration & Preflight 6/6 Green)
+
+### ADK Schema Validation & Sampling Configuration
+- **Pydantic Constraint Compliance**: Fixed `my_submission/configs/sampling.yaml` by setting `thinking_budget: 4096`, `max_output_tokens: 16384`, and `include_thoughts: true`. This resolves the `Input should be greater than or equal to 1` Pydantic validation error caused by `thinking_budget: 0` in ADK `ThinkingConfig`.
+- **Repackaged `submission.zip`**: Rebuilt `submission.zip` from `my_submission` with 0 bytecode (`.pyc` count: 0) and verified ADK compiler compatibility.
+
+### LiteRouter Integration & Model Configuration
+- **Model Target**: Configured `start.sh` with `SWEGEMMA_MODEL=thinkingmachines/inkling:free` for testing with 77 Tier-1 high-confidence tasks.
+- **LiteRouter Directive**: Configured `SWEGEMMA_API_KEY=lr-or-oa-ch-no` across `start.sh`, `scripts/preflight_check.py`, and `scripts/run_eval.py`, resolving `Invalid directive: EMPTY` errors when routing to OpenRouter / Thinking Machines.
+- **Preflight Verification Gate (6/6 Checks Passed)**: Successfully ran preflight checks with 100% success across dependencies, wheels, ADK compiler, sandbox isolation, snapshot pytest, and live agent self-declaration.
+
+## [2026-10-03] - (Declarative Skill Hardening, Monotone Governor Ladder, Track 1 Repackaging & Multi-Turn SFT Dataset)
 
 ### Skill Hardening & Declarative ADK Standardization
 - **Declarative ADK Interface**: All 5 skills (`fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`) scrubbed of shell CLI affordances (`python3 script.py ...`) and standardized to declarative ADK `run_skill_script` and `args: [...]` schemas, eliminating execution ambiguity.
