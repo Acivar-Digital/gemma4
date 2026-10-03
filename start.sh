@@ -15,7 +15,7 @@ cd "$PROJECT_DIR"
 
 export PYTHONDONTWRITEBYTECODE=1
 export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-15}"
-export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-stealth/space-bunny-alpha}"
+export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-thinkingmachines/inkling:free}"
 export SWEGEMMA_API_KEY="${SWEGEMMA_API_KEY:-lr-or-oa-ch-no}"
 
 # Clean any stray bytecode cache in submission directory before ADK compilation
