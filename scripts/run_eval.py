@@ -381,10 +381,34 @@ def main() -> int:
         served_model=run_config.model,
     )
 
+    # Clean any rogue macOS metadata or bytecode before compiling agents
+    submission_dir = ROOT_DIR / "my_submission"
+    if submission_dir.exists():
+        for f in submission_dir.rglob("*.pyc"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for f in submission_dir.rglob(".DS_Store"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for f in submission_dir.rglob("._*"):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for d in submission_dir.rglob("__pycache__"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except OSError:
+                pass
+
     config = EvalConfig(
         tasks_path=ROOT_DIR / "tasks.jsonl",
         snapshots_dir=ROOT_DIR / "snapshots",
-        submission_dir=ROOT_DIR / "my_submission",
+        submission_dir=submission_dir,
         results_dir=run_dir,
         models=models,
         sandbox="subprocess",

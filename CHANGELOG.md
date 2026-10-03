@@ -2,11 +2,14 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
-## [Unreleased] - 2026-10-03 (ADK Schema Validation Fix, LiteRouter Directive Configuration & Preflight 6/6 Green)
+## [Unreleased] - 2026-10-03 (ADK Schema Validation Fix, LiteRouter Directive Configuration & .DS_Store Sanitization Hardening)
+
+### ADK Submission Sanitization & macOS Metadata Protection
+- **Automated `.DS_Store` & AppleDouble Purge**: Enhanced `clean_submission_bytecode` in `scripts/preflight_check.py` and integrated an automatic sanitization step in `scripts/run_eval.py` prior to `Evaluator` startup. It aggressively deletes `.DS_Store`, `._*` AppleDouble metadata, `.pyc`, and `__pycache__` artifacts from `my_submission/` before ADK directory validation. This permanently eliminates the ADK `SubmissionValidationError: File has disallowed extension '': .DS_Store` sandbox failures.
+- **Repackaged `submission.zip`**: Rebuilt `submission.zip` with 0 `.DS_Store` and 0 `.pyc` files (SHA-256: `b5d33ce34e0748ced10d95300f5280c7a02d05c864423ca4e1f2df288c577e00`).
 
 ### ADK Schema Validation & Sampling Configuration
 - **Pydantic Constraint Compliance**: Fixed `my_submission/configs/sampling.yaml` by setting `thinking_budget: 4096`, `max_output_tokens: 16384`, and `include_thoughts: true`. This resolves the `Input should be greater than or equal to 1` Pydantic validation error caused by `thinking_budget: 0` in ADK `ThinkingConfig`.
-- **Repackaged `submission.zip`**: Rebuilt `submission.zip` from `my_submission` with 0 bytecode (`.pyc` count: 0) and verified ADK compiler compatibility.
 
 ### LiteRouter Integration & Model Configuration
 - **Model Target**: Configured `start.sh` with `SWEGEMMA_MODEL=thinkingmachines/inkling:free` for testing with 77 Tier-1 high-confidence tasks.

@@ -192,15 +192,25 @@ def check_wheels() -> CheckResult:
 
 
 def clean_submission_bytecode(submission_dir: Path) -> None:
-    """Purge any __pycache__ directories or .pyc files from submission dir.
+    """Purge any __pycache__, .pyc, .DS_Store, or macOS metadata from submission dir.
     
-    Google ADK compiler strictly forbids .pyc files or __pycache__ inside the submission package.
+    Google ADK compiler strictly forbids .pyc files, __pycache__, or files without extensions (e.g. .DS_Store).
     """
     if not submission_dir.exists():
         return
     for pyc in submission_dir.rglob("*.pyc"):
         try:
             pyc.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for ds in submission_dir.rglob(".DS_Store"):
+        try:
+            ds.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for apple_meta in submission_dir.rglob("._*"):
+        try:
+            apple_meta.unlink(missing_ok=True)
         except OSError:
             pass
     for cache_dir in submission_dir.rglob("__pycache__"):
