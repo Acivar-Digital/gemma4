@@ -31,7 +31,7 @@ adapter:
   # Selection precedence: --mode CLI flag > GATE_SUBMISSION_MODE env var > this
   # submission_mode default. Every scalar here reads back as a STRING, so the
   # consumer coerces/splits allowed_modes on comma.
-  submission_mode: submit
+  submission_mode: local_test
   allowed_modes: submit,local_test
   source: verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path; HARNESS_README.md:202-203
 

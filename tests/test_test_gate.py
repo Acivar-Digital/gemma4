@@ -2,7 +2,7 @@
 """Comprehensive test suite for test-gate skill.
 
 Verifies:
-1. Syntax validation and byte-identical synchronization between gate.py and scripts/gate.py.
+1. Existence and py_compile syntax validation of the shipped scripts/gate.py.
 2. CLI help and unknown option handling with actionable copy-pasteable examples.
 3. Omnivorous & forgiving CLI with positional argument routing:
    - python3 gate.py (smart default: shows status on clean repo, runs blast if files modified)
@@ -54,8 +54,7 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "gate.py"
-SCRIPTS_GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "scripts" / "gate.py"
+GATE_PATH = REPO_ROOT / "my_submission" / "skills" / "test-gate" / "scripts" / "gate.py"
 
 
 def run_gate(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -108,19 +107,13 @@ def init_mock_repo(path: pathlib.Path):
 # ==============================================================================
 
 def test_syntax_and_byte_identity():
-    """DoD 1 & 2: Byte identity and py_compile syntax validation."""
+    """DoD 1 & 2: the shipped scripts/gate.py exists and compiles."""
     print("[1/9] Testing syntax validation and file sync...")
     assert GATE_PATH.exists(), f"Missing {GATE_PATH}"
-    assert SCRIPTS_GATE_PATH.exists(), f"Missing {SCRIPTS_GATE_PATH}"
-
-    # Byte-for-byte check
-    with open(GATE_PATH, "rb") as f1, open(SCRIPTS_GATE_PATH, "rb") as f2:
-        assert f1.read() == f2.read(), "gate.py and scripts/gate.py are NOT identical!"
 
     # Compile check (in-memory without writing disallowed .pyc files to submission directory)
     compile(GATE_PATH.read_text(encoding="utf-8"), str(GATE_PATH), "exec")
-    compile(SCRIPTS_GATE_PATH.read_text(encoding="utf-8"), str(SCRIPTS_GATE_PATH), "exec")
-    print("  ✓ gate.py and scripts/gate.py are byte-identical and pass py_compile.")
+    print("  ✓ scripts/gate.py exists and passes py_compile.")
 
 
 def test_cli_help_and_unknown_options():

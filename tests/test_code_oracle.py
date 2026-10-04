@@ -32,8 +32,7 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "oracle.py"
-SCRIPTS_ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "scripts" / "oracle.py"
+ORACLE_PATH = REPO_ROOT / "my_submission" / "skills" / "code-oracle" / "scripts" / "oracle.py"
 
 
 def run_oracle(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None, timeout: int = 15) -> subprocess.CompletedProcess:
@@ -54,19 +53,12 @@ def run_oracle(*args: str, cwd: pathlib.Path | None = None, env: dict | None = N
 
 
 def test_syntax_and_byte_identity():
-    print("[1/13] Testing syntax validation and byte-for-byte identity...")
+    print("[1/13] Testing syntax validation...")
     assert ORACLE_PATH.exists(), f"Missing {ORACLE_PATH}"
-    assert SCRIPTS_ORACLE_PATH.exists(), f"Missing {SCRIPTS_ORACLE_PATH}"
-
-    # Verify 100% byte-for-byte identical
-    with open(ORACLE_PATH, "rb") as f1, open(SCRIPTS_ORACLE_PATH, "rb") as f2:
-        b1, b2 = f1.read(), f2.read()
-        assert b1 == b2, f"oracle.py ({len(b1)} bytes) and scripts/oracle.py ({len(b2)} bytes) are not byte-identical!"
 
     # Compile check (in-memory without writing disallowed .pyc files to submission directory)
     compile(ORACLE_PATH.read_text(encoding="utf-8"), str(ORACLE_PATH), "exec")
-    compile(SCRIPTS_ORACLE_PATH.read_text(encoding="utf-8"), str(SCRIPTS_ORACLE_PATH), "exec")
-    print("  ✓ Syntax & byte identity verified.")
+    print("  ✓ Syntax verified for scripts/oracle.py.")
 
 
 def test_empty_and_help():

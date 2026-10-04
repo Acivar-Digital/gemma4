@@ -21,25 +21,24 @@ The 42GB is on disk, *not* in git. This is why `du -sh .` is a misleading signal
 |---|---|---|
 | **On-disk, `.gitignore`d, 0 tracked files** | `snapshots/` | ~20G |
 | | `models/` | ~18G |
-| | `adapters_staging/` | ~848M |
-| | `checkpoints/` | ~777M |
-| | `embeddings/` | ~446M |
-| | `graphs/` | ~403M |
-| | `results/` | ~124M |
+| | `adapters_staging/` | 830M |
+| | `checkpoints/` | 778M |
+| | `embeddings/` | 447M |
+| | `graphs/` | 403M |
+| | `results/` | 126M |
 | | `wheels/` | ~27M |
-| **Tracked source** | `.git` | ~1.1G |
-| | all tracked files combined | ~327M |
-| **Build artifact** (rebuildable in seconds) | `submission.zip` | 81MB |
-| **Shipped** (inside the zip) | see [§4](#4-submission-manifest) | unpacked 86.4MB |
+| | `.git` | ~1.2G |
+| | all tracked files combined | 185,469,912 bytes |
+| **Build artifact** (rebuildable in seconds) | `submission.zip` | 124KB — sha256 `bd4f31cd7971ef4df6910f6c5324259d8d337cc527b2f67549340a2f0745b05e` |
+| **Shipped** (inside the zip) | see [§4](#4-submission-manifest) | unpacked 485,641 bytes |
 | **Remote** | Kaggle leaderboard | 2 submissions on record |
 
 **Largest tracked files** (all under GitHub's 100MB per-file hard limit):
 
 | File | Size |
 |---|---|
-| `my_submission/adapters/main_lora/adapter_model.safetensors` | 86MB |
-| `submission.zip` | 81MB |
-| `kaggle_adapter_dataset/adapter_model.safetensors` | 69MB |
+| `kaggle_adapter_dataset/adapter_model.safetensors` | 90MB |
+| `submission.zip` | 124KB |
 | `cloud_results/canary_test_results/submission/adapters/main_lora/adapter_model.safetensors` | 69MB |
 | `data/unsloth_sft_train.jsonl` | 8.4MB |
 | `data/unsloth_sft_val.jsonl` | 2.2MB |
@@ -148,19 +147,17 @@ known WARN. Trust the harness, not the stale cap.
 
 ## 4. Submission manifest
 
-`submission.zip` has **31 members = 16 real files + 15 directory entries**, **flat root, no
-nested wrapper prefix** (the first-level dirs `skills/`, `configs/`, `prompts/`, `adapters/` are
-intentional, not a packaging prefix).
+`submission.zip` has **27 members = 14 real files + 13 directory entries**, **flat root, no
+nested wrapper prefix** (the first-level dirs `skills/` and `configs/` are intentional, not a
+packaging prefix).
 
-**The 16 shipped files, exactly:**
+**The 14 shipped files, exactly:**
 
 ```
 agent.yaml
 eval_config.yaml
 configs/sampling.yaml
 prompts/main.md
-adapters/main_lora/adapter_config.json
-adapters/main_lora/adapter_model.safetensors
 skills/code-map/SKILL.md
 skills/code-map/scripts/map.py
 skills/fast-grep/SKILL.md
@@ -173,36 +170,29 @@ skills/test-gate/SKILL.md
 skills/test-gate/scripts/gate.py
 ```
 
-That is 6 non-skill files + 5 skills × 2 files (a `SKILL.md` plus one script) = 16. Note the
+That is 4 non-skill files + 5 skills × 2 files (a `SKILL.md` plus one script) = 14. Note the
 script filenames are **short verbs**, not the skill name: `map.py`, `grep.py`, `oracle.py`,
 `check.py`, `gate.py`.
 
 **What is NOT in here:** no `tests/`, no `tasks.jsonl`, no gold patches, no `.npz` embeddings,
 no graphs, no snapshots, no wheels, no `checkpoints/`, no `.jsonl` dataset, no `__pycache__`,
-no `.DS_Store`.
+no `.DS_Store`, and **no `adapters/`**.
 
-**Adapter provenance — it is genuinely trained, not a random-init stub:**
+**No adapter ships.** The LoRA was removed end to end (2026-10-05): it is not in
+`my_submission/`, not declared in `agent.yaml`, and not in the archive. It was unvalidated —
+training loss 3.51 against a documented `< 1.1` target, `eval_steps: 500 > max_steps: 60` so
+validation never ran once, and 16 training rows whose tool observation *is* a `SYNTAX_ERROR`,
+which taught the agent to abandon verification. The weights remain on disk under
+`adapters_staging/` (830M, `.gitignore`d) for analysis; they are not part of the submission.
+See `docs/FINDINGS.md` for the full audit.
 
-| Property | Value |
-|---|---|
-| Tensors / modules | 460 tensors across 230 modules |
-| Rank | 8 |
-| `lora_alpha` | 16 (effective scale 2.0) |
-| Dtype | F32 |
-| Targets | `q_proj`, `k_proj`, `v_proj`, `o_proj` |
-| Training | 60 steps, loss 6.8636 → 3.5135, LR annealed to 1.63e-08 |
-| Copy integrity | byte-verified from `adapters_staging/main_lora/` with `cmp` exit 0 |
-
-**Why "all 230 `lora_B` tensors are nonzero" is a proof, not an observation:** PEFT
-**zero-initializes `lora_B`**. A freshly-created adapter has all-zero `lora_B`. Therefore
-nonzero `lora_B` is only reachable by gradient descent actually running. This is the single
-strongest piece of evidence that the adapter was trained.
-
-**Config facts that ship:** `agent.yaml` declares `model: gemma-4-31b-it-qat-w4a16-ct` and
-`adapter: main_lora`. `configs/sampling.yaml` is `temperature: 0.15`, `top_p: 0.95`,
+**Config facts that ship:** `agent.yaml` declares `model: gemma-4-31b-it-qat-w4a16-ct` and **no**
+`adapter:` key. `configs/sampling.yaml` is `temperature: 0.15`, `top_p: 0.95`,
 `max_output_tokens: 16384`, `thinking_config.thinking_budget: 4096`,
 `thinking_config.include_thoughts: true`. `thinking_level` is **deliberately ABSENT** —
-LiteLLM mistranslates it into OpenAI `reasoning_effort`.
+LiteLLM mistranslates it into OpenAI `reasoning_effort`, and its presence crashed 115 of 129
+tasks on turn 1.
+
 
 **Budget parity is exact:** the prompt's tool budget is **40**, matching
 `eval_config.yaml:4` `max_tool_calls: 40`. 40 = 40, and the prompt ladder is monotone.
@@ -255,8 +245,9 @@ operator explicitly selects its category.
 truth, and the code *reads* it rather than hardcoding. An AST test enforces that the code really
 does depend on the policy file.
 
-**Current status: exit 0** — 11 passed / 1 failed / 2 warnings, **0 gating FAILs**. The one
-FAIL is non-gating `g_run_health`. Local suite: **33 passed**.
+**Current status: exit 0** — 12 passed / 1 failed / 1 warning, **0 gating FAILs**. The one
+FAIL is non-gating `g_run_health`; the one WARN is the advisory `max_output_tokens` cap. Local
+suite: **33 passed**.
 
 **`scripts/submit_safe.sh` is the only supported submission path:**
 
@@ -280,18 +271,23 @@ This is the honest answer to "how do I know it's correct?" — because the answe
 and blurring them is how a 0.03 gets mistaken for a win.
 
 **Tier 1 — Proven by direct inspection.**
-No leakage. No gold patches. Skills are self-sufficient. Budget parity 40 = 40. The adapter is
-genuinely trained (230 nonzero `lora_B`) and byte-identical to its staging source. The zip is
-byte-identical to the source tree.
+No leakage. No gold patches. Skills are self-sufficient. Budget parity 40 = 40. `agent.yaml`
+declares no adapter and none ships. The zip is byte-identical to the source tree.
 
 **Tier 2 — Structurally correct (gates green, exit 0).**
-Config coherence, archive layout, file extensions, unpacked size 86.4MB against the 3072MB cap.
-This is necessary and it is **not** sufficient.
+Config coherence, archive layout, file extensions, unpacked size 485,641 bytes against the 3 GiB
+cap. This is necessary and it is **not** sufficient.
 
 **Tier 3 — UNPROVEN. Only a real Kaggle run can settle it.**
-Whether the agent scores above 0.03. Whether the adapter helps or hurts. Whether the serving
-path works end to end. **Do not blur these tiers.** Nothing in this repository can answer a
-tier-3 question, because the only real run on record resolved 0 of 129.
+Whether the agent scores above 0.03. Whether the serving path works end to end.
+**Do not blur these tiers.** Nothing in this repository can answer a tier-3 question, because
+the only real run on record resolved 0 of 129.
+
+> **Retired claim.** An earlier version of this document carried the adapter in Tier 1 as
+> "genuinely trained … byte-identical to its staging source". That was true of the artifact and
+> silent about its fitness. Training loss ended at 3.51 against a documented `< 1.1` target, and
+> `eval_steps: 500 > max_steps: 60` means validation never ran once — so no held-out number
+> exists. Being trained and being useful are different claims; only the second one is at issue.
 
 ---
 
@@ -302,7 +298,7 @@ The anti-grep table. Every answer has an authoritative `file:line`.
 | Question | Authoritative source |
 |---|---|
 | How do I check the tool budget? | `my_submission/eval_config.yaml:4` (`max_tool_calls: 40`) and `my_submission/prompts/main.md:59` |
-| How do I check the adapter is real? | `my_submission/adapters/main_lora/adapter_config.json` (rank 8, `lora_alpha` 16, `q/k/v/o_proj`); nonzero `lora_B` across all 230 modules |
+| How do I check no adapter ships? | `my_submission/agent.yaml` has no `adapter:` key, and `unzip -l submission.zip \| grep -c adapters/` returns `0`; gates `g_adapter_declared` / `g_adapter_present` / `g_adapter_base_model` enforce all three |
 | How do I check what ships? | `scripts/check_submission.py:1183` (`g_zip_root_layout`) and `:1120` (`g_zip_directory_drift`); the exclusion vocabulary is `scripts/gate_policy.yaml` `packaging.excluded_globs` (line 98) |
 | How do I check the exit code? | `scripts/check_submission.py:13-16` — exit 0 unless a `submission`-category gate FAILs |
 | Where do thresholds live? | `scripts/gate_policy.yaml` (single source of truth; read by the code, enforced by an AST test) |

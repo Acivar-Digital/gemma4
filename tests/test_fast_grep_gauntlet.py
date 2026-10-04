@@ -27,10 +27,7 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-GREP_PATH = REPO_ROOT / "my_submission" / "skills" / "fast-grep" / "grep.py"
-SCRIPTS_GREP_PATH = (
-    REPO_ROOT / "my_submission" / "skills" / "fast-grep" / "scripts" / "grep.py"
-)
+GREP_PATH = REPO_ROOT / "my_submission" / "skills" / "fast-grep" / "scripts" / "grep.py"
 SKILL_MD_PATH = (
     REPO_ROOT / "my_submission" / "skills" / "fast-grep" / "SKILL.md"
 )
@@ -59,20 +56,12 @@ def run_grep(
 
 
 def test_syntax_and_sync():
-    print("[1/9] Testing syntax validation and file synchronization...")
+    print("[1/9] Testing syntax validation...")
     assert GREP_PATH.exists(), f"Missing {GREP_PATH}"
-    assert SCRIPTS_GREP_PATH.exists(), f"Missing {SCRIPTS_GREP_PATH}"
-
-    # Check byte-for-byte identity
-    with open(GREP_PATH, "rb") as f1, open(SCRIPTS_GREP_PATH, "rb") as f2:
-        content1 = f1.read()
-        content2 = f2.read()
-        assert content1 == content2, "grep.py and scripts/grep.py are NOT byte-identical!"
 
     # Compile check (in-memory without writing disallowed .pyc files to submission directory)
     compile(GREP_PATH.read_text(encoding="utf-8"), str(GREP_PATH), "exec")
-    compile(SCRIPTS_GREP_PATH.read_text(encoding="utf-8"), str(SCRIPTS_GREP_PATH), "exec")
-    print("  ✓ Syntax & byte-level synchronization verified.")
+    print("  ✓ Syntax verified for scripts/grep.py.")
 
 
 def test_empty_and_overview():
@@ -84,12 +73,12 @@ def test_empty_and_overview():
             "fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents"
             in res.stdout
         )
-        assert "Tailored copy-pasteable commands" in res.stdout
+        assert "Recommended search arguments for next step:" in res.stdout
 
     # Test help flag
     res_help = run_grep("--help")
     assert res_help.returncode == 0
-    assert "Usage: python grep.py" in res_help.stdout
+    assert 'run_skill_script(skill_name="fast-grep", file_path="grep.py"' in res_help.stdout
 
     # Test JSON mode on overview
     res_json = run_grep("--json")
@@ -111,7 +100,7 @@ def test_positional_auto_detection():
     # 2. Positional query + target directory
     res_pos_path = run_grep("parse_args", "my_submission/skills/fast-grep")
     assert res_pos_path.returncode == 0
-    assert "my_submission/skills/fast-grep/grep.py" in res_pos_path.stdout
+    assert "my_submission/skills/fast-grep/scripts/grep.py" in res_pos_path.stdout
 
     # 3. Multi-term positional search (union)
     res_multi = run_grep("splitlines", "rstrip", "strip")
@@ -125,14 +114,14 @@ def test_forgiving_cli_flags():
     # 1. -p and -d flags
     res1 = run_grep("-p", "parse_args", "-d", "my_submission/skills/fast-grep")
     assert res1.returncode == 0
-    assert "my_submission/skills/fast-grep/grep.py" in res1.stdout
+    assert "my_submission/skills/fast-grep/scripts/grep.py" in res1.stdout
 
     # 2. --pattern= and --dir= flags
     res2 = run_grep(
         "--pattern=parse_args", "--dir=my_submission/skills/fast-grep"
     )
     assert res2.returncode == 0
-    assert "my_submission/skills/fast-grep/grep.py" in res2.stdout
+    assert "my_submission/skills/fast-grep/scripts/grep.py" in res2.stdout
 
     # 3. -i / --ignore-case flag
     res_ci = run_grep("-i", "apirouter")
@@ -234,11 +223,11 @@ def test_crash_and_infinite_loop_immunity():
 def test_zero_matches_actionable_diagnostics():
     print("[7/9] Testing actionable diagnostics on zero matches...")
     # 1. Case mismatch hint: search for lowercase 'fastgrepresult'
-    res_case = run_grep("fastgrepresult")
+    res_case = run_grep("fastgrepresult", "-d", "my_submission/skills")
     assert res_case.returncode == 0
     assert "0 exact matches, but" in res_case.stdout
     assert "-i / --ignore-case" in res_case.stdout
-    assert 'python3 grep.py -i "fastgrepresult"' in res_case.stdout
+    assert 'args: ["-i", "fastgrepresult"]' in res_case.stdout
 
     # 2. Narrow path filter hint: search for symbol outside target dir
     res_path = run_grep(
@@ -247,7 +236,7 @@ def test_zero_matches_actionable_diagnostics():
     assert res_path.returncode == 0
     assert "PATH FILTER TOO NARROW" in res_path.stdout
     assert "Try searching without path filter" in res_path.stdout
-    assert 'python3 grep.py "CodeGraphResult"' in res_path.stdout
+    assert 'args: ["CodeGraphResult"]' in res_path.stdout
 
     # 3. Fuzzy symbol suggestion from AST
     res_fuzzy = run_grep("FastGrepRezult")

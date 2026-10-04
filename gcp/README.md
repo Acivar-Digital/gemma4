@@ -168,12 +168,18 @@ Before mounting any newly trained LoRA adapter into the production submission:
    ```
 
 3. **Kaggle Promotion Rule:**
-   - Local validation via `./start.sh` must score $\ge 43.4\%$ across the benchmark suite (surpassing Track 1 baseline).
+   - Local validation via `./start.sh` must beat the Track 1 declarative baseline **measured on
+     `gemma-4-31b-it-qat-w4a16-ct` itself**. The historical `43.4%` is **not** a usable
+     threshold — the runs behind it (`run_B35`/`B37`/`B39`) recorded
+     `model_name: stealth/space-bunny-alpha`, a LiteRouter proxy rather than Gemma 4.
    - Must cleanly resolve canary tasks `fastapi_14479` and `requests_7205` without looping.
-   - Run the 9-gate audit:
+   - Validate and submit through the single supported path:
      ```bash
-     python3 scripts/verify_submission.py
+     bash scripts/submit_safe.sh --dry-run   # gates only; packs and submits nothing
+     bash scripts/submit_safe.sh             # gate -> pack -> gate -> hash -> quota -> prompt
      ```
+     `scripts/verify_submission.py` was deleted; `scripts/submit_safe.sh` +
+     `scripts/check_submission.py` replaced it.
 
 ---
 

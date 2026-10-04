@@ -646,6 +646,18 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
       mode is for validating the harness without shipping weights). The *declaration*
       inversion (an adapter still declared in agent.yaml) is enforced by
       :func:`g_adapter_declared`, not here.
+
+    SCOPE -- THIS GATE READS THE DIRECTORY ONLY. It deliberately does not open
+    ``submission.zip``: the zip is the graded artifact, and a second zip reader
+    here would be a second vocabulary that can silently disagree with the packer.
+
+    The zip-vs-directory invariant is not left unasserted -- it is owned by
+    :func:`g_zip_directory_drift`, which hashes every file on both sides under the
+    SAME ``packaging.excluded_globs``. Verified empirically: with an adapter
+    present in ``my_submission/`` but absent from the zip, drift reports
+    ``submission.zip is out of sync with my_submission/`` as a blocking
+    ``submission``-category FAIL, and the reverse (zip-only adapter) drifts too.
+    So a directory-only adapter cannot reach Kaggle undeclared.
     """
     adapters_subdir = str(_policy_get(policy, "adapter", "dir"))
     mode = _effective_mode(policy)
@@ -691,16 +703,14 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 # --- 4. adapter base model == served model EXACTLY -------------------------
 
 def _find_adapter_config() -> Optional[str]:
-    """Locate an adapter_config.json, preferring the submission, then staging."""
-    candidates = [
-        os.path.join(SUBMISSION_DIR, "adapters", "main_lora", "adapter_config.json"),
-        os.path.join(ADAPTERS_STAGING, "main_lora", "adapter_config.json"),
-        os.path.join(ADAPTERS_STAGING, "adapters", "main_lora", "adapter_config.json"),
-    ]
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return None
+    """Locate the adapter_config.json of the adapter that is actually GRADED.
+
+    Only ``my_submission/adapters/`` counts. Staging directories are not part
+    of the submission artifact, so a config there says nothing about what
+    Kaggle would load -- warning about one is noise that masks a real signal.
+    """
+    candidate = os.path.join(SUBMISSION_DIR, "adapters", "main_lora", "adapter_config.json")
+    return candidate if os.path.isfile(candidate) else None
 
 
 def g_adapter_base_model(policy: Dict[str, Dict[str, Any]]) -> GateResult:
@@ -722,10 +732,10 @@ def g_adapter_base_model(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     required_base = str(_policy_get(policy, "adapter", "required_base_model"))
     cfg = _find_adapter_config()
     if cfg is None:
-        return GateResult("g_adapter_base_model", WARN,
-                          "no adapter_config.json found (cannot assess base-model fidelity)",
-                          "searched my_submission/adapters/ and adapters_staging/",
-                          "Advisory only. Stage an adapter if you want this fidelity signal.")
+        return GateResult("g_adapter_base_model", PASS,
+                          "submission ships no adapter; base-model fidelity not applicable",
+                          "no adapters/main_lora/adapter_config.json in my_submission/",
+                          "")
     try:
         with open(cfg, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -749,9 +759,9 @@ def g_adapter_base_model(policy: Dict[str, Dict[str, Any]]) -> GateResult:
             "The harness imposes NO requirement that these match (discover_adapters() "
             "registers the adapter against the already-loaded base); this is a "
             "numerical-fidelity signal only, not a loading/harness violation.",
-            "Advisory only. If you later want the fidelity to match, prefer a LoRA "
-            "trained against the served quantization as a quality choice; no retrain is "
-            "required to pass the gates.",
+            "Advisory only; not a harness requirement (HARNESS_README.md has no "
+            "rule on adapter base). A LoRA fit against a different quantization may "
+            "degrade output fidelity — measure before shipping one.",
         )
     return GateResult("g_adapter_base_model", PASS,
                       "adapter base model matches served model",

@@ -28,8 +28,7 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-MAP_PATH = REPO_ROOT / "my_submission" / "skills" / "code-map" / "map.py"
-SCRIPTS_MAP_PATH = REPO_ROOT / "my_submission" / "skills" / "code-map" / "scripts" / "map.py"
+MAP_PATH = REPO_ROOT / "my_submission" / "skills" / "code-map" / "scripts" / "map.py"
 
 
 def run_map(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -52,16 +51,10 @@ def run_map(*args: str, cwd: pathlib.Path | None = None, env: dict | None = None
 def test_syntax_and_sync():
     print("[1/10] Testing syntax validation and file sync...")
     assert MAP_PATH.exists(), f"Missing {MAP_PATH}"
-    assert SCRIPTS_MAP_PATH.exists(), f"Missing {SCRIPTS_MAP_PATH}"
-
-    # Check byte-for-byte identity
-    with open(MAP_PATH, "rb") as f1, open(SCRIPTS_MAP_PATH, "rb") as f2:
-        assert f1.read() == f2.read(), "map.py and scripts/map.py are NOT identical!"
 
     # Compile check (in-memory without writing disallowed .pyc files to submission directory)
     compile(MAP_PATH.read_text(encoding="utf-8"), str(MAP_PATH), "exec")
-    compile(SCRIPTS_MAP_PATH.read_text(encoding="utf-8"), str(SCRIPTS_MAP_PATH), "exec")
-    print("  ✓ Syntax & synchronization verified.")
+    print("  ✓ Syntax verified for scripts/map.py.")
 
 
 def test_empty_and_overview():
@@ -70,9 +63,9 @@ def test_empty_and_overview():
         res = run_map(*args)
         assert res.returncode == 0, f"Call with args={args} failed with returncode {res.returncode}: {res.stderr}"
         assert "CODE-MAP: WORKSPACE OVERVIEW & ACTIONABLE USAGE GUIDE" in res.stdout, f"Header missing in {args}"
-        assert "TAILORED COPY-PASTEABLE COMMANDS:" in res.stdout
-        assert "python3 map.py --file" in res.stdout
-        assert "python3 map.py --symbol" in res.stdout
+        assert "RECOMMENDED TOOL ARGUMENTS:" in res.stdout
+        assert 'args: ["--file"' in res.stdout
+        assert 'args: ["--symbol"' in res.stdout
 
     # Test JSON mode on overview
     res_json = run_map("--json")

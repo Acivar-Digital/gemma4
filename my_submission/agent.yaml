@@ -1,6 +1,5 @@
 name: main
 model: gemma-4-31b-it-qat-w4a16-ct
-adapter: main_lora
 instruction: !include prompts/main.md
 tools:
   - read_file

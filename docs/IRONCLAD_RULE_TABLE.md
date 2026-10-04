@@ -50,7 +50,7 @@ Origin is `HARNESS_README.md` unless marked PROJECT (derived in this repo).
 | rule | source | value now | asserted? |
 |---|---|---|---|
 | declared `adapter:` implies `adapters/<n>/adapter_model.safetensors` **in the zip** | README:145,203 | none declared | PARTIAL — dir/zip split |
-| `base_model_name_or_path` == served model | PROJECT | n/a (adapter absent) | no |
+| ~~adapter base must equal served model~~ | **RETRACTED (fabricated)** — see `SHARED_UNDERSTANDING.md:192` | never was a rule | n/a |
 | `r <= 128` | README:169,204 | 8 pass | no |
 | adapter count `<= 8` | README:169,204 | 0 pass | no |
 | `.safetensors` only, no `.bin`/`.pt`/`.pth` | README:145 | pass | yes |

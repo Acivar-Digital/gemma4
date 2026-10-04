@@ -73,12 +73,17 @@ useless by construction.
    counterpart (sha256), and every non-excluded directory file is present in
    the zip. This is the check that does not exist today.
 2. `agent.yaml` at zip root, exactly one root config (README:72,97).
-3. **Adapter coherence, four-part**: if any agent declares `adapter:` then
+3. **Adapter coherence, three-part**: if any agent declares `adapter:` then
    (a) `adapters/<name>/adapter_model.safetensors` exists **in the zip**, (b)
-   `adapter_config.json` `base_model_name_or_path` matches the served model,
-   (c) `r <= 128` (README:169), (d) recorded sha256 equals the recorded build
-   manifest. Today only (a)-in-zip and (c) are partially attempted, and (a) is
+   `r <= 128` (README:169), (c) recorded sha256 equals the recorded build
+   manifest. Today only (a)-in-zip and (b) are partially attempted, and (a) is
    satisfied by *either* signal so a directory-only adapter passes.
+   **RETRACTED 5 Oct 2026:** the former clause (b), which required an adapter's recorded base
+   model to equal the served model, was a **fabricated requirement** — no such harness rule
+   exists. See `SHARED_UNDERSTANDING.md:192`. `ALLOWED_MODEL_NAMES` (README:185) constrains the
+   `model:` field declared in `agent.yaml`, not the adapter's own config, and
+   `discover_adapters()` (README:204) applies LoRA modules to the already-loaded base without
+   ever consulting the adapter's base string. The gate above is therefore three-part, not four.
 4. Extension allowlist `.yaml,.yml,.md,.txt,.py,.json,.safetensors` (README:144).
    `.DS_Store` is **disallowed** and is currently present on disk in
    `my_submission/` — it survives only because the zip excludes it.

@@ -24,8 +24,7 @@ sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "check.py"
-SCRIPTS_CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "scripts" / "check.py"
+CHECK_PY = REPO_ROOT / "my_submission" / "skills" / "repro-check" / "scripts" / "check.py"
 
 
 def run_check(*args: str, env: dict | None = None, stdin_data: str | None = None) -> subprocess.CompletedProcess:
@@ -48,20 +47,12 @@ def run_check(*args: str, env: dict | None = None, stdin_data: str | None = None
 
 
 def test_syntax_and_byte_identity() -> None:
-    print("[1/10] Testing syntax validation and byte-for-byte identity...")
+    print("[1/10] Testing syntax validation...")
     assert CHECK_PY.exists(), f"Missing {CHECK_PY}"
-    assert SCRIPTS_CHECK_PY.exists(), f"Missing {SCRIPTS_CHECK_PY}"
-
-    # Byte-for-byte identity
-    with open(CHECK_PY, "rb") as f1, open(SCRIPTS_CHECK_PY, "rb") as f2:
-        content1 = f1.read()
-        content2 = f2.read()
-    assert content1 == content2, "check.py and scripts/check.py are NOT byte-identical!"
 
     # Compile check (in-memory without writing disallowed .pyc files to submission directory)
     compile(CHECK_PY.read_text(encoding="utf-8"), str(CHECK_PY), "exec")
-    compile(SCRIPTS_CHECK_PY.read_text(encoding="utf-8"), str(SCRIPTS_CHECK_PY), "exec")
-    print("  ✓ Syntax & byte identity verified.")
+    print("  ✓ Syntax verified for scripts/check.py.")
 
 
 def test_string_assertion_with_ansi_escapes() -> None:

@@ -24,9 +24,14 @@ backups/
 *credentials*
 *secret*
 kaggle.json
+.kaggle.json
+access_token
+.kaggle/
 *.token
 *.token.json
+*.kaggle.token
 asus_vpn/
+kaggle_baseline_v1/submission.zip
 
 # Beads / Dolt files (standard bd pattern)
 .dolt/
