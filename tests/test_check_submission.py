@@ -575,12 +575,18 @@ def test_g_adapter_present_still_fails_on_populated_dir_without_weights(policy, 
 
 
 
-def test_g_adapter_declared_fails_on_still_declared_adapter_in_local_test_mode(policy, tmp_path, monkeypatch):
-    """local_test: a still-declared 'adapter:' -> FAIL (no silent middle state).
+def test_g_adapter_declared_passes_on_declared_adapter_in_local_test_mode(policy, tmp_path, monkeypatch):
+    """local_test: a correctly-declared 'adapter:' now PASSES (was FAIL).
 
-    The adapter must be explicitly OFF under local_test; a surviving declaration
-    is a hard FAIL so the local path cannot pretend to use an adapter it lacks.
-    Proved on a temp copy -- the real agent.yaml is never mutated.
+    CONTRACT CHANGE 2026-10-05 -- this is the trap that made the adapter
+    obligation mode-driven unworkable. ``adapter.submission_mode`` defaults to
+    ``local_test`` (scripts/gate_policy.yaml) and ``scripts/submit_safe.sh``
+    passes no ``--mode`` and no ``GATE_SUBMISSION_MODE``, so local_test was the
+    EFFECTIVE mode at pack time. Under the old rule local_test FAILed any
+    declared adapter, so the moment Track 2 mounted ``adapter: main_lora`` the
+    only shipping path hard-blocked on its own adapter. The obligation is now the
+    policy scalar ``adapter.required``; the mode selects budgets and packaging
+    only. Proved on a temp copy -- the real agent.yaml is never mutated.
     """
     sub = tmp_path / "my_submission"
     sub.mkdir(parents=True)
@@ -593,15 +599,15 @@ def test_g_adapter_declared_fails_on_still_declared_adapter_in_local_test_mode(p
     pol = dict(policy)
     pol["_resolved_mode"] = {"mode": cs.MODE_LOCAL_TEST, "source": "test"}
     result = cs.g_adapter_declared(pol)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL on a still-declared adapter in local_test mode, got {result.status}: {result.message}"
+    assert result.status == cs.PASS, (
+        f"a correctly-declared adapter must not be vetoed by the local_test mode, "
+        f"got {result.status}: {result.message}"
     )
-    assert "still declares an adapter" in result.message
-    assert cs.MODE_SUBMIT in result.remediation  # escape: run in submit mode
+    assert "main_lora" in result.message
 
 
-def test_g_adapter_declared_passes_when_explicitly_off_in_local_test_mode(policy, tmp_path, monkeypatch):
-    """local_test: NO 'adapter:' key -> PASS (the correct OFF state)."""
+def test_g_adapter_declared_passes_when_no_adapter_and_not_required(policy, tmp_path, monkeypatch):
+    """No 'adapter:' key + policy required:false -> PASS in EITHER mode."""
     sub = tmp_path / "my_submission"
     sub.mkdir(parents=True)
     (sub / "agent.yaml").write_text(
@@ -609,13 +615,16 @@ def test_g_adapter_declared_passes_when_explicitly_off_in_local_test_mode(policy
     )
     monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
 
-    pol = dict(policy)
-    pol["_resolved_mode"] = {"mode": cs.MODE_LOCAL_TEST, "source": "test"}
-    result = cs.g_adapter_declared(pol)
-    assert result.status == cs.PASS, (
-        f"expected PASS when adapter is explicitly off in local_test mode, got {result.status}: {result.message}"
-    )
-    assert "explicitly OFF" in result.message
+    # Deliberately drive BOTH modes: the verdict must not depend on them.
+    for mode in (cs.MODE_LOCAL_TEST, cs.MODE_SUBMIT):
+        pol = dict(policy)
+        pol["_resolved_mode"] = {"mode": mode, "source": "test"}
+        result = cs.g_adapter_declared(pol)
+        assert result.status == cs.PASS, (
+            f"expected PASS in {mode} when no adapter ships and required is false, "
+            f"got {result.status}: {result.message}"
+        )
+        assert "OPTIONAL" in result.message
 
 
 def test_g_adapter_present_passes_when_absent_in_local_test_mode(policy, tmp_path, monkeypatch):

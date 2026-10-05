@@ -65,24 +65,34 @@ The gate that reports ``INFRASTRUCTURE FAILURE, NOT A QUALITY RESULT`` is
 BECAUSE the gate no longer blocks: demoting its veto power must not cost it its
 voice.
 
-Submission modes (which obligation the adapter gates enforce):
-    submit       (DEFAULT) This tree is what gets uploaded to Kaggle, so an
-                 adapter MUST be declared in ``agent.yaml`` (``adapter:`` key
-                 present) AND present in ``adapters/`` (populated). Either one
-                 missing is a hard FAIL -- if there is no adapter for submission,
-                 fail loudly and fail quickly (HARNESS_README.md:202-203).
-    local_test   Explicit opt-in for validating the harness locally WITHOUT
-                 shipping an adapter. The adapter must be explicitly turned OFF,
-                 i.e. the ``adapter:`` key is absent from ``agent.yaml``. A
-                 ``local_test`` run that still finds an adapter declared is a
-                 hard FAIL: the local path must not pretend to use an adapter it
-                 does not have. There is no middle state in which an adapter is
-                 silently absent.
+The adapter obligation is NOT mode-driven. It is driven by the policy scalar
+``adapter.required``, because coupling it to the mode made the two-mode
+vocabulary a trap: ``adapter.submission_mode`` defaults to ``local_test`` and
+``scripts/submit_safe.sh`` passes no ``--mode``, so the effective mode at pack
+time was ``local_test`` -- under which the old rule FAILed any declared adapter,
+hard-blocking the only shipping path the moment Track 2 mounted one.
 
-``submit`` is the default and is selected by precedence:
-``--mode`` CLI flag > ``GATE_SUBMISSION_MODE`` env var > ``adapter.submission_mode``
-in the policy file. Example::
+What the submission mode still means (it selects budgets/packaging, not the
+adapter):
+    submit       This tree is what gets uploaded to Kaggle.
+    local_test   Explicit opt-in for validating the harness locally without
+                 shipping. Currently the shipped default
+                 (scripts/gate_policy.yaml).
 
+The adapter gates enforce, independently of mode:
+    required:false  (current) No ``adapter:`` key and no populated ``adapters/``
+                    -> PASS. The harness PERMITS an adapter but never REQUIRES one
+                    (HARNESS_README.md:38,85,110 mark it Optional; :128,:134
+                    impose only a 3 GiB size ceiling, not a presence rule).
+    required:true   A missing declaration or unpopulated ``adapters/`` -> FAIL.
+    always          A declaration that does not equal ``declared_name``, and a
+                    populated ``adapters/`` with no ``adapter_model.safetensors``,
+                    are hard FAILs in BOTH modes. If we claim to ship an adapter,
+                    it must actually load; absence is fine, breakage is not.
+
+The effective mode is selected by precedence: ``--mode`` CLI flag >
+``GATE_SUBMISSION_MODE`` env var > ``adapter.submission_mode`` in the policy file
+(currently ``local_test``). Example::
     python3 scripts/check_submission.py --mode local_test
     GATE_SUBMISSION_MODE=local_test python3 scripts/check_submission.py
     python3 scripts/check_submission.py --mode submit  # beats the env var
@@ -555,20 +565,32 @@ def g_required_files(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 # --- 2. adapter declared in agent.yaml -------------------------------------
 
 def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
-    """agent.yaml adapter declaration, per the active submission mode.
+    """agent.yaml adapter declaration.
 
-    Mode semantics (see module docstring / gate_policy adapter.submission_mode):
+    The obligation is driven by the policy scalar ``adapter.required`` -- NOT by the
+    submission mode. Those are deliberately separate axes:
 
-    * ``submit`` (DEFAULT): agent.yaml MUST carry an ``adapter:`` key and it MUST
-      equal the policy ``declared_name``. A missing key is a hard FAIL ("if there
-      is no adapter for submission, fail it"); a wrong value is a hard FAIL.
-    * ``local_test``: the adapter must be explicitly turned OFF, i.e. NO
-      ``adapter:`` key in agent.yaml. If a declaration is still present, that is a
-      hard FAIL -- the local path must not pretend to use an adapter it does not
-      have. An absent key is the correct PASS for this mode.
+    * ``adapter.required: false`` (the current default). The harness PERMITS an
+      adapter but never REQUIRES one: every mention of ``adapters/`` in
+      HARNESS_README.md is marked Optional (:38, :85, :110), and :128/:134 impose
+      only a 3 GiB unpacked-size CEILING that an adapter must fit inside -- a
+      ceiling is not a presence requirement. :201-203 are if-used placement
+      instructions. So an adapter-less submission is valid and PASSes.
+    * ``adapter.required: true``. A missing ``adapter:`` key is a hard FAIL.
 
-    There is deliberately no middle state: in ``local_test`` a silent adapter is a
-    FAIL, and in ``submit`` a silent (absent) adapter is a FAIL.
+    Independently of ``required``, CONSISTENCY is always enforced when a
+    declaration is present: a value that does not equal the policy
+    ``declared_name`` is a hard FAIL, because that is a packaging defect rather
+    than a legitimate no-adapter submission.
+
+    Why this is not mode-driven: coupling the two made the two-mode vocabulary a
+    trap. ``adapter.submission_mode`` defaults to ``local_test``
+    (scripts/gate_policy.yaml:66) and ``scripts/submit_safe.sh`` invokes the
+    checker with no ``--mode`` and no ``GATE_SUBMISSION_MODE``, so the effective
+    mode was ``local_test`` at pack time. Under the old rule ``local_test``
+    FAILed any declared adapter -- so the moment Track 2 mounted
+    ``adapter: main_lora``, the only shipping path hard-blocked on its own
+    adapter. See scripts/gate_policy.yaml ``adapter.required``.
     """
     declared_name = str(_policy_get(policy, "adapter", "declared_name"))
     mode = _effective_mode(policy)
@@ -588,27 +610,32 @@ def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                 if value == declared_name:
                     found_line = (lineno, value)
 
-    if mode == MODE_LOCAL_TEST:
-        # Adapter must be explicitly OFF. Any 'adapter:' declaration is a FAIL.
-        if declarations:
-            lineno, value = declarations[0]
-            detail = "; ".join(f"agent.yaml:{ln} 'adapter: {v}'" for ln, v in declarations)
+    required = _policy_get(policy, "adapter", "required")
+    if isinstance(required, str):
+        required = required.strip().lower() in {"1", "true", "yes", "on"}
+
+    if not declarations:
+        if required:
             return GateResult(
                 "g_adapter_declared", FAIL,
-                f"local_test mode: agent.yaml still declares an adapter ('{value}')",
-                f"{detail}; local_test requires the adapter be explicitly turned OFF "
-                f"(no 'adapter:' key) so the local path does not pretend to use an adapter it lacks",
-                f"Remove the 'adapter:' key from agent.yaml for a local_test run "
-                f"(mode {mode}, from {_mode_source(None, policy)}), or run in 'submit' mode to ship it.",
+                "agent.yaml does not declare an adapter (policy requires one)",
+                f"no 'adapter:' key in agent.yaml; policy adapter.required is true; "
+                f"expected 'adapter: {declared_name}'",
+                f"Add 'adapter: {declared_name}' to agent.yaml and populate "
+                f"my_submission/{_policy_get(policy, 'adapter', 'dir')}/, or set "
+                f"adapter.required: false in scripts/gate_policy.yaml if the harness "
+                f"does not require one (it does not -- HARNESS_README.md:38,85,110).",
             )
         return GateResult(
             "g_adapter_declared", PASS,
-            f"local_test mode: agent.yaml declares no adapter (adapter explicitly OFF)",
-            f"no 'adapter:' key in agent.yaml; mode={mode} (from {_mode_source(None, policy)})",
+            "agent.yaml declares no adapter (adapter is OPTIONAL per the harness)",
+            "no 'adapter:' key in agent.yaml; policy adapter.required is false; "
+            "HARNESS_README.md:38,85,110 mark adapters/ Optional",
             "",
         )
 
-    # submit mode: a declaration is REQUIRED.
+    # A declaration IS present. Consistency is enforced regardless of `required`:
+    # shipping a name that does not match the shipped adapter is a defect.
     if found_line is None and declarations:
         lineno, value = declarations[0]
         return GateResult(
@@ -617,43 +644,28 @@ def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
             f"agent.yaml:{lineno} 'adapter: {value}' != policy declared_name '{declared_name}'",
             f"Set 'adapter: {declared_name}' in agent.yaml (decision D9).",
         )
-    if found_line is None:
-        # The harness PERMITS an adapter but never REQUIRES one: every mention of
-        # adapters/ in HARNESS_README.md is marked Optional (:38, :85, :110), and
-        # :128/:134 impose only a 3 GiB unpacked-size CEILING that an adapter must
-        # fit inside -- a ceiling is not a presence requirement. :201-203 are
-        # if-used placement instructions, conditional on shipping one at all. So an
-        # adapter-less submission is valid and must NOT hard-FAIL. What is still
-        # enforced above is CONSISTENCY: a partial declaration (wrong value, or a
-        # declared name with no matching adapters/ dir) is a FAIL, because that is
-        # a packaging defect rather than a legitimate no-adapter submission.
-        return GateResult(
-            "g_adapter_declared", PASS,
-            "submit mode: agent.yaml declares no adapter (adapter is OPTIONAL per the harness)",
-            f"no 'adapter:' key in agent.yaml; mode={mode} (from {_mode_source(None, policy)}); "
-            f"HARNESS_README.md:38,85,110 mark adapters/ Optional",
-            "",
-        )
     lineno, value = found_line
     return GateResult("g_adapter_declared", PASS,
                       f"agent.yaml declares adapter '{value}'",
-                      f"agent.yaml:{lineno} 'adapter: {value}'; mode={mode} "
-                      f"(from {_mode_source(None, policy)})", "")
+                      f"agent.yaml:{lineno} 'adapter: {value}'", "")
 
 
 # --- 3. adapter present ----------------------------------------------------
 
 def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
-    """The adapters/ dir inside the submission is populated, per submission mode.
+    """The adapters/ dir inside the submission, if one is declared.
 
-    * ``submit`` (DEFAULT): ``adapters/`` must exist AND be populated AND contain
-      ``adapter_model.safetensors``. Missing, empty, or weights-absent is a hard
-      FAIL -- shipping without an adapter means shipping no adapter.
-    * ``local_test``: the adapter is explicitly OFF, so a populated ``adapters/``
-      dir is neither required nor a defect. A present-but-empty dir PASSes (this
-      mode is for validating the harness without shipping weights). The *declaration*
-      inversion (an adapter still declared in agent.yaml) is enforced by
-      :func:`g_adapter_declared`, not here.
+    Driven by the policy scalar ``adapter.required`` -- NOT by the submission mode,
+    for the same reason as :func:`g_adapter_declared` (see its docstring).
+
+    * Absent or empty ``adapters/`` with ``adapter.required: false`` -> PASS. It
+      ships no adapter, which the harness permits (HARNESS_README.md:38,85,110
+      mark it Optional; :128,:134 impose only a 3 GiB size ceiling).
+    * ``adapter.required: true`` and no ``adapters/`` -> FAIL.
+    * ``adapters/`` populated but containing no ``adapter_model.safetensors`` ->
+      hard FAIL in every case. A BROKEN adapter is worse than none, so this
+      consistency rule holds even when an adapter is optional: if we claim to
+      ship one, it must actually load.
 
     SCOPE -- THIS GATE READS THE DIRECTORY ONLY. It deliberately does not open
     ``submission.zip``: the zip is the graded artifact, and a second zip reader
@@ -672,34 +684,32 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     adir = os.path.join(SUBMISSION_DIR, adapters_subdir)
     rel_dir = os.path.join(adapters_subdir, "")
 
-    if not os.path.isdir(adir):
-        if mode == MODE_LOCAL_TEST:
-            return GateResult("g_adapter_present", PASS,
-                              f"local_test mode: {adapters_subdir}/ absent (adapter explicitly OFF)",
-                              f"{rel_dir} not present; mode={mode} (from {_mode_source(None, policy)}); "
-                              "presence is not required when no adapter ships", "")
+    required = _policy_get(policy, "adapter", "required")
+    if isinstance(required, str):
+        required = required.strip().lower() in {"1", "true", "yes", "on"}
+
+    if not os.path.isdir(adir) or not any(
+        os.path.join(r, n) for r, _d, ns in os.walk(adir) for n in ns
+    ):
+        if required:
+            return GateResult("g_adapter_present", FAIL,
+                              f"{adapters_subdir}/ missing in submission (policy requires one)",
+                              f"{rel_dir} not populated under my_submission/; "
+                              "policy adapter.required is true",
+                              f"Populate my_submission/{adapters_subdir}/ with "
+                              f"adapter_config.json + adapter_model.safetensors, or set "
+                              f"adapter.required: false (the harness does not require one).")
         return GateResult("g_adapter_present", PASS,
-                          f"submit mode: {adapters_subdir}/ absent (adapter is OPTIONAL per the harness)",
-                          f"{rel_dir} not present; mode={mode} (from {_mode_source(None, policy)}); "
-                          f"HARNESS_README.md:38,85,110 mark adapters/ Optional, and :128,:134 "
-                          "impose only a 3 GiB unpacked-size ceiling -- not a presence requirement", "")
+                          f"{adapters_subdir}/ absent or empty (adapter is OPTIONAL per the harness)",
+                          f"{rel_dir} not populated under my_submission/; policy "
+                          f"adapter.required is false; HARNESS_README.md:38,85,110 mark "
+                          "adapters/ Optional", "")
     files = []
     for root, _dirs, names in os.walk(adir):
         for n in names:
             files.append(os.path.relpath(os.path.join(root, n), adir))
-    if not files:
-        if mode == MODE_LOCAL_TEST:
-            return GateResult("g_adapter_present", PASS,
-                              f"local_test mode: {adapters_subdir}/ present but empty (adapter OFF)",
-                              f"{adapters_subdir}/ exists with 0 files; mode={mode} "
-                              f"(from {_mode_source(None, policy)}); empty is fine when no adapter ships", "")
-        return GateResult("g_adapter_present", PASS,
-                          f"submit mode: {adapters_subdir}/ present but empty (adapter OFF)",
-                          f"{adapters_subdir}/ exists with 0 files; mode={mode} "
-                          f"(from {_mode_source(None, policy)}); an empty adapters/ ships no "
-                          "adapter, which the harness permits", "")
     weight = [f for f in files if f.endswith("adapter_model.safetensors")]
-    detail = f"{len(files)} file(s); weights={'yes' if weight else 'NO'}; mode={mode}"
+    detail = f"{len(files)} file(s); weights={'yes' if weight else 'NO'}"
     if not weight:
         return GateResult("g_adapter_present", FAIL,
                           f"{adapters_subdir}/ has no adapter_model.safetensors",
@@ -2034,11 +2044,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Ironclad submission gates (Gemma 4 Kaggle).",
         epilog=(
-            "Submission modes (default: submit). In 'submit', an adapter MUST be "
-            "declared in agent.yaml AND present in adapters/, else FAIL. In "
-            "'local_test', the adapter MUST be explicitly OFF (no 'adapter:' key); "
-            "a still-declared adapter FAILs. Precedence: --mode > "
-            f"{MODE_ENV_VAR} env var > policy adapter.submission_mode.\n"
+            "Submission mode. The effective default comes from "
+            "adapter.submission_mode in scripts/gate_policy.yaml (currently "
+            "'local_test'), NOT from this CLI. The mode selects budgets and "
+            "packaging; it does NOT decide whether an adapter is required -- that "
+            "is the policy scalar adapter.required. Consistency is always "
+            "enforced: a declared name that does not match adapters/, and a "
+            "populated adapters/ with no adapter_model.safetensors, both FAIL. "
+            f"Precedence: --mode > {MODE_ENV_VAR} env var > policy "
+            f"adapter.submission_mode.\n"
             f"\n"
             f"Gate categories. Every gate is exactly one of: "
             f"{', '.join(GATE_CATEGORIES)}.\n"
@@ -2085,8 +2099,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                              "artifact that will be uploaded. A genuine pre-pack "
                              f"{CAT_SUBMISSION} FAIL still exits non-zero.")
     parser.add_argument("--mode", choices=ALLOWED_MODES, default=None,
-                        help="submission mode (default: submit); overrides "
-                             f"{MODE_ENV_VAR} and the policy default")
+                        help="submission mode; overrides "
+                             f"{MODE_ENV_VAR} and the policy default "
+                             f"(adapter.submission_mode, currently 'local_test')")
     args = parser.parse_args(argv)
 
     if args.show_categories:

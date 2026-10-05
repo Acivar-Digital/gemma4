@@ -215,7 +215,20 @@ What the gates still enforce is **consistency**, in both modes:
 | `adapters/` present but empty | **PASS** — ships no adapter |
 | `adapter:` declared with a **wrong** name (≠ policy `declared_name`) | **FAIL** — packaging defect |
 | `adapters/` **populated** but containing no `adapter_model.safetensors` | **FAIL** — a broken adapter is worse than none |
-| `local_test` mode with an `adapter:` key still declared | **FAIL** — the local path must not pretend to use an adapter it lacks |
+| `local_test` mode with a correctly-declared `adapter:` | **PASS** — the mode no longer vetoes a declared adapter |
+> **Why the obligation is a separate scalar, not the mode.** Until 2026-10-05 the
+> obligation was mode-driven, and that was a trap. `adapter.submission_mode` defaults to
+> `local_test` (`scripts/gate_policy.yaml`) and `scripts/submit_safe.sh` invokes the checker
+> with no `--mode` and no `GATE_SUBMISSION_MODE` — so `local_test` was the **effective** mode at
+> pack time. Under the old rule `local_test` FAILed any *declared* adapter, so the moment Track 2
+> mounted `adapter: main_lora`, the only shipping path hard-blocked on its own adapter. Verified
+> live before the fix: `[FAIL] g_adapter_declared: local_test mode: agent.yaml still declares an
+> adapter ('main_lora')`.
+>
+> The fix is the policy scalar `adapter.required` (`scripts/gate_policy.yaml`), not a different
+> `submission_mode` value — the policy file can only select among behaviours the gate actually
+> implements, and the two axes now select different things: `required` decides the adapter
+> obligation, `submission_mode` selects budgets and packaging.
 
 Two obligations are *not* mode-scoped: `adapter.required_base_model` is **advisory only** —
 `g_adapter_base_model` WARNs and never FAILs (`scripts/gate_policy.yaml:12-19`); and `thinking_level`

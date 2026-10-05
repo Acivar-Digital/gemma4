@@ -52,19 +52,36 @@ adapter:
   # correct ONLY for a tree that actually ships one, where it stops a real LoRA
   # submission from silently losing its weights. 'local_test' is the mode for a
   # tree that ships none: the adapter is explicitly turned OFF (no 'adapter:' key in
-  # agent.yaml), and a still-declared adapter is a hard FAIL because a tree with no
-  # adapters/ weights must not claim to use them. There is no middle state where an
-  # adapter is silently absent.
-  # KNOWN LIMIT OF THE TWO-MODE VOCABULARY (consumer side, check_submission.py:591):
-  # because 'local_test' FAILs a DECLARED adapter, this default would also veto a
-  # future submission that legitimately ships one. Reconciling that needs a third
-  # mode implemented in the consumer, not a different value here: gate_policy.yaml
-  # can only select between the two behaviours the gate actually implements.
+  # agent.yaml).
   # Selection precedence: --mode CLI flag > GATE_SUBMISSION_MODE env var > this
   # submission_mode default. Every scalar here reads back as a STRING, so the
   # consumer coerces/splits allowed_modes on comma.
   submission_mode: local_test
   allowed_modes: submit,local_test
+  # Whether an adapter MUST be declared and shipped. THIS IS THE AXIS THAT
+  # DECIDES THE ADAPTER OBLIGATION -- deliberately NOT submission_mode, which
+  # only selects budgets/packaging.
+  #
+  # false (current, correct): the harness PERMITS an adapter but never REQUIRES
+  # one. HARNESS_README.md:38,:85,:110 mark adapters/ "Optional"; :128,:134
+  # impose only a 3 GiB unpacked-size CEILING that an adapter must fit inside --
+  # a ceiling is not a presence requirement; :201-203 are if-used placement
+  # instructions. So an adapter-less submission is valid.
+  #
+  # Set true only when we deliberately decide to ship Track 2 weights: it makes a
+  # missing 'adapter:' key and an unpopulated adapters/ hard FAILs, in BOTH modes.
+  #
+  # CONSISTENCY IS ENFORCED IN BOTH MODES regardless of this scalar: a declared
+  # name that does not equal declared_name FAILs, and a populated adapters/ with
+  # no adapter_model.safetensors FAILs. Absence is fine; breakage is not.
+  #
+  # Why this scalar exists: coupling the obligation to the mode was a trap.
+  # submission_mode defaults to local_test (below) and scripts/submit_safe.sh
+  # invokes the checker with no --mode and no GATE_SUBMISSION_MODE, so the
+  # effective mode at pack time was local_test -- under the old rule local_test
+  # FAILed any DECLARED adapter, so the moment Track 2 mounted 'adapter:
+  # main_lora' the only shipping path hard-blocked on its own adapter.
+  required: false
   source: adapter is OPTIONAL per HARNESS_README.md:38,85,110; size-only ceiling :128,134; if-used placement :202-203; required_base_model from verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path
 
 tool_budget:
