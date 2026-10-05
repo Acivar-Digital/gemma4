@@ -924,7 +924,7 @@ def execute_blast(
             "No modified files detected in git working tree and no target specified.\n"
             f"Available source modules to test:\n"
             + "\n".join(f"  • {f}" for f in sample_files)
-            + '\nUsage: run_skill_script(skill_name="test-gate", file_path="gate.py", args=["--blast", "<path/to/file.py>"])'
+            + '\nUsage: run_skill_script with skill_name: "test-gate", file_path: "gate.py", args: ["--blast", "<path/to/file.py>"]'
             + '\n   or: args: ["--blast", "<path/to/file.py>"]'
         )
 
@@ -1005,7 +1005,7 @@ def execute_blast(
         rec = (
             f"Exact failing tests:\n"
             + "\n".join(f"  ✗ {t}" for t in failing_names)
-            + '\nGuidance: Fix the logic causing test failures in your modified files before calling submit_patch(). Inspect the failing statements and expected vs actual values above, then re-run run_skill_script(skill_name="test-gate", file_path="gate.py", args=[]).'
+            + '\nGuidance: Fix the logic causing test failures in your modified files before calling submit_patch(). Inspect the failing statements and expected vs actual values above, then re-run run_skill_script with skill_name: "test-gate", file_path: "gate.py", args: [].'
         )
 
     return TestGateResult(
@@ -1429,7 +1429,7 @@ def print_usage_guide(invalid_arg: Optional[str] = None):
         print(f"[test-gate] ⚠️ Unknown argument or flag: '{invalid_arg}'\n")
     print("test-gate: Authoritative regression runner, diff inspector, and patch readiness gate.\n")
     print("Tool Invocation:")
-    print('  run_skill_script(skill_name="test-gate", file_path="gate.py", args=[...])\n')
+    print('  run_skill_script with skill_name: "test-gate", file_path: "gate.py", args: [...]\n')
     print("Available Modes & Options:")
     print("  --blast [file], -b, blast    Run distance-1 neighbor tests on modified or target files (default)")
     print("  --diff, -d, diff             Safe read-only git diff with test-file mutation assertion")

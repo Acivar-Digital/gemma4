@@ -67,7 +67,7 @@ flowchart TD
     TR["adapters_staging/main_lora/<br/>rank-8 LoRA trainer output"]
     CK["checkpoints/<br/>777M, NOT shipped"]
     MS["my_submission/<br/>declarative submission tree"]
-    GATES["scripts/check_submission.py<br/>14 gates, thresholds from gate_policy.yaml"]
+    GATES["scripts/check_submission.py<br/>15 gates, thresholds from gate_policy.yaml"]
     SAFE["scripts/submit_safe.sh<br/>gate to pack to gate to hash to quota to prompt to submit"]
     ZIP["submission.zip<br/>31 members = 16 files + 15 dir entries"]
     KAG["Kaggle<br/>gemma-4-31b-it-qat-w4a16-ct + main_lora"]
@@ -98,7 +98,7 @@ flowchart TD
   data/unsloth_sft_val.jsonl    (2.2MB) ─┘        │
                                               (cmp exit 0)   └──X──> checkpoints/ (777M, NOT shipped)
   ──> my_submission/ (declarative tree)
-        ──> scripts/check_submission.py (14 gates, thresholds from scripts/gate_policy.yaml)
+        ──> scripts/check_submission.py (15 gates, thresholds from scripts/gate_policy.yaml)
               │ step 1: --pre-pack
               v
            scripts/submit_safe.sh
@@ -230,11 +230,11 @@ alarming and is not, so here is the full accounting:
 
 ## 6. Gate system
 
-`scripts/check_submission.py` implements **14 gates** in **3 categories**:
+`scripts/check_submission.py` implements **15 gates** in **3 categories**:
 
 | Category | Count | Governs exit code? |
 |---|---|---|
-| `submission` | 12 | **YES — these 12 alone** |
+| `submission` | 13 | **YES — these 13 alone** |
 | `post_run` | 1 (`g_run_health`) | no |
 | `hygiene` | 1 (`g_no_embedded_code_in_docs`) | no |
 
@@ -245,7 +245,7 @@ operator explicitly selects its category.
 truth, and the code *reads* it rather than hardcoding. An AST test enforces that the code really
 does depend on the policy file.
 
-**Current status: exit 0** — 12 passed / 1 failed / 1 warning, **0 gating FAILs**. The one
+**Current status: exit 0** — 13 passed / 1 failed / 1 warning, **0 gating FAILs**. The one
 FAIL is non-gating `g_run_health`; the one WARN is the advisory `max_output_tokens` cap. Local
 suite: **33 passed**.
 
@@ -258,7 +258,7 @@ gate -> pack -> gate-the-artifact -> hash -> quota -> prompt -> submit
 - **Step 1** validates the *source tree* using `--pre-pack`, which skips the 4 zip-dependent
   gates and prints one explicit `SKIPPED (pre-pack): <gate>` line per skip — never a silent
   skip.
-- **Step 3** runs the **FULL 14-gate check on the packed artifact**.
+- **Step 3** runs the **FULL 15-gate check on the packed artifact**.
 
 **Submission quota is 1 per day.** Authoritative source: `scripts/gate_policy.yaml`
 `submission_quota.per_day`. One shot a day; there is no retry budget to spend casually.

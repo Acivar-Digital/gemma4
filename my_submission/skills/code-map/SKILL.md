@@ -14,32 +14,32 @@ Omnivorous & forgiving: auto-detects positional arguments, supports flexible fla
 
 #### 1. Workspace Overview & Repository Guide (Empty, `.`, or `-o`)
 ```python
-run_skill_script(skill_name="code-map", file_path="map.py", args=[])
+skill_name: "code-map", file_path: "map.py", args: []
 ```
 
 #### 2. Symbol Tracing & Reachability (`--symbol`, `-s`, `--callers`, `--callees`)
 Trace definitions (with base classes), subclasses, imports, callers, and callees across the repository:
 ```python
-run_skill_script(skill_name="code-map", file_path="map.py", args=["--symbol", "APIRouter"])
-run_skill_script(skill_name="code-map", file_path="map.py", args=["--callers", "APIRouter"])
+skill_name: "code-map", file_path: "map.py", args: ["--symbol", "APIRouter"]
+skill_name: "code-map", file_path: "map.py", args: ["--callers", "APIRouter"]
 ```
 
 #### 3. Compact File & Directory Skeletons (`--file`, `-f`, `-d`, `--dir`, `--tree`)
 Inspect class signatures, methods, return annotations, docstrings, and line ranges `[start-end]`:
 ```python
-run_skill_script(skill_name="code-map", file_path="map.py", args=["--file", "fastapi/routing.py"])
-run_skill_script(skill_name="code-map", file_path="map.py", args=["-d", "fastapi"])
+skill_name: "code-map", file_path: "map.py", args: ["--file", "fastapi/routing.py"]
+skill_name: "code-map", file_path: "map.py", args: ["-d", "fastapi"]
 ```
 
 #### 4. Omnivorous Positional Auto-Detection
 - Existing file, `.py` extension, or path with `/`: treated as file outline:
   ```python
-  run_skill_script(skill_name="code-map", file_path="map.py", args=["fastapi/routing.py"])
-  run_skill_script(skill_name="code-map", file_path="map.py", args=["fastapi"])
+  skill_name: "code-map", file_path: "map.py", args: ["fastapi/routing.py"]
+  skill_name: "code-map", file_path: "map.py", args: ["fastapi"]
   ```
 - Symbol identifier: treated as symbol search:
   ```python
-  run_skill_script(skill_name="code-map", file_path="map.py", args=["APIRouter"])
+  skill_name: "code-map", file_path: "map.py", args: ["APIRouter"]
   ```
 
 ## Core Guarantees

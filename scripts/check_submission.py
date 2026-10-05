@@ -148,7 +148,7 @@ WARN = "WARN"
 # Gate categories — WHY a gate exists, which decides WHETHER it may veto a
 # submission. Exactly one category per gate; the registry is the single source
 # of truth and :func:`_assert_gate_categories` proves at load time that none of
-# the 14 gates is left uncategorized.
+# the 15 gates is left uncategorized.
 #
 #   submission  Asserts a property OF THE ARTIFACT BEING SHIPPED. A FAIL here is
 #               a genuine defect in submission.zip / my_submission/, so it MUST
@@ -618,13 +618,21 @@ def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
             f"Set 'adapter: {declared_name}' in agent.yaml (decision D9).",
         )
     if found_line is None:
+        # The harness PERMITS an adapter but never REQUIRES one: every mention of
+        # adapters/ in HARNESS_README.md is marked Optional (:38, :85, :110), and
+        # :128/:134 impose only a 3 GiB unpacked-size CEILING that an adapter must
+        # fit inside -- a ceiling is not a presence requirement. :201-203 are
+        # if-used placement instructions, conditional on shipping one at all. So an
+        # adapter-less submission is valid and must NOT hard-FAIL. What is still
+        # enforced above is CONSISTENCY: a partial declaration (wrong value, or a
+        # declared name with no matching adapters/ dir) is a FAIL, because that is
+        # a packaging defect rather than a legitimate no-adapter submission.
         return GateResult(
-            "g_adapter_declared", FAIL,
-            "agent.yaml does not declare the required adapter",
-            f"no 'adapter: {declared_name}' line found in agent.yaml; policy requires "
-            f"'{declared_name}'; mode={mode} (from {_mode_source(None, policy)})",
-            f"Add 'adapter: {declared_name}' to agent.yaml, or drop 'adapter' explicitly "
-            f"via --mode {MODE_LOCAL_TEST} if this is a local (no-ship) run.",
+            "g_adapter_declared", PASS,
+            "submit mode: agent.yaml declares no adapter (adapter is OPTIONAL per the harness)",
+            f"no 'adapter:' key in agent.yaml; mode={mode} (from {_mode_source(None, policy)}); "
+            f"HARNESS_README.md:38,85,110 mark adapters/ Optional",
+            "",
         )
     lineno, value = found_line
     return GateResult("g_adapter_declared", PASS,
@@ -670,11 +678,11 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                               f"local_test mode: {adapters_subdir}/ absent (adapter explicitly OFF)",
                               f"{rel_dir} not present; mode={mode} (from {_mode_source(None, policy)}); "
                               "presence is not required when no adapter ships", "")
-        return GateResult("g_adapter_present", FAIL, f"{adapters_subdir}/ missing in submission",
-                          f"{rel_dir} not found under my_submission/; mode={mode} "
-                          f"(from {_mode_source(None, policy)})",
-                          f"Populate my_submission/{adapters_subdir}/ with the trained adapter "
-                          f"(D9), or run in {MODE_LOCAL_TEST} mode if no adapter ships.")
+        return GateResult("g_adapter_present", PASS,
+                          f"submit mode: {adapters_subdir}/ absent (adapter is OPTIONAL per the harness)",
+                          f"{rel_dir} not present; mode={mode} (from {_mode_source(None, policy)}); "
+                          f"HARNESS_README.md:38,85,110 mark adapters/ Optional, and :128,:134 "
+                          "impose only a 3 GiB unpacked-size ceiling -- not a presence requirement", "")
     files = []
     for root, _dirs, names in os.walk(adir):
         for n in names:
@@ -685,11 +693,11 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                               f"local_test mode: {adapters_subdir}/ present but empty (adapter OFF)",
                               f"{adapters_subdir}/ exists with 0 files; mode={mode} "
                               f"(from {_mode_source(None, policy)}); empty is fine when no adapter ships", "")
-        return GateResult("g_adapter_present", FAIL, f"{adapters_subdir}/ is empty",
-                          f"{adapters_subdir}/ exists but contains no files; mode={mode} "
-                          f"(from {_mode_source(None, policy)})",
-                          f"Install the adapter files into my_submission/{adapters_subdir}/, "
-                          f"or run in {MODE_LOCAL_TEST} mode if no adapter ships.")
+        return GateResult("g_adapter_present", PASS,
+                          f"submit mode: {adapters_subdir}/ present but empty (adapter OFF)",
+                          f"{adapters_subdir}/ exists with 0 files; mode={mode} "
+                          f"(from {_mode_source(None, policy)}); an empty adapters/ ships no "
+                          "adapter, which the harness permits", "")
     weight = [f for f in files if f.endswith("adapter_model.safetensors")]
     detail = f"{len(files)} file(s); weights={'yes' if weight else 'NO'}; mode={mode}"
     if not weight:
@@ -1258,6 +1266,102 @@ def g_disallowed_extensions(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                       f"allowed={sorted(ALLOWED_SUBMISSION_EXTENSIONS)}", "")
 
 
+# --- 13. advertised skill scripts exist (prompt vs shipped skills) -----------
+
+# The canonical call form the prompt teaches the model (my_submission/prompts/
+# main.md:37-56) is a plain key/value line:
+#
+#     skill_name: "fast-grep", file_path: "grep.py", args: ["<pattern>"]
+#
+# Every advertised ``file_path`` names a script the model will ask the harness
+# to execute, and the harness only ships what is under
+# ``my_submission/skills/<skill_name>/scripts/``. An advertised basename that is
+# NOT there is the defect this gate exists for: the model spends a turn (and
+# budget) on a call against a script that does not exist, which dies on a
+# missing-file error -- the same dead-end turn as the SkillToolset trap, except
+# it is shipped by OUR prompt instead of by a hallucination.
+def _advertised_skill_scripts(lines: Sequence[str]) -> List[Tuple[int, str, str]]:
+    """(line_no, skill_name, file_path) for each advertised skill call.
+
+    Only lines carrying BOTH ``skill_name: "..."`` and ``file_path: "..."``
+    count. A line that mentions either key alone is prose ABOUT the API, not a
+    call the model will emit -- the parameter glossary (main.md:19-21) and the
+    anti-splice negative example (main.md:121) are deliberately excluded, so
+    neither can produce a false FAIL.
+    """
+    import re
+    name_re = re.compile(r'skill_name:\s*"([^"]+)"')
+    path_re = re.compile(r'file_path:\s*"([^"]+)"')
+    out: List[Tuple[int, str, str]] = []
+    for lineno, line in enumerate(lines, 1):
+        name = name_re.search(line)
+        path = path_re.search(line)
+        if name and path:
+            out.append((lineno, name.group(1), path.group(1)))
+    return out
+
+
+def g_prompt_skill_scripts_exist(policy: Dict[str, Dict[str, Any]]) -> GateResult:
+    """Every ``file_path`` the prompt advertises is a script we actually ship.
+
+    Cross-checks ``my_submission/prompts/main.md`` against the shipped skill
+    tree: for each advertised call, ``skills/<skill_name>/scripts/<file_path>``
+    must be a real file. Working-tree based, like every other pre-submission
+    prompt gate (``g_tool_budget_parity``, ``g_prompt_ladder_consistency``),
+    because the prompt is what the model reads, not the zip's byte layout.
+    """
+    prompt_path = os.path.join(SUBMISSION_DIR, "prompts", "main.md")
+    skills_dir = os.path.join(SUBMISSION_DIR, "skills")
+    if not os.path.isfile(prompt_path):
+        return GateResult("g_prompt_skill_scripts_exist", FAIL, "prompts/main.md missing",
+                          os.path.relpath(prompt_path, REPO_ROOT), "Create prompts/main.md.")
+    try:
+        with open(prompt_path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError as exc:
+        return GateResult("g_prompt_skill_scripts_exist", FAIL, "prompts/main.md unreadable",
+                          str(exc), "Fix prompts/main.md readability.")
+
+    advertised = _advertised_skill_scripts(lines)
+    if not advertised:
+        # A FAIL, not a skip: a prompt that advertises no parsable call has
+        # silently disarmed this gate, and a disarmed gate reads as a PASS.
+        return GateResult("g_prompt_skill_scripts_exist", FAIL,
+                          "main.md advertises no skill call this gate can cross-check",
+                          "no line pairs skill_name: \"...\" with file_path: \"...\"",
+                          "Keep at least one full run_skill_script example (skill_name + "
+                          "file_path + args) in main.md so this gate stays armed.")
+
+    missing: List[str] = []
+    checked: List[str] = []
+    for lineno, skill, rel_file in advertised:
+        # An absolute path or a '..' segment would resolve outside the skill
+        # directory and could make an unshipped script look shipped.
+        if os.path.isabs(rel_file) or ".." in rel_file.replace(os.sep, "/").split("/"):
+            missing.append(f"main.md:{lineno} -> skills/{skill}/{rel_file} (escapes the skill dir)")
+            continue
+        target = os.path.join(skills_dir, skill, "scripts", rel_file)
+        # A file_path that already spells out its own 'scripts/' prefix is
+        # resolved relative to the skill dir as well, so it is not a false FAIL.
+        if not os.path.isfile(target) and not os.path.isfile(
+            os.path.join(skills_dir, skill, rel_file)
+        ):
+            missing.append(f"main.md:{lineno} -> skills/{skill}/scripts/{rel_file}")
+        else:
+            checked.append(f"main.md:{lineno}->{skill}/{rel_file}")
+
+    evidence = (f"{len(advertised)} advertised call(s) in main.md; skills root "
+                f"{os.path.relpath(skills_dir, REPO_ROOT)}; resolved [{', '.join(checked)}]")
+    if missing:
+        return GateResult("g_prompt_skill_scripts_exist", FAIL,
+                          "main.md advertises a skill script that is not shipped",
+                          evidence + " || MISSING: " + "; ".join(sorted(set(missing))),
+                          "Ship each advertised script at my_submission/skills/<skill>/scripts/"
+                          "<file>, or correct the file_path the prompt advertises.")
+    return GateResult("g_prompt_skill_scripts_exist", PASS,
+                      f"all {len(advertised)} advertised skill script(s) exist", evidence, "")
+
+
 # ===========================================================================
 # POST-RUN GATES (decision D2 — operate on COMPLETED-RUN artifacts, kept
 # deliberately separate from the pre-submission gates above)
@@ -1339,7 +1443,7 @@ def g_run_health(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                       evidence, "")
 
 
-# --- 14. no embedded code literals in docs ----------------------------------
+# --- 15. no embedded code literals in docs ----------------------------------
 
 def resolve_embedded_code_doc_exemptions(policy: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
     """Map of docs/*.md filename -> recorded exemption reason.
@@ -1467,6 +1571,7 @@ PRE_SUBMISSION_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], Gate
     ("g_zip_directory_drift", g_zip_directory_drift),
     ("g_zip_root_layout", g_zip_root_layout),
     ("g_disallowed_extensions", g_disallowed_extensions),
+    ("g_prompt_skill_scripts_exist", g_prompt_skill_scripts_exist),
 ]
 
 POST_RUN_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]] = [
@@ -1478,7 +1583,7 @@ ALL_GATES = PRE_SUBMISSION_GATES + POST_RUN_GATES
 
 # --- THE classification: gate name -> category ------------------------------
 # Exactly one category per gate. Keys here are asserted to be a bijection onto
-# the 14 registered gates by _assert_gate_categories() at import time, so
+# the 15 registered gates by _assert_gate_categories() at import time, so
 # adding a gate without classifying it is a hard import-time failure rather
 # than a silently-uncategorized gate whose FAIL nobody knows how to weigh.
 #
@@ -1486,6 +1591,14 @@ ALL_GATES = PRE_SUBMISSION_GATES + POST_RUN_GATES
 # by design: it inspects an artifact INSIDE my_submission/, so it is a
 # submission-category check. Categorizing it does not grant it veto power --
 # WARN never affects the exit code (unchanged semantics).
+#
+# g_prompt_skill_scripts_exist is 'submission' for the same reason
+# g_tool_budget_parity and g_prompt_ladder_consistency are: it cross-checks
+# prompts/main.md (a shipped artifact) against the shipped skills tree. A FAIL
+# means the prompt tells the model to call a script we do not ship -- a defect
+# IN THE ARTIFACT, therefore veto-worthy -- unlike
+# g_no_embedded_code_in_docs, which lints docs/ and says nothing about the
+# submission.
 GATE_CATEGORY: Dict[str, str] = {
     # --- submission: a FAIL is a real defect in the artifact being shipped ---
     "g_required_files": CAT_SUBMISSION,
@@ -1500,6 +1613,7 @@ GATE_CATEGORY: Dict[str, str] = {
     "g_zip_directory_drift": CAT_SUBMISSION,
     "g_zip_root_layout": CAT_SUBMISSION,
     "g_disallowed_extensions": CAT_SUBMISSION,
+    "g_prompt_skill_scripts_exist": CAT_SUBMISSION,
     # --- post_run: a verdict about a HISTORICAL run, not about this artifact ---
     "g_run_health": CAT_POST_RUN,
     # --- hygiene: repository hygiene, irrelevant to the shipped artifact ---

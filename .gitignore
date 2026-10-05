@@ -58,3 +58,10 @@ checkpoints/
 adapters_staging/
 models/
 *.safetensors
+
+# Recovery/diagnostic scratch: holds the full recovered bead memory dump.
+# Never track; regenerate from ~/.local/share/opencode/opencode.db.
+scratch/
+
+# Generated build artifact - rebuilt in seconds by scripts/submit_safe.sh; never commit (AGENTS.md)
+submission.zip

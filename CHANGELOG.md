@@ -2,6 +2,31 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
+## [Unreleased] - 2026-10-05 (Tool-Call Syntax Bleed Fix, Adapter Gate Corrected, Basename Gate Added)
+
+### Tool-Call Syntax Bleed Fix (`gemma4-1dwj`, `gemma4-plx3`, `gemma4-if78`, `gemma4-icsd`)
+The 4-bit quantized Gemma 4 (`gemma-4-31b-it-qat-w4a16-ct`) merges Python call syntax into JSON tool-call **keys**, producing the malformed payload `{"file_path": "grep.py`,skill_name:"}` and the observed 40x-identical-invalid-argument loop. Every `run_skill_script(skill_name="...", file_path="...", args=[...])` example was a live copy source. All are converted to the canonical key form `skill_name: "x", file_path: "y", args: [...]`, matching the form already used at `prompts/main.md:37-56`.
+- **Prompt markdown** — `prompts/main.md:13`, `skills/code-map/SKILL.md` (8 sites), `skills/test-gate/SKILL.md` (9 sites), `skills/repro-check/SKILL.md:17`. Note `repro-check:17` used a backticked-per-keyword form with no parenthesis, which a `run_skill_script(` grep misses; sweep for `skill_name="` instead.
+- **Runtime tool stdout (higher risk — enters model context every turn)** — `test-gate/scripts/gate.py:927,1008,1432`, `fast-grep/scripts/grep.py:1661,1693`, `code-map/scripts/map.py:2389`. `gate.py:1008` was the worst: it embedded the kwarg form inside the blast-failure recovery Guidance, i.e. it handed the model the splice string at the exact moment it was already off-track.
+- **Skill docs** — `.agents/skills/kaggle-submit/SKILL.md:53` and `gcp-train/references/environment-package-traps.md:78-86` documented a nonexistent `script_name` parameter. The gcp-train copy placed Python kwargs *inside a ```json fence*, teaching the exact contradiction. Corrected to `file_path` with the real JSON object shape.
+
+### Adapter Gate Corrected (`gemma4-4fuv`)
+The gate hard-FAILed any `submit`-mode run whose `agent.yaml` declared no adapter. **The harness permits an adapter but never requires one**: every mention of `adapters/` is marked Optional (`HARNESS_README.md:38,85,110`), and `:128,:134` impose only a 3 GiB unpacked-size *ceiling* an adapter must fit inside — a ceiling is not a presence requirement. `:201-203` are if-used placement instructions.
+- `g_adapter_declared` (`check_submission.py:620`) and `g_adapter_present` (`:681`,`:696`) now PASS when no adapter ships.
+- **Consistency is still enforced**: a *wrong* declared name, and a populated `adapters/` with no `.safetensors`, remain hard FAILs. Absence is legitimate; a broken or inconsistent adapter is a packaging defect.
+- `gate_policy.yaml` gained the citation block. Verified: `GATE_SUBMISSION_MODE=submit` exits 0 on the adapter-less tree.
+
+### New Gate: `g_prompt_skill_scripts_exist` (`gemma4-4bud`)
+Cross-checks every `file_path` basename advertised in `prompts/main.md` against the scripts actually shipped under `my_submission/skills/<skill>/scripts/`. A prompt that points the model at an unshipped script is a defect in the artifact, so the gate is `CAT_SUBMISSION` (veto-worthy), matching `g_tool_budget_parity` and `g_prompt_ladder_consistency`. Red-test proven: a mismatched basename exits 1 `BLOCKING`; restoring exits 0. 23 advertised scripts resolve. Gate count 14 -> 15.
+
+### Tests
+- Updated 6 tests that encoded the superseded "adapter is mandatory" contract, and 1 that asserted the old kwarg help text. The exit-code-composition tests were re-pointed at the wrong-name reconstruction, which is still a legitimate FAIL. Each updated test carries a `CONTRACT CHANGE 2026-10-05` note explaining what changed and why, so the new contract cannot be silently reverted. Full suite: **87 passed**.
+
+### Housekeeping
+- `submission.zip` is now gitignored and untracked. Per AGENTS.md it is a generated build artifact (rebuilt in seconds by `scripts/submit_safe.sh`) and must never be committed.
+- Installed `adk-skill` (Google ADK, pinned to `dewitt/adk-skill@9a1c33c`) into `.agents/skills/adk-skill/` for agents to load before ADK/submission work.
+- **Correction to two claims made on 2026-10-05 and retracted:** (1) that `run_skill_script` was a phantom tool absent from the harness — it is a real ADK `SkillToolset` meta-tool, proven by 34 live calls in `results/run_B40/logs/fastapi_11194.log`; the `/tmp/harness_x/swegemma` install is incomplete and is not authoritative on what the harness supports. (2) that the `kaggle-submit`/`gcp-train` skills were ollama tooling docs unrelated to this competition — `kaggle-submit/SKILL.md` documents this competition's own ADK skill layer.
+
 ## [Unreleased] - 2026-10-03 (Context Explosion Hardening, Truncation Guards & Repackaged Track 1 Baseline)
 
 ### Context Explosion Hardening & Skill Output Sanitization

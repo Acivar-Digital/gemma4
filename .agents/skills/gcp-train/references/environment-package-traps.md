@@ -75,10 +75,15 @@ The competition organizers provided `gemma-4-developer-agent-wheelhouse`, but se
 ### ADK `SkillToolset` Tool Hallucination (`ValueError: Tool '<name>' not found`)
 * **Symptom:** Agent tool calls to `fast-grep(...)` failed with `ValueError: Tool 'fast-grep' not found`.
 * **Root Cause:** In Google ADK `1.36.1`, skills are managed under the experimental `FeatureName.SKILL_TOOLSET` and are **not** exposed as top-level tools.
-* **Remediation Protocol:** Prompts must instruct the model to use meta-tools:
+* **Remediation Protocol:** Prompts must instruct the model to use meta-tools, describing the three parameters as plain key/value pairs rather than a Python-style call:
   ```json
-  run_skill_script(skill_name="fast-grep", script_name="grep.py", args=["--pattern", "..."])
+  {
+    "skill_name": "fast-grep",
+    "file_path": "grep.py",
+    "args": ["--pattern", "..."]
+  }
   ```
+  The parameter is `file_path`, **not** `script_name`. Presenting it as `run_skill_script(skill_name="...", file_path="...", args=[...])` inside a JSON block teaches the 4-bit quantized model to splice Python call syntax into JSON keys, which is the documented cause of the malformed-payload loop (see `cloud_results/canary_test_results/consultants/20261003/consultant3.md`, Failure Mode A).
 
 ---
 

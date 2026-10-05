@@ -2386,7 +2386,7 @@ def print_help():
     print("""code-map: AST code structure and symbol call-graph tracer.
 
 Tool Invocation:
-  run_skill_script(skill_name="code-map", file_path="map.py", args=[...])
+  skill_name: "code-map", file_path: "map.py", args: [...]
 
 Modes:
   --symbol, -s <name>     Trace callers, callees, definitions, and class hierarchy across repository.

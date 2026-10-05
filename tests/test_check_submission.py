@@ -486,12 +486,15 @@ def test_submission_mode_precedence_cli_over_env_over_policy(policy, monkeypatch
         cs.resolve_submission_mode(policy, cli_mode="not_a_mode")
 
 
-def test_g_adapter_declared_fails_on_missing_declaration_in_submit_mode(policy, tmp_path, monkeypatch):
-    """submit mode: a tmp agent.yaml with NO 'adapter:' key -> FAIL.
+def test_g_adapter_declared_passes_on_missing_declaration_in_submit_mode(policy, tmp_path, monkeypatch):
+    """submit mode: an agent.yaml with NO 'adapter:' key -> PASS.
 
-    The default submit obligation requires the adapter to be declared. This uses
-    a temp copy (never the real agent.yaml) and pins submit mode via the stash
-    that run_all writes, so the assertion is unambiguous.
+    The harness PERMITS an adapter but never REQUIRES one. Every mention of
+    adapters/ in HARNESS_README.md is marked Optional (:38, :85, :110), and
+    :128/:134 impose only a 3 GiB unpacked-size CEILING that an adapter must fit
+    inside -- a ceiling is not a presence requirement. An adapter-less
+    submission is therefore valid and must not hard-FAIL. This test pins that
+    contract so a future "restore the requirement" change has to argue with it.
     """
     sub = tmp_path / "my_submission"
     sub.mkdir(parents=True)
@@ -504,16 +507,39 @@ def test_g_adapter_declared_fails_on_missing_declaration_in_submit_mode(policy, 
     pol = dict(policy)
     pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
     result = cs.g_adapter_declared(pol)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL when adapter is undeclared in submit mode, got {result.status}: {result.message}"
+    assert result.status == cs.PASS, (
+        f"expected PASS when no adapter ships in submit mode, got {result.status}: {result.message}"
     )
-    assert "does not declare the required adapter" in result.message
-    # Must name the local_test escape hatch as the explicit alternative.
-    assert cs.MODE_LOCAL_TEST in result.remediation
+    assert "OPTIONAL" in result.message
 
 
-def test_g_adapter_present_fails_on_empty_adapters_in_submit_mode(policy, tmp_path, monkeypatch):
-    """submit mode: an EMPTY adapters/ dir -> FAIL (must be populated to submit)."""
+def test_g_adapter_declared_still_fails_on_wrong_declared_name(policy, tmp_path, monkeypatch):
+    """submit mode: a WRONG 'adapter:' value still FAILs.
+
+    Absence is legitimate; inconsistency is not. A declared name that does not
+    equal the policy's ``declared_name`` is a packaging defect, so the gate keeps
+    vetoing it.
+    """
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\nadapter: wrong_name\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
+    result = cs.g_adapter_declared(pol)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL on a wrong adapter name, got {result.status}: {result.message}"
+    )
+    assert "declared_name" in result.evidence or "declared_name" in result.remediation
+
+
+def test_g_adapter_present_passes_on_empty_adapters_in_submit_mode(policy, tmp_path, monkeypatch):
+    """submit mode: an EMPTY adapters/ dir -> PASS (it ships no adapter)."""
     sub = tmp_path / "my_submission"
     (sub / "adapters" / "main_lora").mkdir(parents=True)  # exists, 0 files
     monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
@@ -522,11 +548,31 @@ def test_g_adapter_present_fails_on_empty_adapters_in_submit_mode(policy, tmp_pa
     pol = dict(policy)
     pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
     result = cs.g_adapter_present(pol)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL on empty adapters/ in submit mode, got {result.status}: {result.message}"
+    assert result.status == cs.PASS, (
+        f"expected PASS on empty adapters/ in submit mode, got {result.status}: {result.message}"
     )
-    assert "adapters/ is empty" in result.message
-    assert cs.MODE_LOCAL_TEST in result.remediation
+    assert "empty" in result.message
+
+
+def test_g_adapter_present_still_fails_on_populated_dir_without_weights(policy, tmp_path, monkeypatch):
+    """submit mode: a POPULATED adapters/ with no .safetensors still FAILs.
+
+    Shipping a broken adapter is worse than shipping none, so a half-populated
+    adapters/ keeps its veto.
+    """
+    sub = tmp_path / "my_submission"
+    (sub / "adapters" / "main_lora").mkdir(parents=True)
+    (sub / "adapters" / "main_lora" / "adapter_config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
+    monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
+
+    pol = dict(policy)
+    pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
+    result = cs.g_adapter_present(pol)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL when adapters/ has no weights, got {result.status}: {result.message}"
+    )
+
 
 
 def test_g_adapter_declared_fails_on_still_declared_adapter_in_local_test_mode(policy, tmp_path, monkeypatch):
@@ -892,26 +938,36 @@ def _main_exit(argv):
 def test_submission_fail_sets_nonzero_exit(policy, tmp_path, monkeypatch):
     """A submission-category FAIL -> exit 1. This is the gating case.
 
-    g_adapter_declared is a submission gate that is genuinely red on an
-    adapter-less agent.yaml in ``submit`` mode, so the FAIL is reproduced on a
-    faithful tmp copy of the real agent.yaml with any ``adapter:`` line removed;
-    the real my_submission/ is never mutated. Driving that reconstruction alone
-    through main() --only must return a non-zero exit code, because a defect in
-    the artifact being shipped is exactly what must veto a submission.
+    g_adapter_declared is a submission gate that is genuinely red on a submission
+    declaring the WRONG adapter name in ``submit`` mode, so the FAIL is reproduced
+    on a faithful tmp copy of agent.yaml; the real my_submission/ is never mutated.
+    Driving that reconstruction alone through main() --only must return a non-zero
+    exit code, because a defect in the artifact being shipped is exactly what must
+    veto a submission.
+
+    CONTRACT CHANGE 2026-10-05: this test previously reconstructed the ADAPTER-LESS
+    agent.yaml, which was a hard FAIL under the old "an adapter is mandatory"
+    contract. The harness permits shipping no adapter (HARNESS_README.md:38,85,110
+    mark adapters/ Optional), so that reconstruction is now a correct PASS. The
+    surviving defect is a WRONG declared name, which is what this test now uses.
 
     submit mode is pinned explicitly (policy stash for the direct gate call,
     ``--mode submit`` for the CLI) rather than inherited from whatever the repo
-    policy currently declares: the repo ships in ``local_test`` mode (no adapter
-    is shipped), where an absent declaration is legitimately a PASS. The
-    obligation under test here is the SUBMIT-mode one, and this test deliberately
-    says nothing about the live tree's current mode.
+    policy currently declares. The obligation under test here is the SUBMIT-mode
+    one, and this test deliberately says nothing about the live tree's mode.
 
     LOAD-BEARING: if exit_code_for treated submission FAILs as non-gating (the
     demotion bug), this returns 0 and the assertion fires. The test therefore
     distinguishes 'the new post_run demotion' from 'FAILs stopped gating at all'.
     """
-    # --- Red half: reconstruct the adapter-less submission so the gate FAILs. ---
-    _make_adapterless_submission(tmp_path, monkeypatch)
+    # --- Red half: reconstruct a wrong-name declaration so the gate FAILs. -----
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\nadapter: wrong_name\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
     monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
     pol = dict(policy)
     pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
@@ -1121,12 +1177,23 @@ def test_category_and_only_compose_including_empty_intersection(policy, tmp_path
     )
 
     # (3) A real intersection runs exactly the one named gate and gates the exit.
-    # Reconstruct the adapter-less submission so g_adapter_declared genuinely
-    # FAILs, and pin submit mode -- the mode in which a missing declaration is a
-    # hard FAIL. A shallow copy of the policy is used (with any _resolved_mode
-    # stash from the run_all calls above dropped) so this run's mode is
-    # unambiguous and cannot be left behind on the shared module-scoped fixture.
-    _make_adapterless_submission(tmp_path, monkeypatch)
+    # Reconstruct a submission with a WRONG 'adapter:' value so g_adapter_declared
+    # genuinely FAILs, and pin submit mode. CONTRACT CHANGE 2026-10-05: this used
+    # to reconstruct the ADAPTER-LESS submission, which was a hard FAIL then; the
+    # harness permits shipping no adapter, so that reconstruction is now a correct
+    # PASS. A wrong declared name is still a packaging defect and remains a hard
+    # FAIL, so it is the right vehicle for exercising exit-code composition --
+    # which is what this test is actually about. A shallow copy of the policy is
+    # used (with any _resolved_mode stash from the run_all calls above dropped) so
+    # this run's mode is unambiguous and cannot be left behind on the shared
+    # module-scoped fixture.
+    sub = tmp_path / "my_submission"
+    sub.mkdir(parents=True, exist_ok=True)
+    (sub / "agent.yaml").write_text(
+        "name: main\nmodel: gemma-4-31b-it-qat-w4a16-ct\nadapter: wrong_name\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
     monkeypatch.delenv(cs.MODE_ENV_VAR, raising=False)
     pol = dict(policy)
     pol.pop("_resolved_mode", None)
@@ -1134,8 +1201,8 @@ def test_category_and_only_compose_including_empty_intersection(policy, tmp_path
                       cli_mode=cs.MODE_SUBMIT)
     assert [r.name for r in res3] == ["g_adapter_declared"]
     assert res3[0].status == cs.FAIL, (
-        f"precondition broken: g_adapter_declared must FAIL on the reconstruction, "
-        f"got {res3[0].status}"
+        f"precondition broken: g_adapter_declared must FAIL on the wrong-name "
+        f"reconstruction, got {res3[0].status}"
     )
     rc3, out3 = _main_exit(["--only", "g_adapter_declared", "--category", "submission",
                             "--mode", cs.MODE_SUBMIT])
@@ -1148,7 +1215,7 @@ def test_category_and_only_compose_including_empty_intersection(policy, tmp_path
 
 
 def test_every_gate_is_classified_into_exactly_one_valid_category():
-    """All 14 gates are classified; none uncategorized; valid set is exactly the 3.
+    """All 15 gates are classified; none uncategorized; valid set is exactly the 3.
 
     Proves the classification registry is a total, well-typed mapping: every
     registered gate has exactly one category, no category names a non-existent
@@ -1173,9 +1240,9 @@ def test_every_gate_is_classified_into_exactly_one_valid_category():
         f"category names non-registered gate(s): {sorted(classified - registered)}"
     )
     # The mapping is exactly one-category-per-gate with the right total size.
-    assert len(cs.ALL_GATES) == 14, f"expected 14 registered gates, got {len(cs.ALL_GATES)}"
-    assert len(cs.GATE_CATEGORY) == 14, (
-        f"expected 14 classified gates, got {len(cs.GATE_CATEGORY)}"
+    assert len(cs.ALL_GATES) == 15, f"expected 15 registered gates, got {len(cs.ALL_GATES)}"
+    assert len(cs.GATE_CATEGORY) == 15, (
+        f"expected 15 classified gates, got {len(cs.GATE_CATEGORY)}"
     )
     # The valid category set is exactly {submission, post_run, hygiene}.
     assert set(cs.GATE_CATEGORIES) == {"submission", "post_run", "hygiene"}
@@ -1227,22 +1294,22 @@ def test_warning_and_unknown_gate_exit_semantics_unchanged(policy):
 # stuck-red.
 # ===========================================================================
 
-def test_g_adapter_declared_fails_on_real_missing_declaration(policy, tmp_path, monkeypatch):
-    """agent.yaml with no 'adapter:' key, in submit mode -> FAIL (reconstructed).
+def test_g_adapter_declared_passes_on_real_missing_declaration(policy, tmp_path, monkeypatch):
+    """agent.yaml with no 'adapter:' key, in submit mode -> PASS (reconstructed).
 
-    HISTORY: this red-proof originally ran against the live my_submission/agent.yaml
-    when it genuinely declared no adapter; an intervening fix added
-    ``adapter: main_lora``, and the shipped LoRA has since been purged again, so
-    the live file declares nothing either way. What this test proves is the GATE
-    behaviour, not the live tree: it reconstructs the adapter-less agent.yaml on
-    tmp_path and asserts that, in submit mode -- where a shipped adapter is
-    mandatory -- an undeclared adapter is a hard FAIL naming the concrete fix.
+    CONTRACT CHANGE 2026-10-05: this test previously asserted FAIL. The harness
+    PERMITS an adapter but never REQUIRES one -- every mention of adapters/ in
+    HARNESS_README.md is marked Optional (:38, :85, :110) and :128/:134 impose
+    only a 3 GiB unpacked-size ceiling, not a presence requirement. An
+    adapter-less submission is valid, so the gate must not veto it.
 
-    submit mode is pinned explicitly (policy stash) rather than read from the repo
-    policy, so the proof survives the repo legitimately shipping in local_test
-    mode (where the very same reconstruction is a correct PASS).
+    It still reconstructs the adapter-less agent.yaml on tmp_path (never the
+    live tree) and pins submit mode explicitly, so the proof does not depend on
+    whatever the repo policy currently declares. Note the counterpart test
+    ``test_g_adapter_declared_still_fails_on_wrong_declared_name`` pins the
+    invariant that survives: a WRONG declared name is still a packaging defect.
     """
-    # --- Red half: faithful reconstruction of the adapter-less agent.yaml. ------
+    # --- Reconstruction of the adapter-less agent.yaml. -------------------------
     sub = _make_adapterless_submission(tmp_path, monkeypatch)
     assert not any(
         ln.strip().startswith("adapter:") for ln in (sub / "agent.yaml").read_text().splitlines()
@@ -1252,17 +1319,13 @@ def test_g_adapter_declared_fails_on_real_missing_declaration(policy, tmp_path, 
     pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
 
     result = cs.g_adapter_declared(pol)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL on the adapter-less agent.yaml, got {result.status}: {result.message}"
+    assert result.status == cs.PASS, (
+        f"expected PASS on the adapter-less agent.yaml, got {result.status}: {result.message}"
     )
-    # The specific verdict must be "no declaration found", not "agent.yaml missing".
-    assert "does not declare the required adapter" in result.message
-    # Evidence must name the required name so the reader knows what was missing.
-    assert "adapter: main_lora" in result.evidence
-    assert "line found in agent.yaml" in result.evidence
-    # Remediation must point at the concrete fix: add the declaration, or
-    # explicitly drop 'adapter' via local_test.
-    assert f"adapter: {cs._policy_get(pol, 'adapter', 'declared_name')}" in result.remediation
+    # The verdict must be the optional-adapter one, not the local_test one.
+    assert "OPTIONAL" in result.message
+    # Evidence must cite the harness rule so the reasoning is auditable.
+    assert "HARNESS_README.md" in result.evidence
 
 
 def test_g_adapter_declared_passes_on_declared_temp_copy(policy, tmp_path, monkeypatch):
@@ -1292,20 +1355,16 @@ def test_g_adapter_declared_passes_on_declared_temp_copy(policy, tmp_path, monke
     )
     assert "adapter: main_lora" in result.evidence
 
-def test_g_adapter_present_fails_on_empty_adapters_dir(policy, tmp_path, monkeypatch):
-    """submit mode: adapters/ exists but is EMPTY -> FAIL (reconstructed on tmp_path).
+def test_g_adapter_present_passes_on_real_empty_adapters_dir(policy, tmp_path, monkeypatch):
+    """submit mode: adapters/ exists but is EMPTY -> PASS (reconstructed on tmp_path).
 
-    HISTORY: this red-proof originally ran against the live my_submission/adapters/
-    main_lora/ when it genuinely existed but contained zero files. The shipped LoRA
-    has since been purged entirely, so the live tree no longer carries that state
-    either. This test reconstructs the historical empty-but-present adapters/ dir
-    on tmp_path and proves the gate is red on it, pinning submit mode explicitly
-    -- the mode in which adapters/ must be populated -- so the proof does not
-    depend on whatever the repo policy currently declares (under ``local_test``
-    an empty adapters/ is deliberately a PASS). Nothing in my_submission/ is
-    mutated.
+    CONTRACT CHANGE 2026-10-05: was FAIL. An empty adapters/ ships no adapter,
+    which the harness permits. Reconstructed on tmp_path so the live
+    my_submission/ is never mutated. The invariant that still holds is pinned by
+    ``test_g_adapter_present_still_fails_on_populated_dir_without_weights``: a
+    populated adapters/ with no .safetensors is a broken adapter and still FAILs.
     """
-    # --- Red half: a faithful empty-but-present adapters/ dir on tmp_path. -------
+    # --- Reconstruction of an empty-but-present adapters/ dir on tmp_path. ------
     sub = tmp_path / "my_submission"
     (sub / "adapters" / "main_lora").mkdir(parents=True)  # exists, 0 files
     monkeypatch.setattr(cs, "SUBMISSION_DIR", str(sub))
@@ -1314,14 +1373,11 @@ def test_g_adapter_present_fails_on_empty_adapters_dir(policy, tmp_path, monkeyp
     pol["_resolved_mode"] = {"mode": cs.MODE_SUBMIT, "source": "test"}
 
     result = cs.g_adapter_present(pol)
-    assert result.status == cs.FAIL, (
-        f"expected FAIL on the empty adapters dir, got {result.status}: {result.message}"
+    assert result.status == cs.PASS, (
+        f"expected PASS on the empty adapters dir, got {result.status}: {result.message}"
     )
-    # The specific verdict must be "empty", not "missing" and not "no weights".
-    assert "adapters/ is empty" in result.message
-    assert "exists but contains no files" in result.evidence
-    # Remediation must tell a human to install the adapter files.
-    assert "Install the adapter files" in result.remediation
+    # The verdict must be the empty-ships-nothing one, not the missing-dir one.
+    assert "empty" in result.message
 
 
 

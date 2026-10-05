@@ -50,13 +50,13 @@ Investigation revealed the root causes behind this and other low-score traps:
    - In Google ADK's `SkillToolset`, skills (like `fast-grep` or `code-map`) are NOT exposed as direct top-level tools in `tools_dict`.
    - Instead, ADK provides meta-tools: `run_skill_script`, `list_skills`, `load_skill`, `load_skill_resource`.
    - If system instructions tell the model to call `fast-grep(...)` directly, the model emits `<|tool_call|fast-grep(...)>`, causing ADK to raise `ValueError: Tool 'fast-grep' not found` and aborting the turn.
-   - **RULE:** Prompt instructions must strictly instruct the model to use either native tools (`read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`) or invoke skills via `run_skill_script(skill_name="...", script_name="...", ...)`.
+   - **RULE:** Prompt instructions must strictly instruct the model to use either native tools (`read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`) or invoke skills via the `run_skill_script` meta-tool. Describe the three parameters as plain key/value pairs — `skill_name` (string), `file_path` (string, e.g. `"grep.py"`), and `args` (list of strings) — never as a Python-style call expression, and never as `script_name`, which is **not** a real parameter and yields a rejected payload.
 
 ---
 
 ## 2. The Gates
 
-Before ANY submission is sent to Kaggle, the candidate package MUST pass the gate suite implemented in `scripts/check_submission.py` (**14 gates**). The gates below are listed for **orientation and rationale only** — the enforcement, the thresholds, and the ordering all live in the code and policy. **Do not hand-run these.**
+Before ANY submission is sent to Kaggle, the candidate package MUST pass the gate suite implemented in `scripts/check_submission.py` (**15 gates**). The gates below are listed for **orientation and rationale only** — the enforcement, the thresholds, and the ordering all live in the code and policy. **Do not hand-run these.**
 
 ```text
 [Required files] ─────► required submission files present
@@ -71,6 +71,7 @@ Before ANY submission is sent to Kaggle, the candidate package MUST pass the gat
 [Zip directory drift]► every in-tree file is accounted for in the zip
 [Zip root layout] ────► agent.yaml at the archive root
 [Disallowed exts] ───► no bytecode / OS metadata / junk in the zip
+[Skill scripts] ──────► every file_path the prompt advertises is a script we ship
 [Run health] ─────────► degenerate-run fingerprint (post_run; cannot veto)
 [No embedded code] ───► docs code-block lint (hygiene; cannot veto)
 ```
@@ -97,7 +98,7 @@ scripts/submit_safe.sh --dry-run
 - **Tool/Skill API** — skills are meta-tools, not direct tools; a prompt telling the model to call a skill name directly triggers `ValueError: Tool '<name>' not found` and aborts the turn (Section 1.6).
 - **Adapter gates** — see Section 5 for the two-mode rule.
 
-> **Preflight (legacy, not a submission gate).** An environment/sandbox preflight suite exists at `scripts/preflight_check.py` (6 tiers, `[1/6]`..`[6/6]`: dependency imports, wheels, real-ADK compilation, sandbox subprocess isolation, live snapshot pytest, live agent diagnostics). It is a **developer-environment** diagnostic, **not** part of the 14 submission gates — per `docs/IRONCLAD_GATES_PLAN.md`, its original failure mode was checking the wrong layer and never opening the files that actually broke. It requires the `adk_submission` harness package, which is **not importable from any interpreter in this environment** (verified: `adk_submission` is absent from the system `python3` and from the private interpreter this file used to hardcode). That hardcoded interpreter path has been removed because it does not contain the harness packages; it is not a working command. Preflight is also **operator-run only** — tiers 5–6 execute pytest and a live LLM call, and the repo execution protocol (`AGENTS.md`, `execution-protocol-only-start-sh`) reserves all evaluation/test execution for the user via `./start.sh`. Agents must not run it. Use `scripts/submit_safe.sh --dry-run` for gate evidence instead.
+> **Preflight (legacy, not a submission gate).** An environment/sandbox preflight suite exists at `scripts/preflight_check.py` (6 tiers, `[1/6]`..`[6/6]`: dependency imports, wheels, real-ADK compilation, sandbox subprocess isolation, live snapshot pytest, live agent diagnostics). It is a **developer-environment** diagnostic, **not** part of the 15 submission gates — per `docs/IRONCLAD_GATES_PLAN.md`, its original failure mode was checking the wrong layer and never opening the files that actually broke. It requires the `adk_submission` harness package, which is **not importable from any interpreter in this environment** (verified: `adk_submission` is absent from the system `python3` and from the private interpreter this file used to hardcode). That hardcoded…
 
 ---
 

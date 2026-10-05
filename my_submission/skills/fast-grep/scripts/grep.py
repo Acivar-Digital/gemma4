@@ -1658,7 +1658,7 @@ def extract_function_scope(
 def print_help() -> None:
     """Print clean usage information."""
     print(
-        """Tool Invocation: run_skill_script(skill_name="fast-grep", file_path="grep.py", args=[...])
+        """Tool Invocation: skill_name: "fast-grep", file_path: "grep.py", args: [...]
 
 fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents.
 
@@ -1690,7 +1690,7 @@ def print_overview(target_display: str = "/workspace") -> None:
     print("fast-grep: Omnivorous, AST-Aware Search Engine for Autonomous Agents")
     print("=" * 80)
     print("\nTool Invocation:")
-    print('  run_skill_script(skill_name="fast-grep", file_path="grep.py", args=[...])')
+    print('  skill_name: "fast-grep", file_path: "grep.py", args: [...]')
     print("\nRecommended search arguments for next step:")
     print("  1. Search symbol or phrase:")
     print('     args: ["def score_match"]')

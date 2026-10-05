@@ -10,7 +10,7 @@ The ONLY tools available in your toolset are:
 
 ABSOLUTELY FORBIDDEN: NEVER attempt to emit a tool call named `fast-grep`, `code-map`, `code-oracle`, `repro-check`, or `test-gate` directly!
 They are skills, NOT native tools. Calling them directly causes `ValueError: Tool not found` and crashes the entire evaluation immediately!
-You MUST invoke skills EXCLUSIVELY via `run_skill_script(skill_name="...", file_path="...", args=[...])`.
+You MUST invoke skills EXCLUSIVELY via the `run_skill_script` tool, supplying the three parameters `skill_name` (string), `file_path` (string), and `args` (list of strings).
 
 # CRITICAL RULE 2: NEVER CALL `load_skill`, `list_skills`, OR `load_skill_resource`
 All 5 skills (`fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`) are ALREADY pre-loaded into your environment.

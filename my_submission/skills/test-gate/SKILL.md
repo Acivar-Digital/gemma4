@@ -41,7 +41,7 @@ Pass the following parameters to `run_skill_script`:
 
 #### 1. Smart Default (tests modified files or shows status)
 ```python
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=[])
+skill_name: "test-gate", file_path: "gate.py", args: []
 ```
 Or via `args: [...]` schema:
 ```yaml
@@ -50,10 +50,10 @@ args: []
 
 #### 2. Positional Argument Routing
 ```python
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["diff"])                 # View diff & check test file safety
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["blast"])                # Run neighbor tests on touched files
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["status"])               # Check patch readiness before submitting
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["fastapi/routing.py"])   # Run neighbor tests for target file
+skill_name: "test-gate", file_path: "gate.py", args: ["diff"]                 # View diff & check test file safety
+skill_name: "test-gate", file_path: "gate.py", args: ["blast"]                # Run neighbor tests on touched files
+skill_name: "test-gate", file_path: "gate.py", args: ["status"]               # Check patch readiness before submitting
+skill_name: "test-gate", file_path: "gate.py", args: ["fastapi/routing.py"]   # Run neighbor tests for target file
 ```
 Or via `args: [...]` schema:
 ```yaml
@@ -65,10 +65,10 @@ args: ["fastapi/routing.py"]   # Run neighbor tests for target file
 
 #### 3. Forgiving Flags & Timeout Tuning
 ```python
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-d"])                   # Short flag for diff
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-s"])                   # Short flag for status
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["-b", "-t", "30"])       # Blast with 30s timeout per test file
-run_skill_script(skill_name="test-gate", file_path="gate.py", args=["status", "--json"])     # Machine-readable JSON output
+skill_name: "test-gate", file_path: "gate.py", args: ["-d"]                   # Short flag for diff
+skill_name: "test-gate", file_path: "gate.py", args: ["-s"]                   # Short flag for status
+skill_name: "test-gate", file_path: "gate.py", args: ["-b", "-t", "30"]       # Blast with 30s timeout per test file
+skill_name: "test-gate", file_path: "gate.py", args: ["status", "--json"]     # Machine-readable JSON output
 ```
 Or via `args: [...]` schema:
 ```yaml

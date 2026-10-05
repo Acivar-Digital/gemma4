@@ -32,7 +32,7 @@
 # real deadlock: g_zip_directory_drift is only FIXABLE by step 2, so a stale zip
 # made step 1 refuse to proceed to the very step that would resolve the refusal.
 #
-# Step 3 runs the FULL check, all 14 gates, against the freshly built zip. That
+# Step 3 runs the FULL check, all 15 gates, against the freshly built zip. That
 # is step 3's entire purpose and it is deliberately NOT narrowed: the artifact
 # that will actually be uploaded is judged by every gate, including all four
 # zip-dependent ones, with full veto power.
@@ -341,7 +341,7 @@ note "packed $(ls -lh "$SUBMISSION_ZIP" | awk '{print $5}')"
 # STEP 3 — Gate the FINISHED zip
 # ============================================================================
 step 3 "Gate the FINISHED zip (validates the artifact that will be uploaded)"
-# FULL check -- all 14 gates, no --pre-pack. The zip now exists, so the four
+# FULL check -- all 15 gates, no --pre-pack. The zip now exists, so the four
 # gates step 1 deferred (g_submission_size_unpacked, g_zip_directory_drift,
 # g_zip_root_layout, g_disallowed_extensions) run here with full veto power.
 # This step is what makes the artifact trustworthy; narrowing it would defeat

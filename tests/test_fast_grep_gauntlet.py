@@ -78,7 +78,13 @@ def test_empty_and_overview():
     # Test help flag
     res_help = run_grep("--help")
     assert res_help.returncode == 0
-    assert 'run_skill_script(skill_name="fast-grep", file_path="grep.py"' in res_help.stdout
+    # The help text must advertise the CANONICAL key form, never Python-kwarg call
+    # syntax. The 4-bit quantized Gemma 4 model copies whatever a tool prints here
+    # verbatim, and Python call syntax in its context is the documented cause of the
+    # malformed-JSON splice loop (consultant3.md, Failure Mode A). Changed
+    # 2026-10-05 alongside gemma4-if78.
+    assert 'skill_name: "fast-grep", file_path: "grep.py", args: [...]' in res_help.stdout
+    assert 'run_skill_script(' not in res_help.stdout
 
     # Test JSON mode on overview
     res_json = run_grep("--json")

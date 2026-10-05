@@ -17,23 +17,55 @@ adapter:
   # onto a QAT w4a16 base is a NUMERICAL-FIDELITY risk worth surfacing, so the gate
   # WARNs; it never FAILs and never demands a retrain.
   required_base_model: gemma-4-31b-it-qat-w4a16-ct
-  # agent.yaml must declare this adapter name.
+  # SUBMIT-MODE OBLIGATION ONLY. In 'submit' the agent.yaml 'adapter:' key must
+  # equal this name. Under the shipped default (local_test, below) it is unused:
+  # no adapter ships, so there is no name to declare.
   declared_name: main_lora
-  # adapters/ subdir inside the submission must be populated.
+  # SUBMIT-MODE OBLIGATION ONLY. In 'submit' this subdir must be populated and
+  # contain adapter_model.safetensors. Under local_test an absent dir is a PASS.
   dir: adapters
-  # Which obligation the adapter gates enforce. 'submit' (DEFAULT) means this tree
-  # is what gets uploaded to Kaggle: an adapter MUST be declared in agent.yaml AND
-  # present in adapters/ -- if there is no adapter for submission, fail loudly and
-  # fail quickly. 'local_test' is the explicit opt-in for validating the harness
-  # locally without shipping an adapter: the adapter MUST be explicitly turned OFF
-  # (no 'adapter:' key in agent.yaml); a still-declared adapter in local_test is a
-  # hard FAIL. There is no middle state where an adapter is silently absent.
+  # Which obligation the adapter gates enforce, and WHY it is a REPO choice rather
+  # than a harness mandate. The harness PERMITS an adapter; it never REQUIRES one:
+  #   HARNESS_README.md:38    Adapters["adapters/* (Optional LoRA / Weights)"]
+  #   HARNESS_README.md:85    "adapters/   # Optional: Fine-tuned PEFT LoRA adapters
+  #                                 or model weights"
+  #   HARNESS_README.md:110   "adapter (str | None): Optional adapter name matching
+  #                                 a subdirectory or weight file under adapters/."
+  #   HARNESS_README.md:128   "... the primary hard constraint is a total unpacked
+  #                                 submission size of < 3 GiB ..., including all
+  #                                 adapters/ weights, plus token ceilings"
+  #   HARNESS_README.md:134   max_total_size_bytes = 3 GiB "total unpacked size,
+  #                                 including adapters/"
+  #   HARNESS_README.md:202-203  IF-USED placement instructions ("Place PEFT LoRA
+  #                              directories ... inside adapters/<adapter_name>/",
+  #                              "Reference adapter: <adapter_name> on any LlmAgent"),
+  #                              conditional on shipping one at all. These lines were
+  #                              previously cited here as if they MANDATED an adapter.
+  #                              They do not: they govern the shape of an adapter IF
+  #                              one is shipped, and the only hard constraint they
+  #                              impose is a SIZE CEILING.
+  # It follows that an adapter-less submission is a fully valid Kaggle submission,
+  # so this gate's DEFAULT must not veto one -- which is exactly what the value
+  # below records, and why it is deliberately NOT the consumer's DEFAULT_MODE.
+  # 'submit' asserts the opposite obligation (an adapter MUST be declared in
+  # agent.yaml AND present in adapters/; either one missing is a hard FAIL). It is
+  # correct ONLY for a tree that actually ships one, where it stops a real LoRA
+  # submission from silently losing its weights. 'local_test' is the mode for a
+  # tree that ships none: the adapter is explicitly turned OFF (no 'adapter:' key in
+  # agent.yaml), and a still-declared adapter is a hard FAIL because a tree with no
+  # adapters/ weights must not claim to use them. There is no middle state where an
+  # adapter is silently absent.
+  # KNOWN LIMIT OF THE TWO-MODE VOCABULARY (consumer side, check_submission.py:591):
+  # because 'local_test' FAILs a DECLARED adapter, this default would also veto a
+  # future submission that legitimately ships one. Reconciling that needs a third
+  # mode implemented in the consumer, not a different value here: gate_policy.yaml
+  # can only select between the two behaviours the gate actually implements.
   # Selection precedence: --mode CLI flag > GATE_SUBMISSION_MODE env var > this
   # submission_mode default. Every scalar here reads back as a STRING, so the
   # consumer coerces/splits allowed_modes on comma.
   submission_mode: local_test
   allowed_modes: submit,local_test
-  source: verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path; HARNESS_README.md:202-203
+  source: adapter is OPTIONAL per HARNESS_README.md:38,85,110; size-only ceiling :128,134; if-used placement :202-203; required_base_model from verified adapters_staging/main_lora/adapter_config.json base_model_name_or_path
 
 tool_budget:
   # eval_config.yaml sets this; prompts/main.md MUST agree (parity gate).

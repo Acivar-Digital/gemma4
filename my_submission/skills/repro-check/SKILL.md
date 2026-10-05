@@ -14,7 +14,7 @@ In SWE-bench and real-world issues, there is **no unit test in the repo for the 
 
 ## How to Run (via run_skill_script)
 
-Invoke `run_skill_script` with `skill_name="repro-check"`, `file_path="check.py"`, and `args`:
+Invoke the `run_skill_script` tool and supply these three parameters: `skill_name` (string), `file_path` (string), and `args` (list of strings). Each example below shows them as a JSON object.
 
 ### 1. Direct Python Snippet (`--code`)
 ```json
