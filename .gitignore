@@ -10,6 +10,8 @@ backups/
 *.whl
 *.tar.gz
 *.tar
+*.zip
+.omp/
 
 # Secrets, Credentials & Private Keys (Strict Security Guardrail)
 *.env
@@ -65,3 +67,6 @@ scratch/
 
 # Generated build artifact - rebuilt in seconds by scripts/submit_safe.sh; never commit (AGENTS.md)
 submission.zip
+
+# poll_state.sh runtime state (self-referential; must not dirty git status)
+.poll_state/

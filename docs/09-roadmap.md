@@ -15,13 +15,81 @@ Scope: theory-first. Code/YAML only after explicit approval.
   `agent_tool skip_summarization:true`.
 - No LoRA adapters v1.
 
-## Phase 2 — Local test + iterate
-- Run recipe from 08-eval-plan on 1–2 fastapi tasks (50 calls / 30 min).
-- Inspect `summary.json`, `patches/`, `traces/`; fix prompts/budgets.
-- Iterate until source-only patches resolve reliably.
+## Phase 2 — Local test + iterate — **SUPERSEDED 2026-10-05, never executable**
+
+The original Phase 2 said "run locally, inspect traces, iterate until patches
+resolve". **There is no local Gemma 4.** The competition model
+`gemma-4-31b-it-qat-w4a16-ct` is served only by Kaggle, at
+`google/gemma-4/other/gemma-4-31b-it-qat-w4a16-ct/2` on 4× NVIDIA L4 24 GB with
+vLLM `tp=4`. Everything runnable locally resolves through a LiteRouter proxy and
+records `model_name: stealth/space-bunny-alpha`.
+
+Consequences, all measured:
+- **0 tasks have ever been resolved on the real model** — 0/129 with exit-code
+  histogram `{-1:115, 1:6, 2:5, 124:3}`, plus 0/2 and 0/3 canaries.
+- Every historical baseline in this repo (**43.4% / 45.7% / 64.9%**, runs
+  B35/B37/B39/B40) is a proxy number. `grep 'gemma-4-31b-it-qat' results/` → 0
+  hits. **No number this repo has ever produced is a Gemma 4 number.**
+- Therefore local iteration cannot gate anything. It can only validate syntax
+  and plumbing. The single measuring instrument is one Kaggle kernel run.
+
+## Phase 2b — Kaggle kernel bring-up (settled; the actual blocker)
+
+Iteration is blocked by getting the harness to import at all. Three kernel
+versions were spent here, and the fault was always *plumbing*, never the agent:
+
+|Ver|Reached|Failure|
+|---|---|---|
+|v2|Phase 2 (11 s)|`ModuleNotFoundError: adk_submission`|
+|v3|Phase 1|tag filter worked; `flashinfer-python` needs `apache-tvm-ffi`, which is cp312-only, so pip could not resolve it|
+|v4|queued|wheelhouse scoring + announced `--no-deps` retry|
+
+Two durable lessons from v3, both now encoded in
+`kaggle_baseline_v1/baseline_v1.ipynb` Phase 1:
+
+1. **The wheelhouse kernel is cp312; the kernel interpreter is CPython 3.13.**
+   When wheels are passed to pip as explicit file paths, one incompatible wheel
+   aborts the **whole batch**, so a partial install silently becomes *no*
+   install. Filter with `packaging.tags.sys_tags()`. Never substring-match
+   `cp312` — that also discards `cp38-abi3` / `cp39-abi3` / `cp310-abi3` wheels
+   that a newer interpreter loads fine.
+2. **Kaggle mounts a second wheel directory the notebook was ignoring.**
+   `/kaggle/input/competitions/<comp>/wheels` (124 wheels) sits beside the
+   attached wheelhouse dataset (41). `discover_wheelhouse()` sorted candidates
+   by whether the path contained the literal string `"wheelhouse"`, so it picked
+   the cp312 set by *name* while a better-fitting one was mounted. Selection is
+   now **measured**: score every candidate by how many wheels this interpreter
+   can load plus whether it can supply `adk_submission`, install from the winner,
+   and print the scoring table so the choice is auditable in the log.
+
+## Phase 3 — Measure (current)
+
+Kernel `francisclyap/gemma4-baseline-v1` v4 is queued. On completion, read the
+output in this order and stop at the first failure:
+
+1. **Phase 3** — printed `submission.zip` sha256 must equal the pinned
+   `bd4f31cd7971ef4df6910f6c5324259d8d337cc527b2f67549340a2f0745b05e`. A
+   mismatch means the run measured something unshipped.
+2. **Phase 4.5** — preflight: no `thinking_level` in `sampling.yaml`, no
+   `adapter:` in `agent.yaml`, corpus task count is 129.
+3. **Phase 4.6** — non-degeneracy verdict.
+4. If non-degenerate: `exit_code_histogram.json` → `tasks_with_tokens` /
+   `total_tasks` (expect ≥ 18/20), `tasks_with_tool_calls`,
+   `tasks_with_nonempty_patch`.
+
+**A `DEGENERATE` verdict is a serving-path fault, not a model result.** Report
+it and stop. Do not escalate to GCP on the first zero; §5 of the recovery plan
+prices GCP at $2–30 per identical run for no added fidelity.
 
 ## Do-NOT list
 - NO `my_submission/` without explicit user approval.
 - NO `agent.py` — declarative YAML only (`compile_submission`).
 - NO bare `pytest` in agent instructions; NO test-file edits.
 - NO repro files in `/workspace`; NO LoRA v1; NO `..` in `!include`.
+- **NO treating a proxy score as a Gemma 4 result.** If a run did not record
+  `gemma-4-31b-it-qat-w4a16-ct`, its number is not a quality signal — including
+  the 43.4% / 45.7% / 64.9% figures that predate this correction.
+- NO local iteration as a quality gate (see Phase 2 — it cannot be executed).
+- NO selecting a wheelhouse or any runtime artifact by **name**; select it by
+  measured compatibility with the interpreter that will actually load it.
+- NO shipping an adapter until a real Gemma 4 baseline exists.

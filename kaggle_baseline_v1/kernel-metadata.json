@@ -12,7 +12,8 @@
     "gpu"
   ],
   "dataset_sources": [
-    "metric/gemma-4-developer-agent-wheelhouse"
+    "metric/gemma-4-developer-agent-wheelhouse",
+    "francisclyap/gemma4-submission-artifact"
   ],
   "kernel_sources": [],
   "competition_sources": [

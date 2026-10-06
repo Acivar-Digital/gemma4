@@ -35,7 +35,7 @@
   "r": 8,
   "rank_pattern": {},
   "revision": null,
-  "target_modules": "(?:.*?(?:language|text).*?(?:self_attn|attention|attn|mixer|mlp|feed_forward|ffn|dense|mixer).*?\\.(?:q_proj|v_proj|o_proj))|(?:\\bmodel\\.layers\\.[\\d]{1,}(?!.*\\.experts\\.\\d)\\..*?(?:self_attn|attention|attn|mixer|mlp|feed_forward|ffn|dense|mixer).*?\\.(?:(?:q_proj|v_proj|o_proj)))",
+  "target_modules": "(?:.*?(?:language|text).*?(?:self_attn|attention|attn|mixer|mlp|feed_forward|ffn|dense|mixer).*?\\.(?:q_proj|k_proj|v_proj|o_proj))|(?:\\bmodel\\.layers\\.[\\d]{1,}(?!.*\\.experts\\.\\d)\\..*?(?:self_attn|attention|attn|mixer|mlp|feed_forward|ffn|dense|mixer).*?\\.(?:(?:q_proj|k_proj|v_proj|o_proj)))",
   "target_parameters": null,
   "task_type": "CAUSAL_LM",
   "trainable_token_indices": null,
