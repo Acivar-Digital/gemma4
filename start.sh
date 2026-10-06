@@ -19,8 +19,8 @@ export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-thinkingmachines/inkling:free}"
 export SWEGEMMA_API_KEY="${SWEGEMMA_API_KEY:-lr-or-oa-ch-no}"
 
 # Clean any stray bytecode cache in submission directory before ADK compilation
-find "$PROJECT_DIR/my_submission" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-find "$PROJECT_DIR/my_submission" -name "*.pyc" -delete 2>/dev/null || true
+find "$PROJECT_DIR/submissions/track1_live" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+find "$PROJECT_DIR/submissions/track1_live" -name "*.pyc" -delete 2>/dev/null || true
 
 PYTHON_BIN="/tmp/brun/venv/bin/python"
 

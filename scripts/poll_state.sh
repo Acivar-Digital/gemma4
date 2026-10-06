@@ -47,7 +47,7 @@ sig_git() {
 }
 
 sig_zip() {
-  [ -f submission.zip ] && sha256sum submission.zip | cut -c1-16 || echo "NO-ZIP"
+  [ -f submissions/ship_dataset/submission.zip ] && sha256sum submissions/ship_dataset/submission.zip | cut -c1-16 || echo "NO-ZIP"
 }
 
 sig_gate() {

@@ -22,7 +22,7 @@ from typing import Any
 sys.dont_write_bytecode = True
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SUBMISSION_DIR = ROOT_DIR / "my_submission"
+SUBMISSION_DIR = ROOT_DIR / "submissions/track1_live"
 ADAPTERS_DIR = SUBMISSION_DIR / "adapters" / "main_lora"
 
 

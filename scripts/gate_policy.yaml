@@ -88,7 +88,7 @@ tool_budget:
   # eval_config.yaml sets this; prompts/main.md MUST agree (parity gate).
   # main.md was corrected from a false 50 to this true 40 on 2026-10-04.
   max_tool_calls: 40
-  source: my_submission/eval_config.yaml:4 evaluation.max_tool_calls
+  source: submissions/track1_live/eval_config.yaml:4 evaluation.max_tool_calls
 
 serving:
   # configs/sampling.yaml current values (verified compliant 2026-10-04).
@@ -119,7 +119,7 @@ run_health:
   # INFRASTRUCTURE FAILURE, not a quality result.
   zero_completion_token_traces_min_fraction: 0.5
   empty_patch_min_count: 100
-  source: cloud_results/results/task_results.jsonl (verified 2026-10-04)
+  source: evidence/cloud_runs_results/task_results.jsonl (verified 2026-10-04)
 
 submission_quota:
   # Official rules allow ONE submission per day, not 5. The skill doc asserting
@@ -131,7 +131,7 @@ packaging:
   # SINGLE SOURCE OF TRUTH for what the packer EXCLUDES from submission.zip.
   #
   # g_zip_directory_drift compares the zip's members against EVERY file under
-  # my_submission/. Without a shared exclusion filter, a file the packer
+  # submissions/track1_live/. Without a shared exclusion filter, a file the packer
   # CORRECTLY omits (e.g. .DS_Store) is reported as "in dir not zip" and the gate
   # fails forever -- a permanent false FAIL that vetoes an otherwise valid
   # submission. The gate therefore honours this list.

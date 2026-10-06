@@ -17,7 +17,7 @@ Source of truth: `HARNESS_README.md` (671 lines). Read it before any design work
 - `sample_submission/` — baseline: `agent.yaml`, `eval_config.yaml`, `configs/sampling.yaml` (0.2/16384/4096), `prompts/system.md` + `analyzer.md`, `sub_agents/code_analyzer.yaml`, dummy LoRAs (213K each)
 - `graphs/` (127 .json), `embeddings/` (.npz), `snapshots/`, `wheels/`, `docker/`, `sandbox/`
 - `gemma-4-developer-agent/` — empty.
-- `my_submission/` — Active Track 1 baseline submission (declarative ADK agent with 5 pre-installed skills: `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`). Scored 56/129 (43.4%) in run_B39.
+- `submissions/track1_live/` — Active Track 1 baseline submission (declarative ADK agent with 5 pre-installed skills: `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`). Scored 56/129 (43.4%) in run_B39.
 - `submission.zip` — Packaged and verified 221 KB competition submission archive.
 
 ## Canonical Architecture Source of Truth
@@ -43,7 +43,7 @@ Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) f
 
 - **Keep these out of git** — already `.gitignore`d, 0 tracked files, leave them that way: `snapshots/` (~20G), `models/` (~18G), `adapters_staging/` (~848M), `checkpoints/` (~777M), `embeddings/` (~446M), `graphs/` (~403M), `results/` (~124M), `wheels/` (~27M). If a task seems to require tracking one of these, STOP and report it; that is the failure this section prevents.
 - **Never commit generated build artifacts, especially `submission.zip`.** It is rebuilt in seconds by `scripts/submit_safe.sh`; every repack committed adds ~80MB **permanently** to immutable history. If tracked, prefer `git rm --cached submission.zip` and add it to `.gitignore` — say so plainly, because history cannot be shrunk without a rewrite.
-- **GitHub's hard limit is 100MB per file** — a single tracked file over it fails `git push` outright. `my_submission/adapters/main_lora/adapter_model.safetensors` is 86MB: under the limit, thin margin. Never commit checkpoints or larger quantizations.
+- **GitHub's hard limit is 100MB per file** — a single tracked file over it fails `git push` outright. `submissions/track1_live/adapters/main_lora/adapter_model.safetensors` is 86MB: under the limit, thin margin. Never commit checkpoints or larger quantizations.
 - **No duplicate copies of large artifacts.** The main_lora adapter is tracked 3× (86M + 69M + 69M). One canonical location only.
 - **Prefer the cheap direction.** `git rm --cached` is cheap and safe; purging blobs already in history needs a rewrite that invalidates every commit SHA and every tag. Never rewrite history to fix repo size unless the user explicitly asks for it in that turn.
 

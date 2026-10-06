@@ -382,7 +382,7 @@ def main() -> int:
     )
 
     # Clean any rogue macOS metadata or bytecode before compiling agents
-    submission_dir = ROOT_DIR / "my_submission"
+    submission_dir = ROOT_DIR / "submissions/track1_live"
     if submission_dir.exists():
         for f in submission_dir.rglob("*.pyc"):
             try:

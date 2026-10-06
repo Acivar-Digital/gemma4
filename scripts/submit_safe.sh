@@ -15,7 +15,7 @@
 # STRICT ORDER
 # ------------
 #   1. Gate the working tree   (check_submission.py --pre-pack) -> stop on non-zero
-#   2. Pack my_submission/ -> submission.zip         (announced first)
+#   2. Pack submissions/track1_live/ -> submission.zip         (announced first)
 #   3. Gate the FINISHED zip  (check_submission.py)  -> stop on non-zero
 #   4. Summary + SHA-256 of the zip
 #   5. Quota check (submission_quota.per_day from gate_policy.yaml)
@@ -68,7 +68,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 CHECKER="$SCRIPT_DIR/check_submission.py"
 POLICY="$SCRIPT_DIR/gate_policy.yaml"
-SUBMISSION_DIR="$REPO_ROOT/my_submission"
+SUBMISSION_DIR="$REPO_ROOT/submissions/track1_live"
 SUBMISSION_ZIP="$REPO_ROOT/submission.zip"
 COMPETITION="gemma-4-developer-agent"
 
@@ -279,7 +279,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
   fi
 
   step 4 "What a real run WOULD do (no changes made)"
-  note "  - purge junk from my_submission/, then pack it into submission.zip"
+  note "  - purge junk from submissions/track1_live/, then pack it into submission.zip"
   note "  - re-run the gates against that new zip"
   note "  - print its SHA-256, check the daily quota, then prompt you"
   note "  - exclusion vocabulary (packaging.excluded_globs from gate_policy.yaml):"
@@ -301,7 +301,7 @@ fi
 # ============================================================================
 # STEP 2 — Pack (irreversible-ish: overwrites the real submission.zip)
 # ============================================================================
-step 2 "Pack my_submission/ -> submission.zip"
+step 2 "Pack submissions/track1_live/ -> submission.zip"
 
 # ANNOUNCED BEFORE IT HAPPENS: this overwrites the real archive.
 warn "ABOUT TO OVERWRITE: $SUBMISSION_ZIP"

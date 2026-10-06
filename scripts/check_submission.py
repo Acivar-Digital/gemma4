@@ -45,7 +45,7 @@ Gate categories -- every gate is EXACTLY ONE of these, and the registry asserts
 at load time that none is uncategorized (see ``GATE_CATEGORIES``):
 
     submission  Asserts a property of the artifact being shipped. A FAIL here is
-                a real defect in ``my_submission/`` / ``submission.zip``, so it
+                a real defect in ``submissions/track1_live/`` / ``submission.zip``, so it
                 blocks the submission and sets a non-zero exit code.
     post_run    Analyzes COMPLETED-RUN artifacts (``cloud_results/results/``). A
                 FAIL is a verdict about a HISTORICAL RUN's health, not about
@@ -131,11 +131,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_HERE)
 
 POLICY_PATH = os.path.join(_HERE, "gate_policy.yaml")
-SUBMISSION_DIR = os.path.join(REPO_ROOT, "my_submission")
+SUBMISSION_DIR = os.path.join(REPO_ROOT, "submissions/track1_live")
 SUBMISSION_ZIP = os.path.join(REPO_ROOT, "submission.zip")
 ADAPTERS_STAGING = os.path.join(REPO_ROOT, "adapters_staging")
-TASK_RESULTS = os.path.join(REPO_ROOT, "cloud_results", "results", "task_results.jsonl")
-TRACES_DIR = os.path.join(REPO_ROOT, "cloud_results", "results", "traces")
+TASK_RESULTS = os.path.join(REPO_ROOT, "evidence", "cloud_runs_results", "task_results.jsonl")
+TRACES_DIR = os.path.join(REPO_ROOT, "evidence", "cloud_runs_results", "traces")
 DOCS_DIR = os.path.join(REPO_ROOT, "docs")
 
 # The harness allowlist (HARNESS_README.md allowed_file_extensions). This is a
@@ -161,7 +161,7 @@ WARN = "WARN"
 # the 15 gates is left uncategorized.
 #
 #   submission  Asserts a property OF THE ARTIFACT BEING SHIPPED. A FAIL here is
-#               a genuine defect in submission.zip / my_submission/, so it MUST
+#               a genuine defect in submission.zip / submissions/track1_live/, so it MUST
 #               block the submission and sets a non-zero exit code.
 #   post_run    Analyzes COMPLETED-RUN artifacts (cloud_results/results/).
 #               A FAIL here is a verdict about a HISTORICAL RUN's infrastructure
@@ -622,7 +622,7 @@ def g_adapter_declared(policy: Dict[str, Dict[str, Any]]) -> GateResult:
                 f"no 'adapter:' key in agent.yaml; policy adapter.required is true; "
                 f"expected 'adapter: {declared_name}'",
                 f"Add 'adapter: {declared_name}' to agent.yaml and populate "
-                f"my_submission/{_policy_get(policy, 'adapter', 'dir')}/, or set "
+                f"submissions/track1_live/{_policy_get(policy, 'adapter', 'dir')}/, or set "
                 f"adapter.required: false in scripts/gate_policy.yaml if the harness "
                 f"does not require one (it does not -- HARNESS_README.md:38,85,110).",
             )
@@ -674,8 +674,8 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     The zip-vs-directory invariant is not left unasserted -- it is owned by
     :func:`g_zip_directory_drift`, which hashes every file on both sides under the
     SAME ``packaging.excluded_globs``. Verified empirically: with an adapter
-    present in ``my_submission/`` but absent from the zip, drift reports
-    ``submission.zip is out of sync with my_submission/`` as a blocking
+    present in ``submissions/track1_live/`` but absent from the zip, drift reports
+    ``submission.zip is out of sync with submissions/track1_live/`` as a blocking
     ``submission``-category FAIL, and the reverse (zip-only adapter) drifts too.
     So a directory-only adapter cannot reach Kaggle undeclared.
     """
@@ -694,14 +694,14 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
         if required:
             return GateResult("g_adapter_present", FAIL,
                               f"{adapters_subdir}/ missing in submission (policy requires one)",
-                              f"{rel_dir} not populated under my_submission/; "
+                              f"{rel_dir} not populated under submissions/track1_live/; "
                               "policy adapter.required is true",
-                              f"Populate my_submission/{adapters_subdir}/ with "
+                              f"Populate submissions/track1_live/{adapters_subdir}/ with "
                               f"adapter_config.json + adapter_model.safetensors, or set "
                               f"adapter.required: false (the harness does not require one).")
         return GateResult("g_adapter_present", PASS,
                           f"{adapters_subdir}/ absent or empty (adapter is OPTIONAL per the harness)",
-                          f"{rel_dir} not populated under my_submission/; policy "
+                          f"{rel_dir} not populated under submissions/track1_live/; policy "
                           f"adapter.required is false; HARNESS_README.md:38,85,110 mark "
                           "adapters/ Optional", "")
     files = []
@@ -723,7 +723,7 @@ def g_adapter_present(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 def _find_adapter_config() -> Optional[str]:
     """Locate the adapter_config.json of the adapter that is actually GRADED.
 
-    Only ``my_submission/adapters/`` counts. Staging directories are not part
+    Only ``submissions/track1_live/adapters/`` counts. Staging directories are not part
     of the submission artifact, so a config there says nothing about what
     Kaggle would load -- warning about one is noise that masks a real signal.
     """
@@ -752,7 +752,7 @@ def g_adapter_base_model(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     if cfg is None:
         return GateResult("g_adapter_base_model", PASS,
                           "submission ships no adapter; base-model fidelity not applicable",
-                          "no adapters/main_lora/adapter_config.json in my_submission/",
+                          "no adapters/main_lora/adapter_config.json in submissions/track1_live/",
                           "")
     try:
         with open(cfg, "r", encoding="utf-8") as fh:
@@ -1162,7 +1162,7 @@ def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     exclude = resolve_excluded_globs(policy)
     if not os.path.isdir(SUBMISSION_DIR):
         return GateResult("g_zip_directory_drift", FAIL, "submission directory missing",
-                          os.path.relpath(SUBMISSION_DIR, REPO_ROOT), "Restore my_submission/.")
+                          os.path.relpath(SUBMISSION_DIR, REPO_ROOT), "Restore submissions/track1_live/.")
     if not os.path.isfile(SUBMISSION_ZIP):
         return GateResult("g_zip_directory_drift", FAIL,
                           "submission.zip absent; cannot verify drift",
@@ -1201,9 +1201,9 @@ def g_zip_directory_drift(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     if differing:
         parts.append(f"content differs ({len(differing)}): " + ", ".join(differing[:8]) + (" ..." if len(differing) > 8 else ""))
     return GateResult("g_zip_directory_drift", FAIL,
-                      "submission.zip is out of sync with my_submission/",
+                      "submission.zip is out of sync with submissions/track1_live/",
                       " | ".join(parts) + ignored_note,
-                      "Repack submission.zip from my_submission/ so the zip matches the tree.")
+                      "Repack submission.zip from submissions/track1_live/ so the zip matches the tree.")
 
 
 # --- 11. zip root layout ----------------------------------------------------
@@ -1237,7 +1237,7 @@ def g_zip_root_layout(policy: Dict[str, Dict[str, Any]]) -> GateResult:
         return GateResult("g_zip_root_layout", FAIL,
                           f"archive is nested one level deep under '{single_root}/'",
                           evidence + f"; required found under {single_root}/: {misplaced}",
-                          "Zip from INSIDE my_submission/ so agent.yaml sits at the archive root.")
+                          "Zip from INSIDE submissions/track1_live/ so agent.yaml sits at the archive root.")
     if missing:
         return GateResult("g_zip_root_layout", FAIL,
                           "required files missing from archive root",
@@ -1278,14 +1278,14 @@ def g_disallowed_extensions(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 
 # --- 13. advertised skill scripts exist (prompt vs shipped skills) -----------
 
-# The canonical call form the prompt teaches the model (my_submission/prompts/
+# The canonical call form the prompt teaches the model (submissions/track1_live/prompts/
 # main.md:37-56) is a plain key/value line:
 #
 #     skill_name: "fast-grep", file_path: "grep.py", args: ["<pattern>"]
 #
 # Every advertised ``file_path`` names a script the model will ask the harness
 # to execute, and the harness only ships what is under
-# ``my_submission/skills/<skill_name>/scripts/``. An advertised basename that is
+# ``submissions/track1_live/skills/<skill_name>/scripts/``. An advertised basename that is
 # NOT there is the defect this gate exists for: the model spends a turn (and
 # budget) on a call against a script that does not exist, which dies on a
 # missing-file error -- the same dead-end turn as the SkillToolset trap, except
@@ -1314,7 +1314,7 @@ def _advertised_skill_scripts(lines: Sequence[str]) -> List[Tuple[int, str, str]
 def g_prompt_skill_scripts_exist(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     """Every ``file_path`` the prompt advertises is a script we actually ship.
 
-    Cross-checks ``my_submission/prompts/main.md`` against the shipped skill
+    Cross-checks ``submissions/track1_live/prompts/main.md`` against the shipped skill
     tree: for each advertised call, ``skills/<skill_name>/scripts/<file_path>``
     must be a real file. Working-tree based, like every other pre-submission
     prompt gate (``g_tool_budget_parity``, ``g_prompt_ladder_consistency``),
@@ -1366,7 +1366,7 @@ def g_prompt_skill_scripts_exist(policy: Dict[str, Dict[str, Any]]) -> GateResul
         return GateResult("g_prompt_skill_scripts_exist", FAIL,
                           "main.md advertises a skill script that is not shipped",
                           evidence + " || MISSING: " + "; ".join(sorted(set(missing))),
-                          "Ship each advertised script at my_submission/skills/<skill>/scripts/"
+                          "Ship each advertised script at submissions/track1_live/skills/<skill>/scripts/"
                           "<file>, or correct the file_path the prompt advertises.")
     return GateResult("g_prompt_skill_scripts_exist", PASS,
                       f"all {len(advertised)} advertised skill script(s) exist", evidence, "")
@@ -1598,7 +1598,7 @@ ALL_GATES = PRE_SUBMISSION_GATES + POST_RUN_GATES
 # than a silently-uncategorized gate whose FAIL nobody knows how to weigh.
 #
 # g_adapter_base_model is categorized 'submission' even though it is WARN-only
-# by design: it inspects an artifact INSIDE my_submission/, so it is a
+# by design: it inspects an artifact INSIDE submissions/track1_live/, so it is a
 # submission-category check. Categorizing it does not grant it veto power --
 # WARN never affects the exit code (unchanged semantics).
 #

@@ -2,11 +2,15 @@ name: main
 model: gemma-4-31b-it-qat-w4a16-ct
 instruction: !include prompts/main.md
 tools:
+  - run_command
   - read_file
   - edit_file
   - write_file
   - get_status
   - submit_patch
+  - get_code_neighbors
+  - search_similar_code
+  - get_code_subgraph
 skills:
   - skills/code-map
   - skills/fast-grep

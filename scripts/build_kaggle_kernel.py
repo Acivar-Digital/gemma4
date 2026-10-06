@@ -38,8 +38,8 @@ import zipfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SUBMISSION_DIR = ROOT_DIR / "my_submission"
-KERNEL_DIR = ROOT_DIR / "kaggle_kernel"
+SUBMISSION_DIR = ROOT_DIR / "submissions/track1_live"
+KERNEL_DIR = ROOT_DIR / "simulation/kernels_diag/kaggle_kernel"
 KERNEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # The served competition model. This string is policy/harness-defined and is the
@@ -139,48 +139,36 @@ def _preflight() -> dict:
             break
 
     if declared_adapter is None:
-        _fail(
-            "agent.yaml declares no `adapter:` key, but this builder always "
-            "mounts the real adapter.\n"
-            "  This kernel is the full-eval path and ships adapters/main_lora. "
-            "Silence here would mean the kernel silently serves base weights "
-            "only while looking identical in the log. Declare the adapter in "
-            "agent.yaml or use an explicitly adapter-less builder."
-        )
-    print(f"  declared adapter              : {declared_adapter}")
-
-    adapter_dir = adapters_root / declared_adapter
-    if not adapter_dir.is_dir():
-        _fail(
-            f"Adapter directory {adapter_dir} is missing.\n"
-            "  The submission declares an adapter but does not ship it. The "
-            "kernel would build and then serve base weights with no LoRA, "
-            "scoring near zero for a reason that has nothing to do with the "
-            "model's capability. Train/promote the adapter first."
-        )
-    missing = [name for name in ADAPTER_REQUIRED_FILES if not (adapter_dir / name).is_file()]
-    if missing:
-        _fail(
-            f"Adapter {adapter_dir} is incomplete; missing {missing}.\n"
-            "  adapter_config.json + adapter_model.safetensors are both "
-            "required. A zero-byte or truncated adapter is the failure class "
-            "that wastes a quota run, so it is checked here and again at run "
-            "time after the zip is unpacked."
-        )
-    empty = [
-        name
-        for name in ADAPTER_REQUIRED_FILES
-        if (adapter_dir / name).stat().st_size == 0
-    ]
-    if empty:
-        _fail(f"Adapter {adapter_dir} has empty file(s) {empty}. Refusing to build.")
-    adapter_bytes = (adapter_dir / "adapter_model.safetensors").stat().st_size
-    print(f"  adapter dir                   : {adapter_dir}")
-    print(f"  adapter weights               : {adapter_bytes:,} bytes")
-    print(f"  adapter files present         : OK {list(ADAPTER_REQUIRED_FILES)}")
+        print("  declared adapter              : None (base weights only, adapter optional)")
+        adapter_dir = None
+        adapter_bytes = 0
+        adapter_files = []
+    else:
+        print(f"  declared adapter              : {declared_adapter}")
+        adapter_dir = adapters_root / declared_adapter
+        if not adapter_dir.is_dir():
+            _fail(
+                f"Adapter directory {adapter_dir} is missing.\n"
+                "  The submission declares an adapter but does not ship it. Train/promote first."
+            )
+        missing = [name for name in ADAPTER_REQUIRED_FILES if not (adapter_dir / name).is_file()]
+        if missing:
+            _fail(f"Adapter {adapter_dir} is incomplete; missing {missing}.")
+        empty = [
+            name
+            for name in ADAPTER_REQUIRED_FILES
+            if (adapter_dir / name).stat().st_size == 0
+        ]
+        if empty:
+            _fail(f"Adapter {adapter_dir} has empty file(s) {empty}. Refusing to build.")
+        adapter_bytes = (adapter_dir / "adapter_model.safetensors").stat().st_size
+        adapter_files = list(ADAPTER_REQUIRED_FILES)
+        print(f"  adapter dir                   : {adapter_dir}")
+        print(f"  adapter weights               : {adapter_bytes:,} bytes")
+        print(f"  adapter files present         : OK {adapter_files}")
 
     print(f"\n  TARGET MODEL : {declared_model}")
-    print(f"  ADAPTER MOUNT: {declared_adapter} ({adapter_bytes:,} bytes of LoRA weights)")
+    print(f"  ADAPTER MOUNT: {declared_adapter or 'None (pure base weights)'} ({adapter_bytes:,} bytes of LoRA weights)")
     print("  ABOUT TO DO  : rebuild submission.zip from my_submission/, embed it as")
     print("                base64 into a 5-cell notebook, and write")
     print("                kaggle_kernel/gemma4-eval-40calls.ipynb + kernel-metadata.json.")
@@ -191,7 +179,7 @@ def _preflight() -> dict:
     return {
         "model": declared_model,
         "adapter_name": declared_adapter,
-        "adapter_files": list(ADAPTER_REQUIRED_FILES),
+        "adapter_files": adapter_files,
         "adapter_weights_bytes": adapter_bytes,
     }
 
@@ -210,22 +198,21 @@ if not zip_path.exists():
 if not zip_path.is_file() or zip_path.stat().st_size == 0:
     _fail(f"Packaged submission archive {zip_path} is missing or empty.")
 
-# Verify the archive actually contains the adapter we just validated. An archive
-# built from a stale tree is the classic way a "real" adapter silently vanishes.
-with zipfile.ZipFile(zip_path) as archive:
-    names = set(archive.namelist())
-adapter_prefix = f"{ADAPTER_DIR_NAME}/{PREFLIGHT['adapter_name']}/"
-absent = [
-    name for name in PREFLIGHT["adapter_files"] if adapter_prefix + name not in names
-]
-if absent:
-    _fail(
-        f"{zip_path} does not contain {adapter_prefix}{absent}.\n"
-        f"  The archive is stale relative to {SUBMISSION_DIR}. Delete "
-        f"{zip_path.name} and re-run so the archive is rebuilt from the "
-        "current tree; the kernel would otherwise serve without the adapter."
-    )
-print(f"Adapter present in {zip_path.name}: {adapter_prefix}{PREFLIGHT['adapter_files']}")
+if PREFLIGHT["adapter_name"]:
+    with zipfile.ZipFile(zip_path) as archive:
+        names = set(archive.namelist())
+    adapter_prefix = f"{ADAPTER_DIR_NAME}/{PREFLIGHT['adapter_name']}/"
+    absent = [
+        name for name in PREFLIGHT["adapter_files"] if adapter_prefix + name not in names
+    ]
+    if absent:
+        _fail(
+            f"{zip_path} does not contain {adapter_prefix}{absent}.\n"
+            f"  The archive is stale relative to {SUBMISSION_DIR}."
+        )
+    print(f"Adapter present in {zip_path.name}: {adapter_prefix}{PREFLIGHT['adapter_files']}")
+else:
+    print(f"No adapter declared; packaging base-model submission.")
 
 b64_zip = base64.b64encode(zip_path.read_bytes()).decode("ascii")
 print(f"Embedded submission.zip base64 payload: {len(b64_zip)} chars")
@@ -305,6 +292,43 @@ subprocess.run(
 importlib.invalidate_caches()
 print('Wheelhouse installation complete.')
 """
+if PREFLIGHT["adapter_name"]:
+    _cell_1_adapter_snippet = f"""# FAIL LOUD: the adapter must be on disk AFTER unpacking, not just at build time.
+ADAPTER_NAME = '{PREFLIGHT['adapter_name']}'
+ADAPTER_DIR = AGENT_DIR / 'adapters' / ADAPTER_NAME
+assert ADAPTER_DIR.is_dir(), (
+    f'ADAPTER MISSING: {{ADAPTER_DIR}} does not exist after unpacking. The kernel '
+    'will NOT score the model you think it is scoring. Do not continue.'
+)
+for _required in {PREFLIGHT['adapter_files']!r}:
+    _p = ADAPTER_DIR / _required
+    assert _p.is_file() and _p.stat().st_size > 0, (
+        f'ADAPTER INCOMPLETE: {{_p}} missing or zero bytes. Aborting before vLLM starts.'
+    )
+print('ADAPTER VERIFIED ON DISK:', ADAPTER_DIR,
+      sorted(p.name for p in ADAPTER_DIR.iterdir() if p.is_file()))"""
+else:
+    _cell_1_adapter_snippet = "print('NO ADAPTER DECLARED: serving pure base weights (decision-adapter-optional).')"
+
+if PREFLIGHT["adapter_name"]:
+    _cell_2_adapter_snippet = f"""adapters = discover_adapters(str(AGENT_DIR), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS)
+assert adapters, (
+    'NO ADAPTERS DISCOVERED at run time, but this kernel was built to mount '
+    f'{PREFLIGHT["adapter_name"]}. vLLM would serve base weights only and '
+    'the resulting score would be a serving artefact, not a model result.'
+)
+print('ADAPTERS DISCOVERED:', adapters)
+enable_lora_flag = bool(adapters)
+max_loras_val = 8
+max_lora_rank_val = 128"""
+    _cell_2_lora_assert = "assert vllm_cfg.enable_lora, 'vLLM LoRA is disabled despite a discovered adapter manifest.'"
+else:
+    _cell_2_adapter_snippet = """adapters = []
+print('NO ADAPTERS CONFIGURED: LoRA disabled for maximum KV cache.')
+enable_lora_flag = False
+max_loras_val = 0
+max_lora_rank_val = 0"""
+    _cell_2_lora_assert = "# Pure base weights: LoRA disabled"
 
 cell_1_unpack = f"""import base64
 import os
@@ -339,23 +363,7 @@ for root, dirs, files in os.walk(AGENT_DIR):
         if d == '__pycache__':
             shutil.rmtree(os.path.join(root, d))
 
-# FAIL LOUD: the adapter must be on disk AFTER unpacking, not just at build time.
-# A truncated base64 payload, a stale archive, or a bad zip layout would
-# otherwise produce a kernel that starts vLLM with LoRA disabled and reports a
-# low score that is indistinguishable from model weakness.
-ADAPTER_NAME = '{PREFLIGHT['adapter_name']}'
-ADAPTER_DIR = AGENT_DIR / 'adapters' / ADAPTER_NAME
-assert ADAPTER_DIR.is_dir(), (
-    f'ADAPTER MISSING: {{ADAPTER_DIR}} does not exist after unpacking. The kernel '
-    'will NOT score the model you think it is scoring. Do not continue.'
-)
-for _required in {PREFLIGHT['adapter_files']!r}:
-    _p = ADAPTER_DIR / _required
-    assert _p.is_file() and _p.stat().st_size > 0, (
-        f'ADAPTER INCOMPLETE: {{_p}} missing or zero bytes. Aborting before vLLM starts.'
-    )
-print('ADAPTER VERIFIED ON DISK:', ADAPTER_DIR,
-      sorted(p.name for p in ADAPTER_DIR.iterdir() if p.is_file()))
+{_cell_1_adapter_snippet}
 
 TASKS_PATH = DATA_DIR / 'tasks.jsonl'
 tasks = load_tasks(TASKS_PATH)
@@ -453,15 +461,7 @@ assert declared_model == TARGET_MODEL_NAME, (
 )
 print('agent.yaml model matches served model:', declared_model)
 
-adapters = discover_adapters(str(AGENT_DIR), adapter_extensions=ALLOWED_ADAPTER_EXTENSIONS)
-# FAIL LOUD: we validated a real adapter at build time, so a silent empty
-# manifest at run time means the unpack diverged from what we validated.
-assert adapters, (
-    'NO ADAPTERS DISCOVERED at run time, but this kernel was built to mount '
-    f'{PREFLIGHT["adapter_name"]}. vLLM would serve base weights only and '
-    'the resulting score would be a serving artefact, not a model result.'
-)
-print('ADAPTERS DISCOVERED:', adapters)
+{_cell_2_adapter_snippet}
 
 gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
 tp_size = 4 if gpu_count >= 4 else (2 if gpu_count >= 2 else 1)
@@ -479,13 +479,13 @@ vllm_cfg = VllmConfig(
     dtype='bfloat16' if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else 'auto',
     gpu_memory_utilization=0.90,
     enable_auto_tool_choice=True,
-    enable_lora=bool(adapters),
-    max_loras=8 if adapters else 0,
-    max_lora_rank=128 if adapters else 0,
+    enable_lora=enable_lora_flag,
+    max_loras=max_loras_val,
+    max_lora_rank=max_lora_rank_val,
     tensor_parallel_size=tp_size,
     startup_timeout=60 * 20,
 )
-assert vllm_cfg.enable_lora, 'vLLM LoRA is disabled despite a discovered adapter manifest.'
+{_cell_2_lora_assert}
 server_instance = VllmServer(vllm_cfg, adapter_manifest=adapters)
 server_instance.start()
 print(f'vLLM server started on {{server_instance.base_url}} (tp={{tp_size}})')
@@ -893,16 +893,23 @@ _emitted = json.loads(out_nb.read_text(encoding="utf-8"))
 _emitted_cells = "\n".join(
     "".join(cell["source"]) for cell in _emitted["cells"] if cell["cell_type"] == "code"
 )
-for _required_marker, _why in (
+required_markers = [
     ("MODEL NOT FOUND", "model-path precondition"),
-    ("ADAPTER INCOMPLETE", "run-time adapter precondition"),
-    ("NO ADAPTERS DISCOVERED", "run-time adapter precondition"),
     ("litellm.drop_params did not take effect", "drop_params verification"),
     ("INFERENCE ENDPOINT DEAD", "run-health gate"),
     ("EVALUATION ABORTED at task", "per-task fail-loud handler"),
     ("degenerate run", "degenerate-run detector"),
-    (PREFLIGHT["adapter_name"], "adapter identity"),
-):
+]
+if PREFLIGHT["adapter_name"]:
+    required_markers.extend([
+        ("ADAPTER INCOMPLETE", "run-time adapter precondition"),
+        ("NO ADAPTERS DISCOVERED", "run-time adapter precondition"),
+        (PREFLIGHT["adapter_name"], "adapter identity"),
+    ])
+else:
+    required_markers.append(("NO ADAPTER DECLARED", "adapter-less mode confirmation"))
+
+for _required_marker, _why in required_markers:
     if _required_marker not in _emitted_cells:
         _fail(
             f"Emitted notebook is missing the '{_why}' guard "
@@ -946,8 +953,8 @@ _banner("KERNEL BUILT -- WHAT IS IN THE BOX")
 print(f"  notebook     : {out_nb}")
 print(f"  metadata     : {out_meta}")
 print(f"  target model : {PREFLIGHT['model']}")
-print(f"  adapter      : {PREFLIGHT['adapter_name']} "
-      f"({PREFLIGHT['adapter_weights_bytes']:,} bytes) -- MOUNTED")
+print(f"  adapter      : {PREFLIGHT['adapter_name'] or 'None (pure base weights)'} "
+      f"({PREFLIGHT['adapter_weights_bytes']:,} bytes)")
 print(f"  eval scope   : all tasks from the competition tasks.jsonl, 4x L4")
 print("  fail-loud    : model path, adapter presence, litellm.drop_params,")
 print("                 per-task endpoint health, per-task exceptions, and a")

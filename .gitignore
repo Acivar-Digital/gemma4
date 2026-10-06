@@ -4,6 +4,8 @@ embeddings/
 graphs/
 wheels/
 results/
+simulation/runs_local/
+evidence/cloud_runs_results/
 docker/
 backups/
 *.npz

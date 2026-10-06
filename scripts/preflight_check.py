@@ -30,9 +30,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 WORK_DIR = Path(__file__).resolve().parent
 if WORK_DIR.name in ("scripts", "brun"):
     WORK_DIR = WORK_DIR.parent
-if not (WORK_DIR / "my_submission").exists() and Path("/Users/yapilymm/Downloads/projects/gemma4-dev").exists():
+if not (WORK_DIR / "submissions/track1_live").exists() and Path("/Users/yapilymm/Downloads/projects/gemma4-dev").exists():
     WORK_DIR = Path("/Users/yapilymm/Downloads/projects/gemma4-dev")
-SUBMISSION_DIR = WORK_DIR / "my_submission"
+SUBMISSION_DIR = WORK_DIR / "submissions/track1_live"
 WHEELS_DIR = WORK_DIR / "wheels"
 SNAPSHOTS_DIR = WORK_DIR / "snapshots"
 

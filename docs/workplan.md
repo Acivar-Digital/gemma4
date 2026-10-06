@@ -19,7 +19,8 @@ Section 1 predates it and is partly superseded by C5.**
 | Submission `56765397` → **0.03** | 2026-10-02 04:10 | **HAD** `thinking_level: 2` |
 | Commit `bfc0614` removes `thinking_level` | 2026-10-03 11:31 | — |
 | Submission `56810465` → **0.00** | 2026-10-04 00:51 | **DID NOT have it** (never re-added) |
-
+| **Submission `56883026` → PENDING** | **2026-10-06 14:21** | **Track 1 verified adapter-less baseline** (sha256 `10e32ceb...`) |
+| **Kernel `francisclyap/gemma4-eval-40calls` → QUEUED** | **2026-10-06 14:20** | **Kaggle Compute diagnostic notebook** (197 KB, 6 fail-loud guards) |
 The 0/129 diagnosis and the 0.00 score come from **different trees**. Any sentence that treats
 them as one measurement is wrong.
 
@@ -247,15 +248,20 @@ Textualize/rich   AAAAAAAAAAAAAAAAABAAAAABAAAA…BBBBBBBB    → 34 A, 14 B, 0 D
 
 | # | Variable | Isolates | Status |
 |---|---|---|---|
-| **T1** | baseline, unchanged | **E1** | **READY — the only test worth quota** |
+| **T1** | baseline, adapter-less | **E1 / Base Gemma 4** | **DISPATCHED 2026-10-06 — Leaderboard ref `56883026` & Kernel `gemma4-eval-40calls`** |
 | ~~T2~~ | `include_thoughts: false` | E2 | **REVOKED** — premise refuted (3.506× vs 0.35×) |
 | ~~T3~~ | relax Turns 1–10 window | E3 | **DEFERRED** — wrong-fix, not search-loop |
-| ~~T4~~ | LoRA | E4 | **BLOCKED** — poisoned data |
+| **T4** | LoRA Upgrade (Unsloth on `qat-q4_0-unquantized`) | Target: 77 Tier-1 tasks | **PLANNED FOR TOMORROW** — gated on baseline score landing |
 
-**T1 is staged:** gate exit 0, **0 gating FAILs** (1 non-gating `g_run_health`), `submission.zip`
-= **126,383 bytes**, SHA-256 **`16f318b23c1f0c248…`**, **14 files**, no adapter. Byte-reproducible:
-two clean rebuilds produced identical hashes. *(Superseded the earlier 123,513 / `d6627107…`
-figure, which predates the kwarg-syntax fix.)*
+**T1 dispatched (2026-10-06):** verified by 15 automated submission quality gates (`python3 scripts/check_submission.py`),
+14 PASS / 0 gating FAIL. Package `submission.zip` = **124,196 bytes**, SHA-256 **`10e32ceb9b2ca6bf40b40c485d9279e837a1e4ce67fa2f4df5c3fcb5e4bc4a83`**,
+strictly adapter-less, 0 stray weights.
+
+**Diagnostic Kernel dispatched (2026-10-06):** `francisclyap/gemma4-eval-40calls` (197 KB, 5 cells, 6 fail-loud runtime guards).
+
+**Next Action (Tomorrow):**
+1. Read graded public score from ref `56883026` and runtime trace metrics from kernel `francisclyap/gemma4-eval-40calls`.
+2. Once pure base resolution rate is confirmed, execute Track 2 LoRA fine-tuning using Unsloth on `google/gemma-4-31B-it-qat-q4_0-unquantized` trained exclusively on the 77 Tier 1 task trajectories.
 
 **Why T1 dominates — REWRITTEN after C5.** The argument is **not** "E1 is 89% of tasks": E1's
 mechanism is refuted (C5), so we cannot lean on its share. The argument is that **no post-Oct-1
