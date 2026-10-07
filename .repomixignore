@@ -1,0 +1,14 @@
+# Exclude giant raw data dumps, old notebooks, and historical evidence from consultant repomix bundles
+training/sft_data/
+training/notebooks/train_gemma4_lora.ipynb
+tasks.jsonl
+evidence/
+simulation/
+docs/gemma-and-the-shape-of-doubt.md
+submissions/track1_scaffold/
+submissions/adapter_dataset/
+submissions/ship_dataset/
+*.safetensors
+*.npz
+*.tgz
+*.zip
