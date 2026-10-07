@@ -72,6 +72,7 @@ _Add your build and test commands here_
 
 _Add a brief overview of your project architecture_
 
-## Conventions & Patterns
+## Git Remote & Conventions
 
-_Add your project-specific conventions here_
+- **Git Remote Name is `gemma4`, NOT `origin`.** `.git/config` defines `[remote "gemma4"]` with `branch.main.remote = gemma4`. Push commands must target `git push gemma4 <branch>`, never `origin`.
+

@@ -45,7 +45,7 @@ Read `docs/EXTERNAL_REVIEW_PACKET.md` (or `EXTERNAL_REVIEW_PACKET.md` in root) f
 - **GitHub's hard limit is 100MB per file** — a single tracked file over it fails `git push` outright. Large `.safetensors` files were untracked (0 tracked `.safetensors` files in git index) and must never be re-added. Never commit checkpoints or weights.
 - **No duplicate copies of large artifacts.** Ensure adapters and models stay strictly in `.gitignore`.
 - **Prefer the cheap direction.** `git rm --cached` is cheap and safe; purging blobs already in history needs a rewrite that invalidates every commit SHA and every tag. Never rewrite history to fix repo size unless the user explicitly asks for it in that turn.
-
+- **Git Remote Name is `gemma4`, NOT `origin`.** `.git/config` defines `[remote "gemma4"]` with `branch.main.remote = gemma4`. Any automation targeting `origin` (e.g. `git push origin main`) will fail with `fatal: 'origin' does not appear to be a git repository`. Always use `git push gemma4 main`.
 Before staging anything large:
 
 ```bash
