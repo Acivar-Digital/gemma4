@@ -14,14 +14,14 @@
 #
 # STRICT ORDER
 # ------------
+#   0. Pre-check working tree (baseline_gate.py verify --mode=leaderboard) -> stop on non-zero
 #   1. Gate the working tree   (check_submission.py --pre-pack) -> stop on non-zero
 #   2. Pack submissions/track1_live/ -> submission.zip         (announced first)
-#   3. Gate the FINISHED zip  (check_submission.py)  -> stop on non-zero
+#   3. Gate the FINISHED zip  (check_submission.py + baseline_gate.py --check-zip) -> stop on non-zero
 #   4. Summary + SHA-256 of the zip
 #   5. Quota check (submission_quota.per_day from gate_policy.yaml)
 #   6. Prompt; default is NO
 #   7. kaggle competitions submit
-#
 # TWO PHASES, ON PURPOSE
 # ----------------------
 # Step 1 runs the checker in --pre-pack mode: it validates the SOURCE TREE and
@@ -68,6 +68,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 
 CHECKER="$SCRIPT_DIR/check_submission.py"
 POLICY="$SCRIPT_DIR/gate_policy.yaml"
+BASELINE_GATE="$SCRIPT_DIR/baseline_gate.py"
+BASELINE_REGISTRY="$REPO_ROOT/configs/baseline_registry.json"
 SUBMISSION_DIR="$REPO_ROOT/submissions/track1_live"
 SUBMISSION_ZIP="$REPO_ROOT/submission.zip"
 COMPETITION="gemma-4-developer-agent"
@@ -210,6 +212,8 @@ done
 
 [ -f "$CHECKER" ] || die "gate script not found: $CHECKER"
 [ -f "$POLICY"  ] || die "gate policy not found: $POLICY"
+[ -f "$BASELINE_GATE" ] || die "baseline gate script not found: $BASELINE_GATE"
+[ -f "$BASELINE_REGISTRY" ] || die "baseline registry not found: $BASELINE_REGISTRY"
 [ -d "$SUBMISSION_DIR" ] || die "submission directory not found: $SUBMISSION_DIR"
 
 # Parse the one exclusion vocabulary now (before any irreversible step) so a
@@ -235,10 +239,7 @@ discover_python() {
   return 1
 }
 
-# ============================================================================
-# STEP 1 — Gate the working tree
-# ============================================================================
-step 1 "Gate the working tree (source-tree validation, before any pack)"
+# --- Discover Python before any gate check -----------------------------------
 if ! PY_BIN="$(discover_python)"; then
   echo
   echo "   STOPPED: no usable Python interpreter found."
@@ -247,6 +248,28 @@ if ! PY_BIN="$(discover_python)"; then
   echo "   (The old checklist hardcoded a venv path that lacks the packages.)"
   exit 5
 fi
+
+# ============================================================================
+# STEP 0 — Pre-check working tree against locked baseline whitelist
+# ============================================================================
+step 0 "Pre-check working tree against locked baseline whitelist"
+note "interpreter:   $PY_BIN"
+note "baseline gate: $BASELINE_GATE"
+note "registry:      $BASELINE_REGISTRY"
+
+if ! "$PY_BIN" "$BASELINE_GATE" verify --mode=leaderboard --registry "$BASELINE_REGISTRY" --source "$SUBMISSION_DIR"; then
+  echo
+  echo "============================================================"
+  echo " BLOCKING: Working tree deviates from locked 0.13 baseline whitelist. Leaderboard submission rejected. Validate variants on Kaggle Compute first."
+  echo "============================================================"
+  exit 1
+fi
+note "baseline whitelist: PASS"
+
+# ============================================================================
+# STEP 1 — Gate the working tree
+# ============================================================================
+step 1 "Gate the working tree (source-tree validation, before any pack)"
 note "interpreter: $PY_BIN"
 note "gates:      $CHECKER"
 note "phase:      pre-pack (the 4 zip-dependent gates run at step 3)"
@@ -276,6 +299,18 @@ if [ "$DRY_RUN" -eq 1 ]; then
     echo " Nothing was submitted. (--dry-run never packs or submits.)"
     echo "============================================================"
     exit 1
+  fi
+
+  if [ -f "$SUBMISSION_ZIP" ]; then
+    note "verifying existing zip against baseline registry..."
+    if ! "$PY_BIN" "$BASELINE_GATE" verify --mode=leaderboard --check-zip --registry "$BASELINE_REGISTRY" --source "$SUBMISSION_DIR" --zip "$SUBMISSION_ZIP"; then
+      echo
+      echo "============================================================"
+      echo " BLOCKING: Working tree deviates from locked 0.13 baseline whitelist. Leaderboard submission rejected. Validate variants on Kaggle Compute first."
+      echo "============================================================"
+      exit 1
+    fi
+    note "baseline registry zip check: PASS"
   fi
 
   step 4 "What a real run WOULD do (no changes made)"
@@ -355,6 +390,15 @@ if ! "$PY_BIN" "$CHECKER"; then
   exit 1
 fi
 note "packed zip: PASS"
+
+if ! "$PY_BIN" "$BASELINE_GATE" verify --mode=leaderboard --check-zip --registry "$BASELINE_REGISTRY" --source "$SUBMISSION_DIR" --zip "$SUBMISSION_ZIP"; then
+  echo
+  echo "============================================================"
+  echo " BLOCKING: Working tree deviates from locked 0.13 baseline whitelist. Leaderboard submission rejected. Validate variants on Kaggle Compute first."
+  echo "============================================================"
+  exit 1
+fi
+note "baseline registry zip check: PASS"
 
 # ============================================================================
 # STEP 4 — Summary + hash

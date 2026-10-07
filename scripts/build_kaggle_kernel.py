@@ -34,9 +34,10 @@ Deliberate exceptions to the fail-loud policy, each documented at its site:
 import base64
 import json
 import shutil
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
 SUBMISSION_DIR = ROOT_DIR / "submissions/track1_live"
 KERNEL_DIR = ROOT_DIR / "simulation/kernels_diag/kaggle_kernel"
@@ -113,6 +114,29 @@ def _preflight() -> dict:
     if not SUBMISSION_DIR.is_dir():
         _fail(f"Submission directory {SUBMISSION_DIR} does not exist.")
 
+    # --- Baseline Whitelist Verification (Compute Mode) ----------------
+    print("  verifying baseline whitelist against compute mode...")
+    gate_script = ROOT_DIR / "scripts" / "baseline_gate.py"
+    gate_res = subprocess.run(
+        [sys.executable, str(gate_script), "verify", "--mode=compute"],
+        capture_output=True,
+        text=True,
+    )
+    if gate_res.returncode != 0:
+        print(gate_res.stdout)
+        print(gate_res.stderr, file=sys.stderr)
+        raise RuntimeError(
+            "unapproved working tree modifications exist without an approved exception."
+        )
+    print("  baseline gate check           : OK (compute mode verified)")
+
+    registry_path = ROOT_DIR / "configs" / "baseline_registry.json"
+    if not registry_path.is_file():
+        _fail(f"Baseline registry {registry_path} is missing.")
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    whitelist = registry.get("whitelist", {})
+    exceptions = registry.get("exceptions", {})
+
     # --- Which model? -------------------------------------------------
     declared_model = _read_agent_yaml_model(SUBMISSION_DIR)
     print(f"  served model (policy constant) : {KERNEL_TARGET_MODEL}")
@@ -181,6 +205,8 @@ def _preflight() -> dict:
         "adapter_name": declared_adapter,
         "adapter_files": adapter_files,
         "adapter_weights_bytes": adapter_bytes,
+        "whitelist": whitelist,
+        "exceptions": exceptions,
     }
 
 
@@ -330,6 +356,58 @@ max_loras_val = 0
 max_lora_rank_val = 0"""
     _cell_2_lora_assert = "# Pure base weights: LoRA disabled"
 
+_cell_1_integrity_snippet = f"""# --- Baseline Integrity Verification (Compute Mode) ---
+import hashlib
+
+WHITELIST = {PREFLIGHT['whitelist']!r}
+EXCEPTIONS = {PREFLIGHT['exceptions']!r}
+
+unpacked_files = {{}}
+for p in sorted(AGENT_DIR.rglob('*')):
+    if not p.is_file():
+        continue
+    if any(part in {{'.DS_Store', '__pycache__'}} for part in p.parts):
+        continue
+    if p.suffix in {{'.pyc', '.pyo'}} or p.name in {{'.DS_Store', '__pycache__'}}:
+        continue
+    rel = p.relative_to(AGENT_DIR).as_posix()
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    unpacked_files[rel] = h.hexdigest()
+
+violations = []
+all_keys = sorted(set(WHITELIST.keys()) | set(unpacked_files.keys()) | set(EXCEPTIONS.keys()))
+for rel_path in all_keys:
+    in_current = rel_path in unpacked_files
+    in_whitelist = rel_path in WHITELIST
+    in_exceptions = rel_path in EXCEPTIONS
+    current_hash = unpacked_files.get(rel_path)
+    whitelist_hash = WHITELIST.get(rel_path)
+    exception_entry = EXCEPTIONS.get(rel_path, {{}})
+
+    if in_exceptions:
+        exp_hash = exception_entry.get('sha256') if isinstance(exception_entry, dict) else None
+        if not in_current:
+            violations.append(f'MISSING EXCEPTION FILE: {{rel_path}}')
+        elif current_hash != exp_hash:
+            violations.append(f'EXCEPTION MISMATCH: {{rel_path}} ({{current_hash}} != {{exp_hash}})')
+        else:
+            print(f'  [PASS] {{rel_path}} (APPROVED EXCEPTION)')
+    elif in_whitelist:
+        if not in_current:
+            violations.append(f'MISSING: {{rel_path}}')
+        elif current_hash != whitelist_hash:
+            violations.append(f'UNAPPROVED MODIFICATION: {{rel_path}} ({{current_hash}} != {{whitelist_hash}})')
+        else:
+            print(f'  [PASS] {{rel_path}} (matches whitelist)')
+    else:
+        violations.append(f'UNAPPROVED FILE: {{rel_path}}')
+
+assert not violations, 'BASELINE INTEGRITY CHECK FAILED:\\n' + '\\n'.join(violations)
+print(f'BASELINE INTEGRITY VERIFIED: {{len(unpacked_files)}} files cleanly match whitelist / approved exceptions.')"""
+
 cell_1_unpack = f"""import base64
 import os
 import shutil
@@ -363,6 +441,8 @@ for root, dirs, files in os.walk(AGENT_DIR):
         if d == '__pycache__':
             shutil.rmtree(os.path.join(root, d))
 
+
+{_cell_1_integrity_snippet}
 {_cell_1_adapter_snippet}
 
 TASKS_PATH = DATA_DIR / 'tasks.jsonl'
@@ -526,7 +606,16 @@ def _probe_endpoint(base, *, timeout=20):
     with urllib.request.urlopen(base + '/health', timeout=timeout) as response:
         if response.status != 200:
             raise RuntimeError('Health endpoint did not return 200')
-    payload = {{'model': TARGET_MODEL_NAME, 'temperature': 0, 'max_tokens': 8,
+    active_model_name = TARGET_MODEL_NAME
+    try:
+        with urllib.request.urlopen(base + '/v1/models', timeout=timeout) as response:
+            document = json.loads(response.read(65537))
+        models_data = document.get('data', []) if isinstance(document, dict) else []
+        if isinstance(models_data, list) and len(models_data) > 0 and isinstance(models_data[0], dict):
+            active_model_name = models_data[0].get('id') or TARGET_MODEL_NAME
+    except Exception:
+        active_model_name = TARGET_MODEL_NAME
+    payload = {{'model': active_model_name, 'temperature': 0, 'max_tokens': 8,
                'chat_template_kwargs': {{'enable_thinking': False}},
                'messages': [{{'role': 'user', 'content': 'What is 2+2? Reply with only the integer.'}}]}}
     request = urllib.request.Request(base + '/v1/chat/completions',
@@ -538,7 +627,7 @@ def _probe_endpoint(base, *, timeout=20):
     document = json.loads(data)
     if (document['choices'][0]['message'].get('content') or '').strip() != '4':
         raise RuntimeError('Inference probe did not return 4')
-    return {{'status': 'PASS', 'elapsed_seconds': round(time.monotonic() - started, 3),
+    return {{'status': 'PASS', 'model': active_model_name, 'elapsed_seconds': round(time.monotonic() - started, 3),
             'usage': document.get('usage'), 'response_sha256': __import__('hashlib').sha256(data).hexdigest()}}
 
 
@@ -899,7 +988,9 @@ required_markers = [
     ("INFERENCE ENDPOINT DEAD", "run-health gate"),
     ("EVALUATION ABORTED at task", "per-task fail-loud handler"),
     ("degenerate run", "degenerate-run detector"),
+    ("BASELINE INTEGRITY CHECK FAILED", "unpacked-files integrity verification"),
 ]
+
 if PREFLIGHT["adapter_name"]:
     required_markers.extend([
         ("ADAPTER INCOMPLETE", "run-time adapter precondition"),

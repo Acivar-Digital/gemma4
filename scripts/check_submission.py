@@ -119,6 +119,7 @@ import hashlib
 import json
 import os
 import sys
+import subprocess
 import zipfile
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -137,6 +138,8 @@ ADAPTERS_STAGING = os.path.join(REPO_ROOT, "adapters_staging")
 TASK_RESULTS = os.path.join(REPO_ROOT, "evidence", "cloud_runs_results", "task_results.jsonl")
 TRACES_DIR = os.path.join(REPO_ROOT, "evidence", "cloud_runs_results", "traces")
 DOCS_DIR = os.path.join(REPO_ROOT, "docs")
+BASELINE_REGISTRY = os.path.join(REPO_ROOT, "configs", "baseline_registry.json")
+BASELINE_GATE_SCRIPT = os.path.join(_HERE, "baseline_gate.py")
 
 # The harness allowlist (HARNESS_README.md allowed_file_extensions). This is a
 # fixed format allowlist from the competition, not a tunable threshold, so it
@@ -1372,6 +1375,106 @@ def g_prompt_skill_scripts_exist(policy: Dict[str, Dict[str, Any]]) -> GateResul
                       f"all {len(advertised)} advertised skill script(s) exist", evidence, "")
 
 
+
+# --- 14. baseline whitelist verification -----------------------------------
+
+def g_baseline_whitelist(policy: Dict[str, Dict[str, Any]]) -> GateResult:
+    """Verify source files against locked 0.13 baseline whitelist.
+
+    In submit mode: strict whitelist verification against configs/baseline_registry.json;
+    any deviation (modified, added, missing, unpromoted exception) is a gating FAIL.
+    In local_test mode: reports status (advisory PASS or WARN).
+    """
+    mode = _effective_mode(policy)
+    registry_path = BASELINE_REGISTRY
+    gate_script = BASELINE_GATE_SCRIPT
+
+    if not os.path.isfile(registry_path):
+        if mode == MODE_SUBMIT:
+            return GateResult(
+                "g_baseline_whitelist", FAIL,
+                "baseline registry missing",
+                f"expected registry at {registry_path}",
+                "Initialize baseline registry via scripts/baseline_gate.py init.",
+            )
+        return GateResult(
+            "g_baseline_whitelist", WARN,
+            "baseline registry missing (local_test mode)",
+            f"expected registry at {registry_path}",
+            "",
+        )
+
+    if not os.path.isfile(gate_script):
+        if mode == MODE_SUBMIT:
+            return GateResult(
+                "g_baseline_whitelist", FAIL,
+                "baseline_gate.py script missing",
+                f"expected {gate_script}",
+                "Restore scripts/baseline_gate.py.",
+            )
+        return GateResult(
+            "g_baseline_whitelist", WARN,
+            "baseline_gate.py script missing (local_test mode)",
+            f"expected {gate_script}",
+            "",
+        )
+
+    cmd = [
+        sys.executable,
+        gate_script,
+        "verify",
+        "--mode=leaderboard",
+        "--registry",
+        registry_path,
+        "--source",
+        SUBMISSION_DIR,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        rc = proc.returncode
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+    except Exception as e:
+        if mode == MODE_SUBMIT:
+            return GateResult(
+                "g_baseline_whitelist", FAIL,
+                f"failed to execute baseline_gate.py: {e}",
+                f"command: {' '.join(cmd)}",
+                "Fix Python environment or baseline_gate.py permissions.",
+            )
+        return GateResult(
+            "g_baseline_whitelist", WARN,
+            f"failed to execute baseline_gate.py in local_test mode: {e}",
+            f"command: {' '.join(cmd)}",
+            "",
+        )
+
+    if rc == 0:
+        return GateResult(
+            "g_baseline_whitelist", PASS,
+            "all source files match locked 0.13 baseline whitelist",
+            f"verified against {os.path.relpath(registry_path, REPO_ROOT)} ({mode} mode)",
+            "",
+        )
+
+    fail_lines = [line for line in stdout.splitlines() if line.startswith("[FAIL]")]
+    fail_summary = "; ".join(fail_lines[:5]) if fail_lines else (stderr or stdout or "verification failed")
+    evidence = f"mode={mode}; {fail_summary}"
+    if mode == MODE_SUBMIT:
+        return GateResult(
+            "g_baseline_whitelist", FAIL,
+            "source files deviate from locked 0.13 baseline whitelist",
+            evidence,
+            "BLOCKING: Working tree deviates from locked 0.13 baseline whitelist. "
+            "Leaderboard submission rejected. Validate variants on Kaggle Compute first.",
+        )
+    return GateResult(
+        "g_baseline_whitelist", WARN,
+        f"source files deviate from locked baseline whitelist (permitted in {mode} mode)",
+        evidence,
+        "",
+    )
+
 # ===========================================================================
 # POST-RUN GATES (decision D2 — operate on COMPLETED-RUN artifacts, kept
 # deliberately separate from the pre-submission gates above)
@@ -1582,6 +1685,7 @@ PRE_SUBMISSION_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], Gate
     ("g_zip_root_layout", g_zip_root_layout),
     ("g_disallowed_extensions", g_disallowed_extensions),
     ("g_prompt_skill_scripts_exist", g_prompt_skill_scripts_exist),
+    ("g_baseline_whitelist", g_baseline_whitelist),
 ]
 
 POST_RUN_GATES: List[Tuple[str, Callable[[Dict[str, Dict[str, Any]]], GateResult]]] = [
@@ -1624,6 +1728,7 @@ GATE_CATEGORY: Dict[str, str] = {
     "g_zip_root_layout": CAT_SUBMISSION,
     "g_disallowed_extensions": CAT_SUBMISSION,
     "g_prompt_skill_scripts_exist": CAT_SUBMISSION,
+    "g_baseline_whitelist": CAT_SUBMISSION,
     # --- post_run: a verdict about a HISTORICAL run, not about this artifact ---
     "g_run_health": CAT_POST_RUN,
     # --- hygiene: repository hygiene, irrelevant to the shipped artifact ---

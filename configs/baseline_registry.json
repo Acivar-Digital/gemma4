@@ -1,0 +1,23 @@
+{
+  "baseline_ref": "56883026",
+  "public_score": 0.13,
+  "locked_at": "2026-10-06T14:21:38Z",
+  "zip_sha256": "10e32ceb9b2ca6bf40b40c485d9279e837a1e4ce67fa2f4df5c3fcb5e4bc4a83",
+  "whitelist": {
+    "agent.yaml": "1fa754c20d31429e718ef8403e089db4711ca359de46dbd93e910cbdeec41b6a",
+    "configs/sampling.yaml": "fc9fd45474d352a93aad5e837d70cb4bc1b75755813f1df1e6d83d1e45e4d744",
+    "eval_config.yaml": "965a1eb5c43880541def28b15710ccbf34291fd10d656ce2620cddd2e8173180",
+    "prompts/main.md": "5efdd653e647dc7d195c031c7dd641fa340d8fcc6294441f0c4835ccfc787cf2",
+    "skills/code-map/SKILL.md": "d85ec4276b302ead5b4f7c825f9766d40aa73de74129a39d71679006e6e930d5",
+    "skills/code-map/scripts/map.py": "7940e0bd7bd3045fe494ee4c92fc1c5a6da95b063b41fbf78507a15c288a2dae",
+    "skills/code-oracle/SKILL.md": "bf90b81a86f96c5b9aa40851de2f586a417786ff41bddff825c8cffacbafee0e",
+    "skills/code-oracle/scripts/oracle.py": "7684e4c3f7c586d79bbac983806c2ab8335bfbde827403e03abc4421a1b10077",
+    "skills/fast-grep/SKILL.md": "145f0374ef2d56fe3f88491416200493bcdb2a66cff72bc3d3a785c0964a1eb6",
+    "skills/fast-grep/scripts/grep.py": "ae311bfba29d2f398841b96ec8ee668dbeb9b7d81805bf9b8460d523a26c2ed7",
+    "skills/repro-check/SKILL.md": "4d4898cc6de5c3a5307627550c58579b280b1266c78b26d9e39be7f3f2a7cbc6",
+    "skills/repro-check/scripts/check.py": "4b12f741abbe5bcd12f7595f3f90a16fdcad77c71e52a46c10ac3467c82c7aea",
+    "skills/test-gate/SKILL.md": "cf5bfbb8f4830a3e1616308df7428cb67aa05add7c5976097f2d939c1d21731b",
+    "skills/test-gate/scripts/gate.py": "1f12b715c6abf3d57fd88cf347d69206f7daa01a827b60bac8d5d312caeb3b92"
+  },
+  "exceptions": {}
+}
