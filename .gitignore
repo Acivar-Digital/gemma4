@@ -13,6 +13,7 @@ backups/
 *.tar.gz
 *.tar
 *.zip
+data/
 .omp/
 
 # Secrets, Credentials & Private Keys (Strict Security Guardrail)

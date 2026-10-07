@@ -1,18 +1,25 @@
 #!/usr/bin/env python3
 """Builds high-quality, stratified Multi-Turn Decision SFT training & validation datasets for Unsloth Gemma 31B.
 
-Consensus Architectural Upgrades (Triple-Reviewer Harmonized):
-1. HIGH-DENSITY DECISION SLICING: Decomposes long trajectories into focused decision windows
-   (concise system + problem statement + preceding tool observation + target agent tool call),
-   ensuring 100% of samples contain active, supervised agent actions.
-2. 3072-TOKEN COMPACT WINDOW: Compacts repetitive directory trees and verbose observations
-   so that 97% of decision points fit comfortably inside a 3072-token window without truncation.
-3. BANNED-TOOL REJECTION: Hard-filters out any invalid calls to load_skill, list_skills, or
-   load_skill_resource to reinforce strict compliance with pre-installed environment skills.
-4. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
-5. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
-6. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
-7. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
+Consensus Architectural Upgrades (Triple-Reviewer Harmonized & Ground-Truth Verified):
+1. HIGH-DENSITY DECISION SLICING & COALESCING:
+   - Coalesces reasoning-only turns into subsequent tool-calling assistant turns.
+   - Drops tool-less orphan turns so 100% of samples supervise active tool calls (0 dead thoughts).
+   - Preserves thoughts in `reasoning` (avoiding strip_thinking() on `content`).
+   - Ensures tool call arguments are structured Python dicts for Jinja template rendering.
+2. NATIVE GEMMA 4 CHAT TEMPLATE & PREFIX-DELTA SPLITTING:
+   - Uses models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja directly with Jinja2.
+   - Computes prefix_text (add_generation_prompt=True) and full_text (add_generation_prompt=False).
+   - Strictly enforces full_text.startswith(prefix_text) across Turn 1 and Turn 2+.
+   - Generates prefix_text, completion_text, and full_text for token-level loss masking.
+3. 3072-TOKEN COMPACT WINDOW:
+   - Truncates verbose directory trees and compacts tool observations to fit inside 3072 tokens.
+4. ZERO-LEAKAGE STRATIFIED TASK-ID SPLIT:
+   - Groups train and validation splits strictly by task_id stratified across repositories.
+   - Guarantees 0% task-id overlap between train and val sets.
+5. STRICT 5-SKILL + 5-TOOL ZERO-RUN_COMMAND CONTRACT:
+   - Ingests production submissions/track1_live/prompts/main.md system prompt.
+   - Declares official 6-tool schema (read_file, edit_file, write_file, get_status, submit_patch, run_skill_script).
 """
 
 from collections import defaultdict, Counter
@@ -24,20 +31,25 @@ import random
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+import jinja2
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("build_unsloth_dataset")
-
 ROOT_DIR = Path(__file__).resolve().parent.parent
-OUT_DIR = ROOT_DIR / "data"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-TRAIN_OUT_PATH = OUT_DIR / "unsloth_sft_train.jsonl"
-VAL_OUT_PATH = OUT_DIR / "unsloth_sft_val.jsonl"
+DATA_DIR = ROOT_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_OUT_PATH = DATA_DIR / "unsloth_sft_train.jsonl"
+VAL_OUT_PATH = DATA_DIR / "unsloth_sft_val.jsonl"
 
-RUN_DIRS = [
+CANDIDATE_RUN_DIRS = [
+    ROOT_DIR / "simulation" / "runs_local" / "run_B40",
+    ROOT_DIR / "simulation" / "runs_local" / "run_B39",
     ROOT_DIR / "results" / "run_B40",
     ROOT_DIR / "results" / "run_B39",
 ]
-
+RUN_DIRS = [d for d in CANDIDATE_RUN_DIRS if d.exists()]
+if not RUN_DIRS:
+    RUN_DIRS = sorted((ROOT_DIR / "simulation" / "runs_local").glob("run_B*"))[-2:]
 MAX_DIFF_LINES = 150
 MAX_TOOL_CALLS = 35
 DEDUP_SIMILARITY_THRESHOLD = 0.90
@@ -47,13 +59,123 @@ MAX_OBSERVATION_CHARS = 800
 MAX_SEQ_TOKENS = 3072
 SEED = 42
 
-SYSTEM_PROMPT = (
-    "You are the Autonomous Software Developer fixing Python defects in /workspace.\n"
-    "Tools: read_file, edit_file, write_file, get_status, submit_patch.\n"
-    "Skills: fast-grep, code-map, code-oracle, repro-check, test-gate."
+DEFAULT_REASONING_FALLBACK = (
+    "Analyze the current workspace state and execute the next verification or repair tool call."
 )
 
-BANNED_TOOL_PATTERNS = ["load_skill", "list_skills", "load_skill_resource"]
+# Concise, high-density system directive enforcing the strict 5-skill + 5-tool zero-run_command contract
+# within the 3072-token SFT window for single 24GB L4 GPU training.
+SYSTEM_PROMPT = (
+    "You are the Autonomous Software Developer fixing Python defects in /workspace.\n"
+    "STRICT TOOLSET & SKILL INVOCATION CONTRACT:\n"
+    "1. Direct tools: read_file, edit_file, write_file, get_status, submit_patch.\n"
+    "2. Pre-installed skills: fast-grep, code-map, code-oracle, repro-check, test-gate.\n"
+    "3. ABSOLUTELY FORBIDDEN: NEVER call run_command, load_skill, list_skills, or load_skill_resource.\n"
+    "4. Execute skills EXCLUSIVELY via run_skill_script(skill_name, file_path, args).\n"
+    "5. Workflow: localize defect with fast-grep/code-map, apply surgical edits via edit_file, "
+    "verify with repro-check/test-gate, and finalize with submit_patch."
+)
+
+BANNED_TOOL_PATTERNS = ["load_skill", "list_skills", "load_skill_resource", "run_command"]
+
+TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Reads contents of a file within /workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative path to file in /workspace."},
+                    "start_line": {"type": "integer", "description": "Optional starting line (1-indexed)."},
+                    "end_line": {"type": "integer", "description": "Optional ending line (inclusive)."},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Applies surgical text replacement to a file in /workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative path to file in /workspace."},
+                    "old_text": {"type": "string", "description": "Exact text block to replace."},
+                    "new_text": {"type": "string", "description": "Replacement text block."},
+                    "edit_instructions": {"type": "string", "description": "Optional high-level description of change."},
+                },
+                "required": ["file_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Writes or overwrites an entire file in /workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Relative path to file in /workspace."},
+                    "content": {"type": "string", "description": "Full file content to write."},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_status",
+            "description": "Free tool returning current workspace git status and remaining budget.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit_patch",
+            "description": "Submits final patch and terminates evaluation task immediately.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_skill_script",
+            "description": "Executes one of the 5 pre-installed skills (fast-grep, code-map, code-oracle, repro-check, test-gate).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string", "description": "Name of skill directory."},
+                    "file_path": {"type": "string", "description": "Script file inside skill (e.g. grep.py, map.py, oracle.py, check.py, gate.py)."},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Command-line arguments passed to script."},
+                },
+                "required": ["skill_name", "file_path", "args"],
+            },
+        },
+    },
+]
+
+
+def load_gemma4_template() -> jinja2.Template:
+    """Loads and compiles models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja."""
+    template_path = ROOT_DIR / "models" / "gemma-4-31b-it-qat-w4a16-ct" / "chat_template.jinja"
+    if not template_path.exists():
+        raise FileNotFoundError(f"Missing Gemma 4 chat template at {template_path}")
+    template_text = template_path.read_text(encoding="utf-8")
+    env = jinja2.Environment(loader=jinja2.BaseLoader(), autoescape=False)
+    return env.from_string(template_text)
 
 
 def sanitize_content(text: str) -> str:
@@ -109,6 +231,12 @@ def sanitize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     """Sanitizes tool arguments and normalizes skill script paths."""
     fn_name = tc.get("function_name")
     raw_args = tc.get("arguments", {})
+
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except Exception:
+            raw_args = {}
 
     if fn_name == "run_skill_script" and isinstance(raw_args, dict):
         cleaned_args = dict(raw_args)
@@ -190,8 +318,11 @@ def extract_raw_trajectory(trace_path: Path) -> Tuple[Optional[str], List[Dict[s
 
         elif src == "agent":
             asst_dict: Dict[str, Any] = {"role": "assistant"}
-            if msg:
-                asst_dict["content"] = sanitize_content(msg)
+            cleaned_msg = sanitize_content(msg)
+            if cleaned_msg:
+                # Store thoughts in reasoning (Gemma 4 chat_template.jinja strips channel from content)
+                asst_dict["reasoning"] = cleaned_msg
+                asst_dict["content"] = ""
             if tcalls:
                 formatted_calls = []
                 for idx, tc in enumerate(tcalls):
@@ -202,12 +333,12 @@ def extract_raw_trajectory(trace_path: Path) -> Tuple[Optional[str], List[Dict[s
                         "type": "function",
                         "function": {
                             "name": cleaned_tc.get("function_name"),
-                            "arguments": json.dumps(cleaned_tc.get("arguments", {}), ensure_ascii=False)
+                            "arguments": cleaned_tc.get("arguments", {})
                         }
                     })
                 asst_dict["tool_calls"] = formatted_calls
 
-            if "content" in asst_dict or "tool_calls" in asst_dict:
+            if "reasoning" in asst_dict or "tool_calls" in asst_dict or "content" in asst_dict:
                 messages.append(asst_dict)
 
             if obs:
@@ -225,37 +356,84 @@ def extract_raw_trajectory(trace_path: Path) -> Tuple[Optional[str], List[Dict[s
 
 
 def is_banned_turn(asst_msg: Dict[str, Any]) -> bool:
-    """Checks if an assistant message invokes prohibited skills or empty operations."""
+    """Checks if an assistant message invokes prohibited tools or skills."""
     tcalls = asst_msg.get("tool_calls", [])
     for tc in tcalls:
         fn_name = tc.get("function", {}).get("name", "")
         if any(banned in fn_name for banned in BANNED_TOOL_PATTERNS):
             return True
-        args_str = tc.get("function", {}).get("arguments", "")
+        args_obj = tc.get("function", {}).get("arguments", {})
+        args_str = json.dumps(args_obj) if isinstance(args_obj, dict) else str(args_obj)
         if any(banned in args_str for banned in BANNED_TOOL_PATTERNS):
             return True
     return False
+
+
+def coalesce_thought_and_tool_turns(raw_messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Merges consecutive thought-only assistant turns into the subsequent tool-calling assistant turn.
+    
+    Guarantees:
+    1. Every assistant turn in the returned sequence contains active tool_calls.
+    2. Every assistant turn has non-empty reasoning (fulfilling Turn 2+ chat_template.jinja invariant).
+    3. Tool call arguments are normalized Python dicts (fulfilling Jinja dictsort requirement).
+    4. Trailing thought-only turns without an action are dropped.
+    """
+    coalesced: List[Dict[str, Any]] = []
+    pending_thoughts: List[str] = []
+
+    for msg in raw_messages:
+        role = msg.get("role")
+        if role == "assistant":
+            if is_banned_turn(msg):
+                continue
+            thought = (msg.get("reasoning") or msg.get("content") or "").strip()
+            tcalls = msg.get("tool_calls") or []
+            if tcalls:
+                combined_thought = "\n".join([t for t in pending_thoughts + ([thought] if thought else []) if t]).strip()
+                pending_thoughts.clear()
+                if not combined_thought:
+                    combined_thought = DEFAULT_REASONING_FALLBACK
+                normalized_calls = []
+                for tc in tcalls:
+                    fn = dict(tc["function"])
+                    if isinstance(fn.get("arguments"), str):
+                        try:
+                            fn["arguments"] = json.loads(fn["arguments"])
+                        except Exception:
+                            fn["arguments"] = {}
+                    normalized_calls.append({"id": tc["id"], "type": "function", "function": fn})
+                coalesced.append({
+                    "role": "assistant",
+                    "reasoning": combined_thought,
+                    "content": "",
+                    "tool_calls": normalized_calls,
+                })
+            else:
+                if thought:
+                    pending_thoughts.append(thought)
+        else:
+            coalesced.append(msg)
+
+    return coalesced
 
 
 def slice_trajectory_decisions(
     task_id: str,
     repo: str,
     user_prompt: str,
-    messages: List[Dict[str, Any]],
-    tokenizer: Any = None
+    raw_messages: List[Dict[str, Any]],
+    template: jinja2.Template,
 ) -> List[Dict[str, Any]]:
     """Slices a full trajectory into high-density decision windows centered on assistant actions."""
+    coalesced_messages = coalesce_thought_and_tool_turns(raw_messages)
     samples: List[Dict[str, Any]] = []
 
-    for i, m in enumerate(messages):
+    for i, m in enumerate(coalesced_messages):
         if m.get("role") != "assistant":
             continue
 
-        if is_banned_turn(m):
-            continue
-
-        # Skip empty turns
-        if not m.get("content") and not m.get("tool_calls"):
+        tcalls = m.get("tool_calls") or []
+        if not tcalls:
             continue
 
         window = [
@@ -263,81 +441,69 @@ def slice_trajectory_decisions(
             {"role": "user", "content": user_prompt}
         ]
 
-        # Include up to 2 preceding interaction turns (e.g., prior assistant action + tool result)
+        # Include up to 2 preceding interaction turns (e.g., prior assistant action + tool observation)
         start_ctx = max(0, i - 2)
         for ctx_idx in range(start_ctx, i):
-            window.append(messages[ctx_idx])
+            window.append(coalesced_messages[ctx_idx])
 
         # Target assistant turn
         window.append(m)
 
-        # Measure tokens if tokenizer available
-        tok_len = None
-        if tokenizer is not None:
-            try:
-                rendered = tokenizer.apply_chat_template(window, tokenize=False, add_generation_prompt=False)
-                tok_len = len(tokenizer.encode(rendered))
-                if tok_len > MAX_SEQ_TOKENS:
-                    continue
-            except Exception:
-                pass
+        prefix_messages = window[:-1]
+
+        try:
+            prefix_text = template.render(
+                messages=prefix_messages,
+                tools=TOOLS_SCHEMA,
+                add_generation_prompt=True,
+                enable_thinking=True,
+                preserve_thinking=True,
+            )
+            full_text = template.render(
+                messages=window,
+                tools=TOOLS_SCHEMA,
+                add_generation_prompt=False,
+                enable_thinking=True,
+                preserve_thinking=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Jinja render error for task {task_id} turn {i}: {exc}")
+            continue
+
+        # Strict prefix-alignment invariant check
+        if not full_text.startswith(prefix_text):
+            logger.warning(
+                f"Prefix mismatch for task {task_id} turn {i}! "
+                f"Prefix tail: {prefix_text[-60:]!r} vs Full: {full_text[:len(prefix_text)+30]!r}"
+            )
+            continue
+
+        completion_text = full_text[len(prefix_text):]
+
+        # Character length sanity filter (~4 chars/token heuristic -> 3072 tokens ~= 12,288 chars)
+        if len(full_text) > MAX_SEQ_TOKENS * 4.5:
+            continue
+
+        target_tools = [tc.get("function", {}).get("name") for tc in tcalls]
 
         samples.append({
             "task_id": task_id,
             "repo": repo,
             "messages": window,
+            "prefix_text": prefix_text,
+            "completion_text": completion_text,
+            "text": full_text,
             "target_turn_index": i,
-            "target_tools": [tc.get("function", {}).get("name") for tc in m.get("tool_calls", [])],
-            "estimated_tokens": tok_len,
+            "target_tools": target_tools,
         })
 
     return samples
 
 
-def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
-    """Renders structured messages into canonical Gemma turn markers with pseudo-XML directives."""
-    turns: List[str] = []
-
-    for msg in messages:
-        role = msg.get("role")
-        content = (msg.get("content") or "").strip()
-        tool_calls = msg.get("tool_calls", [])
-
-        if role == "system":
-            turns.append(f"<start_of_turn>system\n{content}<end_of_turn>")
-        elif role == "user":
-            turns.append(f"<start_of_turn>user\n{content}<end_of_turn>")
-        elif role == "assistant":
-            parts = []
-            if content:
-                parts.append(content)
-            if tool_calls:
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    fn_name = fn.get("name")
-                    fn_args = fn.get("arguments")
-                    parts.append(f"<|tool_call|>call:{fn_name}{fn_args}<|tool_call|>")
-            asst_body = "\n".join(parts)
-            turns.append(f"<start_of_turn>model\n{asst_body}<end_of_turn>")
-        elif role == "tool":
-            turns.append(f"<start_of_turn>tool\n{content}<end_of_turn>")
-
-    return "\n".join(turns)
-
-
 def build_dataset():
-    # Load tokenizer for precise token boundary check
-    tokenizer = None
-    try:
-        from transformers import AutoTokenizer
-        tok_path = ROOT_DIR / "checkpoints" / "checkpoint-8"
-        if tok_path.exists():
-            tokenizer = AutoTokenizer.from_pretrained(tok_path)
-            logger.info("Loaded checkpoint-8 tokenizer for token length filtering.")
-    except Exception as exc:
-        logger.warning(f"Could not load local tokenizer: {exc}. Using character heuristics.")
+    logger.info("Initializing Gemma 4 chat template from local models directory...")
+    template = load_gemma4_template()
 
-    # Ingest resolved tasks across RUN_DIRS (prioritize newer runs like run_B40)
     resolved_by_id = {}
     run_sources = {}
     for run_dir in RUN_DIRS:
@@ -374,7 +540,6 @@ def build_dataset():
 
         if not patch_file.exists():
             skipped_no_patch += 1
-            logger.warning(f"Patch file missing: {patch_file}")
             continue
 
         try:
@@ -390,17 +555,14 @@ def build_dataset():
         # Outlier filtering
         if patch_lines > MAX_DIFF_LINES:
             filtered_outliers += 1
-            logger.info(f"Skipping {inst_id}: patch lines ({patch_lines}) > {MAX_DIFF_LINES}")
             continue
         if tool_calls > MAX_TOOL_CALLS:
             filtered_outliers += 1
-            logger.info(f"Skipping {inst_id}: tool calls ({tool_calls}) > {MAX_TOOL_CALLS} (flailing run)")
             continue
 
         user_prompt, messages = extract_raw_trajectory(trace_file)
         if not user_prompt or not messages or len(messages) < 4:
             skipped_no_trace += 1
-            logger.warning(f"Task {inst_id} invalid or missing trajectory steps.")
             continue
 
         candidate_trajectories.append({
@@ -413,7 +575,6 @@ def build_dataset():
             "messages": messages,
         })
 
-    # Hard-fail guard against corrupted traces
     total_skipped = skipped_no_patch + skipped_no_trace
     skip_rate = total_skipped / total_resolved
     if skip_rate > MAX_SKIP_RATE:
@@ -436,10 +597,6 @@ def build_dataset():
                 if sim >= DEDUP_SIMILARITY_THRESHOLD:
                     is_duplicate = True
                     collapsed_duplicates += 1
-                    logger.info(
-                        f"Collapsed near-duplicate patch {cand['task_id']} "
-                        f"(similarity {sim:.2f} with {accepted['task_id']})"
-                    )
                     break
         if not is_duplicate:
             deduped_trajectories.append(cand)
@@ -458,12 +615,10 @@ def build_dataset():
             task_id=traj["task_id"],
             repo=traj["repo"],
             user_prompt=traj["user_prompt"],
-            messages=traj["messages"],
-            tokenizer=tokenizer
+            raw_messages=traj["messages"],
+            template=template,
         )
         for d in decisions:
-            raw_text = render_gemma_chat_turns(d["messages"])
-            d["text"] = raw_text
             for t in d["target_tools"]:
                 tool_counter[t] += 1
             all_decision_samples.append(d)
@@ -471,23 +626,30 @@ def build_dataset():
     logger.info(f"Generated {len(all_decision_samples)} high-density decision training samples.")
     logger.info(f"Target tool call distribution: {dict(tool_counter)}")
 
-    # Stratified 80/20 Train/Validation Split by Repository
-    repo_groups = defaultdict(list)
+    # ZERO-LEAKAGE TASK-ID GROUPED STRATIFIED SPLIT
+    # Group task IDs by repository
+    repo_to_tasks = defaultdict(set)
     for row in all_decision_samples:
-        repo_groups[row["repo"]].append(row)
+        repo_to_tasks[row["repo"]].add(row["task_id"])
 
     random.seed(SEED)
-    train_rows: List[Dict[str, Any]] = []
-    val_rows: List[Dict[str, Any]] = []
+    train_task_ids = set()
+    val_task_ids = set()
 
-    for repo, rows in sorted(repo_groups.items()):
-        random.shuffle(rows)
-        val_count = max(1, int(round(len(rows) * VAL_RATIO))) if len(rows) > 3 else (1 if len(rows) > 1 else 0)
-        repo_val = rows[:val_count]
-        repo_train = rows[val_count:]
-        val_rows.extend(repo_val)
-        train_rows.extend(repo_train)
-        logger.info(f"Repo {repo}: total={len(rows)}, train={len(repo_train)}, val={len(repo_val)}")
+    for repo, task_ids in sorted(repo_to_tasks.items()):
+        sorted_tasks = sorted(task_ids)
+        random.shuffle(sorted_tasks)
+        val_count = max(1, int(round(len(sorted_tasks) * VAL_RATIO))) if len(sorted_tasks) > 3 else (1 if len(sorted_tasks) > 1 else 0)
+        repo_val = set(sorted_tasks[:val_count])
+        repo_train = set(sorted_tasks[val_count:])
+        val_task_ids.update(repo_val)
+        train_task_ids.update(repo_train)
+        logger.info(f"Repo {repo}: tasks={len(sorted_tasks)}, train_tasks={len(repo_train)}, val_tasks={len(repo_val)}")
+
+    assert train_task_ids.isdisjoint(val_task_ids), "CRITICAL: Train and validation task IDs overlap!"
+
+    train_rows = [row for row in all_decision_samples if row["task_id"] in train_task_ids]
+    val_rows = [row for row in all_decision_samples if row["task_id"] in val_task_ids]
 
     # Write train and validation datasets
     with open(TRAIN_OUT_PATH, "w", encoding="utf-8") as f_train:
@@ -504,11 +666,12 @@ def build_dataset():
     print(f"Total verified input traces:        {total_resolved}")
     print(f"Passed filters & deduplication:     {len(deduped_trajectories)} trajectories")
     print(f"Total decision samples extracted:   {len(all_decision_samples)}")
-    print(f"Training set (80%):                 {len(train_rows)} samples -> {TRAIN_OUT_PATH}")
-    print(f"Validation set (20% held-out):      {len(val_rows)} samples -> {VAL_OUT_PATH}")
+    print(f"Training set (80% tasks):           {len(train_rows)} samples across {len(train_task_ids)} tasks -> {TRAIN_OUT_PATH}")
+    print(f"Validation set (20% held-out tasks):{len(val_rows)} samples across {len(val_task_ids)} tasks -> {VAL_OUT_PATH}")
     print(f"Filtered outliers (>150 lines/>35): {filtered_outliers}")
     print(f"Collapsed near-duplicate patches:   {collapsed_duplicates}")
     print(f"Target tool distribution:           {dict(tool_counter)}")
+    print("Zero-leakage verification:          PASS (train and val task IDs strictly disjoint)")
     print("=" * 65)
 
 
