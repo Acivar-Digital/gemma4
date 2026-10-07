@@ -13,6 +13,9 @@ trap 'echo -e "\n🛑 Exited by Ctrl+C."; exit 0' INT
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+# Strip leaked cross-machine Dolt variables so evaluation subshells stay clean
+unset DOLT_ROOT_PATH 2>/dev/null || true
+unset BEADS_DOLT_PASSWORD 2>/dev/null || true
 export PYTHONDONTWRITEBYTECODE=1
 export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-15}"
 export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-thinkingmachines/inkling:free}"

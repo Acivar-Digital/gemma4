@@ -1,624 +1,497 @@
-# Gemma 4 Developer Agent — Canonical Architecture & Review Packet (v3 — Consensus Edition)
+# SWE-Gemma / Gemma 4 Developer Agent: Master Architectural & Track 2 LoRA Review Packet
 
-> 🚨 **CANONICAL SOURCE OF TRUTH & POST-COMPACTION DIRECTIVE:**
-> If you are an AI agent reading this document after context compaction or session reset:
-> **THIS DOCUMENT IS THE FINAL, LOCKED ARCHITECTURAL VERDICT.**
-> - **DO NOT revert to single-turn unified diffs.** SFT dataset MUST be multi-turn tool trajectories.
-> - **DO NOT reduce `max_seq_length` below 16384.** Full trajectories with observations require 16K context.
-> - **DO NOT increase LoRA rank beyond 8 or unfreeze MLPs.** Rank 8 on `q_proj`, `v_proj`, `o_proj` only.
-> - **DO NOT run ad-hoc eval runners.** User exclusively executes tests via `./start.sh`.
-> - **DO NOT delay Track 1.** Track 1 zero-shot baseline submits tonight @ 00:00:00 UTC quota reset.
->
-> All architectural debates between consultants have concluded. Follow the exact specifications documented below.
-
-This document contains the complete technical briefing, source code, prompt architecture, and fine-tuning pipeline for the **Gemma 4 Developer Agent** repository:
-👉 **Repository:** [https://github.com/Acivar-Digital/gemma4](https://github.com/Acivar-Digital/gemma4)  
-👉 **Branch:** `main`  
-👉 **Raw Contents API:** `https://api.github.com/repos/Acivar-Digital/gemma4/contents/`
+> **Canonical Ground Truth Notice**: This self-contained technical packet is synchronized 100% with
+> `training/research_dossier/00_CONSULTANT_PROMPT.md` through `07_INTERNAL_RESEARCH_FINDINGS.md` and
+> verified directly against the local competition checkpoint (`models/gemma-4-31b-it-qat-w4a16-ct/`),
+> live submission artifacts (`submissions/track1_live/`), and scored Kaggle leaderboard traces.
 
 ---
 
-## Table of Contents
-1. [Executive Summary & Triple-Reviewer Consensus](#1-executive-summary--triple-reviewer-consensus)
-2. [Agent Prompt & Execution Governor (`my_submission/prompts/main.md`)](#2-agent-prompt--execution-governor-my_submissionpromptsmainmd)
-3. [Multi-Turn Conversational Tool SFT Pipeline (`scripts/build_unsloth_dataset.py`)](#3-multi-turn-conversational-tool-sft-pipeline-scriptsbuild_unsloth_datasetpy)
-4. [Hardened LoRA Training Pipeline with 16K Context (`kaggle_unsloth/`)](#4-hardened-lora-training-pipeline-with-16k-context-kaggle_unsloth)
-5. [Line-Level Audit: Subprocess Defensive Shield & Timeouts (`check.py` & `oracle.py`)](#5-line-level-audit-subprocess-defensive-shield--timeouts-checkpy--oraclepy)
-6. [Architectural Index of All 5 Skill Engines](#6-architectural-index-of-all-5-skill-engines)
+## Section 1: Executive Context & Locked Architecture
+
+### 1.1 Competition Runtime & Two-Container Evaluation Harness
+- **Competition**: Kaggle `gemma-4-developer-agent` (129 Python software engineering tasks across
+  `fastapi/fastapi` [67], `Textualize/rich` [48], `psf/requests` [13], and `encode/httpx` [1]).
+- **Serving Runtime**: `google/gemma-4-31b-it-qat-w4a16-ct` served via vLLM (`tensor_parallel_size=4`,
+  `max_model_len=32768`, `gpu_memory_utilization=0.90`) on 4x NVIDIA L4 GPUs (96 GB total VRAM).
+- **Container A (Agent Sandbox)**: The Google ADK agent interacts with `/workspace` (checked-out repo at
+  `base_commit`). When the agent finishes or calls `submit_patch`, the harness extracts the patch via:
+  ```bash
+  git add -N . && git diff HEAD
+  ```
+  Any untracked scratch file left in `/workspace` is swept into the patch diff and corrupts grading.
+- **Container B (Isolated Grading Sandbox)**: Applies the extracted patch to a clean checkout, applies
+  `test_patch` (which resets any agent edits to test files), and runs `FAIL_TO_PASS` and `PASS_TO_PASS`
+  pytest targets. A task resolves (`resolved: true`) if and only if `test_exit_code == 0`.
+
+### 1.2 Single-Agent Monolith & Task-Global Budget (`eval_config.yaml`)
+- **Agent Topology (`submissions/track1_live/agent.yaml`)**: Single monolithic `LlmAgent` (`name: main`,
+  `model: gemma-4-31b-it-qat-w4a16-ct`) with zero sub-agents.
+- **Task-Global Budget (`submissions/track1_live/eval_config.yaml`)**:
+  - `max_tool_calls: 40` (strictly global across the entire task; `get_status` and `submit_patch` are free).
+  - `max_time_seconds: 270` (4.5 minutes per task wall-clock limit).
+  - `max_llm_turns: 100`.
+- **Sampling Configuration (`submissions/track1_live/configs/sampling.yaml`)**:
+  - `temperature: 0.15`, `top_p: 0.9`, `max_output_tokens: 4096`, `thinking_budget: 2048`,
+    `include_thoughts: true`.
+
+### 1.3 Strictly 5 Direct Tools + 5 Pre-Installed Skills (`ZERO run_command`)
+The production agent exposes **5 direct file/lifecycle tools** and **5 pre-installed structured skills**
+invoked exclusively through the Google ADK `SkillToolset` meta-tool `run_skill_script`:
+
+| Layer | Name | Invocation / File Path | Role & Safety Guarantees |
+| :--- | :--- | :--- | :--- |
+| **Direct Tool 1** | `read_file` | Native ADK tool | Line-windowed file inspection (`start_line`, `end_line`). |
+| **Direct Tool 2** | `edit_file` | Native ADK tool | Surgical exact-string replacement on existing source files. |
+| **Direct Tool 3** | `write_file` | Native ADK tool | Creation of brand-new files required by the issue. |
+| **Direct Tool 4** | `get_status` | Native ADK tool (Free) | Inspects modified/untracked files in `/workspace`. |
+| **Direct Tool 5** | `submit_patch` | Native ADK tool (Free) | Finalizes patch and terminates loop. |
+| **Skill 1** | `fast-grep` | `run_skill_script` (`grep.py`) | Token/sliding-window code search. |
+| **Skill 2** | `code-map` | `run_skill_script` (`map.py`) | AST call graph, outline, inheritance. |
+| **Skill 3** | `code-oracle` | `run_skill_script` (`oracle.py`) | 2s evaluator (`--eval`, `--syntax`). |
+| **Skill 4** | `repro-check` | `run_skill_script` (`check.py`) | Isolated `/tmp` runner (15s, 1GB RAM). |
+| **Skill 5** | `test-gate` | `run_skill_script` (`gate.py`) | Distance-1 pytest & read-only diff. |
+
+- **Withheld Tools by Design**: `run_command`, `get_code_neighbors`, `search_similar_code`, and
+  `get_code_subgraph` are intentionally omitted from `agent.yaml`.
+- **Empirical Proof of `run_skill_script`**: `run_skill_script` is a verified Google ADK `SkillToolset`
+  meta-tool in the competition container (proven on real Gemma 4 cloud traces such as
+  `cloud_results/results/traces/trace_fastapi_14962.json:36-60` and 4,196 invocations across `run_B39`).
 
 ---
 
-## 1. Executive Summary & Triple-Reviewer Consensus
+## Section 2: Historical Score Provenance & Failure Forensics
 
-Following three independent expert peer reviews (Reviewer 1, Consultant 2, and Consultant 3), all reviewers reached unanimous consensus on four foundational architectural requirements, plus one critical hidden bug:
+### 2.1 Complete Leaderboard & Local Run Ledger
 
-### A. Elimination of the Fatal Modality Mismatch (Multi-Turn Tool Trajectories)
-* **The Fatal Flaw:** The initial SFT pipeline formatted targets as single-turn plain text markdown diffs (`### Proposed Unified Git Diff Patch: \`\`\`diff ...`). When deployed in Google ADK, an agent fine-tuned this way ignores tool calling, outputs plain text diffs into chat, and fails with a 0% resolution score.
-* **The Consensus Fix:** We completely rebuilt `scripts/build_unsloth_dataset.py` to extract the full **multi-turn conversational tool-calling trajectories** from our 56 winning runs in `run_B39` (`System` $\to$ `User` $\to$ `Agent(thought + tool_calls)` $\to$ `Tool(observation)` $\to \dots \to$ `Agent(submit_patch)`).
+| Run / Ref ID | Date | Served Model | Adapter | Score | Forensic Summary |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Ref `56883026`** | Oct 6 | `gemma-4-31b-it-qat-w4a16-ct` | None | **`0.13` LB** | Locked Track 1 baseline (`10e32ceb9b...`). |
+| **Ref `56765397`** | Oct 2 | `gemma-4-31b-it-qat-w4a16-ct` | Rank-8 LoRA | **`0.03` LB** | Early pre-hardening tree (`667472e`). |
+| **Ref `56810465`** | Oct 4 | `gemma-4-31b-it-qat-w4a16-ct` | 90MB BnB NF4 | **`0.00` LB** | BnB NF4 on `w4a16-ct` (`111/129` `tc=0`). |
+| **Local `run_B39`** | Oct 4 | `stealth/space-bunny-alpha` | None | `56/129` (`43.4%`) | Proxy model (teacher trajectories only). |
+| **Local `run_B40`** | Oct 5 | `stealth/space-bunny-alpha` | None | `50/77` (`64.9%`) | Proxy model on 77 Tier-1 subset. |
 
-### B. The Hidden Sequence Length Bug ($16,384$ Tokens)
-* **Hidden Bug Spotted by Consultant 3:** At `max_seq_length=4096`, full 20–30 turn trajectories with tool observations were being silently truncated right before the final `edit_file` and `submit_patch()` turns!
-* **The Consensus Fix:** We expanded `max_seq_length` to **`16384`** in `kaggle_unsloth/train_gemma4_lora.ipynb` and enabled Unsloth gradient checkpointing, while adding observation compaction (capping oversized tool outputs to 800 chars) to comfortably fit long trajectories.
-
-### C. Anti-Memorization LoRA Hyperparameters
-* **Rank & Projections:** Dropped from Rank-16 across all 7 layers down to **Rank 8 on attention + output heads only (`q_proj`, `v_proj`, `o_proj`)**, freezing MLPs to preserve base Python syntax reasoning.
-* **Regularization & Steps:** Set $lr = 2.0 \times 10^{-5}$, `weight_decay = 0.05`, `lora_dropout = 0.05`, `neftune_noise_alpha = 5`, and capped training at **20 steps (~2.5 epochs)** with cosine decay.
-* **Split — CORRECTED 5 Oct 2026:** this bullet previously claimed a stratified 80/20 split of 38 train and 10 held-out trajectories across FastAPI, Rich, and Requests, evaluated every 5 steps. That is wrong on three counts. The actual data is **885 train / 222 validation decision-sample rows**, not 48 trajectories; every row is a per-turn slice of a `run_B39` proxy trajectory, so the split is stratified by **row, not by task**; and it was **never clean** — intra-task duplication is pervasive (`rich_3894` appears on 11+ train lines, `rich_3718` on lines 15 and 16), so train rows leak into validation at the task level. Separately, "evaluated every 5 steps" was never true of the pipeline that produced the shipped adapter: it set `eval_steps: 500` against `max_steps: 60`, so validation never ran at all.
-
-### D. Dynamic Scratchpad Budgeting & Anti-Thrashing Circuit Breaker
-* **Data-Driven Governor:** An empirical audit of our 56 winning runs revealed an average of **5.66 `repro-check` calls** and **8.2 turns before the first edit**. A rigid 2-call ceiling was artificially choking complex bug isolation.
-* **The Consensus Fix:** Expanded hypothesis probes up to 4 calls, backed by an **anti-thrashing circuit breaker** (if `repro-check` fails twice with the identical error without progress, pivot immediately to `read_file` or `code-map`), plus a tiered budget rule forcing edits when `remaining <= 10` or `used >= 30`.
-
-### E. Subprocess Defensive Shields in `repro-check`
-* **Process Group Cleanup:** `start_new_session=True` (`setsid`) + `os.killpg(os.getpgid(proc.pid), signal.SIGKILL)` on 15s timeout prevents orphaned daemon/server process leaks.
-* **Socket Fast-Fail:** Injected `socket.setdefaulttimeout(3.0)` in the test execution wrapper so accidental external network calls fail fast (3.0s) rather than hanging for 15 seconds.
-* **Memory Runaway Guard:** Injected a 1 GiB memory runaway guard inside the `/tmp` execution snippet to catch infinite `while True: x.append(...)` loops before they affect container RAM.
-
----
-
-## 2. Agent Prompt & Execution Governor (`my_submission/prompts/main.md`)
-
-```markdown
-# CRITICAL RULE: NEVER CALL `load_skill`, `list_skills`, OR `load_skill_resource`
-All 5 skills (`fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`) are ALREADY pre-loaded into your environment.
-Calling `load_skill` or `list_skills` is a WASTED TOOL CALL that consumes your task budget and causes evaluation failure.
-Execute skills directly via `run_skill_script(skill_name="...", file_path="...", args=[...])`.
-
-You are the Autonomous Software Developer fixing Python defects in /workspace.
-
-## ROLE & AUTONOMY
-- You own the ENTIRE task lifecycle: locate the root cause, inspect the code, apply surgical edits via `edit_file` (or `write_file` for new files), run verification tests, and submit your patch with `submit_patch()`.
-- You have direct access to `submit_patch()`. There is NO supervisor or subagent. Once verified, you submit directly.
-
-## TOOLS & CAPABILITIES
-- Direct tools: `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`.
-- Skill execution: `run_skill_script(skill_name="...", file_path="...", args=[...])`.
-- NOTE: `get_status()` is a 100% FREE tool (it does NOT consume your tool-call budget).
-- NOTE: The code editing tool name is `edit_file`. NEVER call `edit(...)` directly—`edit` does not exist as a tool name.
-
-## PRE-INSTALLED SKILLS (INVOKE VIA run_skill_script):
-1. `fast-grep`: Fast, ranked AST-aware keyword and regex search across the workspace. Flashes the top enclosing functions centered on the target match line, and outputs `[CLEAN CODE FOR edit_file (EXACT INDENTATION)]` with exact indentation.
-   Invoke via: run_skill_script(skill_name="fast-grep", file_path="grep.py", args=["<pattern>"])
-2. `code-map`: AST code structure, class hierarchies, and symbol call-graph tracer. Query with `--symbol <name>` to trace callers/callees/definitions across the repo, or `--file <path>` for a compact file outline.
-   Invoke via: run_skill_script(skill_name="code-map", file_path="map.py", args=["--symbol", "<symbol_name>"]) or args=["--file", "<file_path>"]
-3. `code-oracle`: Multi-domain coding oracle for Python expression evaluation (`--eval`), ANSI/hex inspection (`--hex`), terminal cell display width (`--width`), HTML entity & tag balance (`--html-esc`), JSON Schema / OpenAPI validation (`--schema`), and AST syntax check (`--syntax`).
-   Invoke via: run_skill_script(skill_name="code-oracle", file_path="oracle.py", args=["--eval", "<expr>"]) or args=["--hex", "<text>"] or args=["--width", "<text>"] or args=["--html-esc", "<html_or_file>"] or args=["--schema", "<json_or_file>"] or args=["--syntax", "<file>"]
-4. `repro-check`: Runs an isolated Python assertion in /tmp with workspace PYTHONPATH to verify a defect or test hypothesis. For missing-validator defects, use `--expect-exception <ExceptionType>`. For complex assertions or tricky quotes, use `--b64 <payload>` to bypass shell escaping.
-   Invoke via: run_skill_script(skill_name="repro-check", file_path="check.py", args=["<python_assertion_code>"]) or args=["--expect-exception", "<ExceptionType>", "<python_code>"] or args=["--b64", "<base64_string>"]
-5. `test-gate`: Authoritative gatekeeper consolidating distance-1 neighbor regression tests (`--blast` or default), safe git diff viewer with test-file mutation assertion (`--diff`), and full patch submission readiness (`--status`).
-   Invoke via: run_skill_script(skill_name="test-gate", file_path="gate.py") (runs neighbor regression tests) or args=["--diff"] or args=["--status"]
-
-## CONCISE 5-PHASE LIFECYCLE
-
-### Phase 1: Search & Structural Mapping
-- On Turn 1, execute `fast-grep` with concrete technical search terms (function names, class names, error types, specific identifiers):
-  `run_skill_script(skill_name="fast-grep", file_path="grep.py", args=["<pattern>"])`
-- If you need symbol caller/callee relationships, class inheritance, or structural definitions, use `code-map`:
-  `run_skill_script(skill_name="code-map", file_path="map.py", args=["--symbol", "<symbol_name>"])`
-- If search in source files is ambiguous or returns many results, search the test suite: `run_skill_script(skill_name="fast-grep", file_path="grep.py", args=["<term>", "tests/"])`. Existing unit tests are the fastest, most precise map of where a feature or behavior is defined and tested.
-- DISCOVERY & HYPOTHESIS BUDGET: Maximum 8–9 discovery tool calls total across search, mapping, and file inspection before applying your initial fix. You MUST apply your initial code fix via `edit_file` by tool call 10 at the latest.
-
-### Phase 2: Targeted Inspection & Hypothesis
-- Single Rule for `read_file`: ALWAYS omit `end_line`! The harness automatically reads 150 lines from `start_line` without bounds errors. Center `start_line` around the line number found by `fast-grep`: `read_file(filepath="pkg/module.py", start_line=110)`. Never pass `end_line`.
-- If testing a hypothesis or missing validator, run an isolated probe in `/tmp` via `repro-check`:
-  `run_skill_script(skill_name="repro-check", file_path="check.py", args=["<assertion_code>"])`
-- DYNAMIC SCRATCHPAD BUDGET & ANTI-THRASHING GUARD:
-  - You may use `repro-check` up to 4 times to formulate and verify your hypothesis.
-  - ANTI-THRASHING CIRCUIT BREAKER: If `repro-check` fails twice with the identical error without progress, STOP probing immediately. Pivot to `code-map` or `read_file` to re-examine the source structure rather than looping in the scratchpad.
-  - BUDGET EXHAUSTION GUARD: If `tool_calls_remaining <= 10` or `tool_calls_used >= 30`, immediately stop investigating and apply your best surgical fix via `edit_file`. Never exhaust your budget without applying an edit!
-  - (Note: Post-edit domain checks and regression verification in Phase 4 are EXEMPT from pre-edit scratchpad ceilings).
-
-### Phase 3: Surgical Fix Implementation
-- Mandatory tool for modifying existing code: `edit_file`.
-  `edit_file(filepath="<path>", old_string="<exact_lines>", new_string="<replacement_lines>")`
-- Provide compact 3–5 line anchors in `old_string`. NEVER include line-number prefixes!
-- If creating a brand-new file explicitly requested by the issue, use `write_file`.
-- MANDATORY IMPLEMENTATION CEILING: Apply your initial change within your first 5–6 tool calls.
-- Codebase Consistency & Idiomatic Alignment: When adding validations or error messages, strictly mirror the concise, canonical phrasing already established in the surrounding codebase and docstrings (e.g. follow existing exception messages in the same module). Avoid overly verbose or conversational explanations.
-
-### Phase 4: Multi-Domain Nuance & Regression Verification
-- Verify domain-specific nuances using `code-oracle`:
-  - **ANSI Styling & Sequences**: Use `code-oracle --hex` to inspect raw escape codes. Preserve exact CSI/SGR styling sequences and ensure proper `\x1b[0m` reset termination without stray escapes.
-  - **Unicode Terminal Cell Width**: Use `code-oracle --width` when dealing with console output, table columns, or string padding. CJK Wide characters (`W`/`F`) and emojis take 2 terminal cells, combining marks take 0, and ANSI escapes take 0. Strictly preserve cell width calculations to prevent table border misalignment.
-  - **HTML Entity Escaping & Web Security**: Use `code-oracle --html-esc` to verify HTML templates and script injection. Standard OWASP/Python web security requires escaping `<`, `>`, and `&` to `\u003c`, `\u003e`, `\u0026` inside HTML `<script>` tags to prevent XSS breakout. Ensure all HTML tags are balanced.
-  - **JSON Schema & OpenAPI Conformance**: Use `code-oracle --schema` when modifying OpenAPI generation or schemas. Check `$defs` vs `definitions`, resolve local `$ref` pointers, and ensure `anyOf` with `null` aligns with Pydantic v1 vs v2 contracts.
-- Run distance-1 neighbor regression tests using `test-gate`:
-  `run_skill_script(skill_name="test-gate", file_path="gate.py")`
-- Distinguish true regressions vs pre-fix test assertion conflicts:
-  - **True Regression**: Unhandled exceptions (`AttributeError`, `TypeError`, `KeyError`), crashes, or broken distance-1 consumer tests. Fix these before submitting.
-  - **Pre-Fix Test Assertion Conflict**: A unit test in `tests/` asserts the old buggy behavior. In Container B, the evaluation harness applies an updated test patch. If distance-1 consumers pass and the failure is solely that an unpatched test expects the old pre-fix output, do NOT suppress or revert!
-  - **NEVER EDIT TEST FILES**: Under NO circumstances edit test files in `/workspace`!
-
-### Phase 5: Patch Inspection & Submission
-- Step 1: Run read-only diff inspection and safety assertion:
-  `run_skill_script(skill_name="test-gate", file_path="gate.py", args=["--diff"])`
-  - Verifies that ZERO test files (`tests/*`, `test_*.py`, `conftest.py`) were modified.
-  - Verifies no dangerous untracked scratch files (`repro.py`, `tmp*.py`) exist in `/workspace`.
-- Step 2: Run patch readiness check:
-  `run_skill_script(skill_name="test-gate", file_path="gate.py", args=["--status"])`
-  - Validates Python AST syntax across all touched files and verifies `[✓ READY]` recommendation.
-- Step 3: Call `submit_patch()`.
-  - Calling `submit_patch()` completes the task. Never submit an empty patch!
-
-## STRICT OPERATIONAL DISCIPLINE
-1. EXACTLY ONE TOOL CALL PER TURN (NO BATCHING / NO CHAINING):
-- You MUST emit EXACTLY ONE tool call per response.
-- NEVER attempt to call multiple tools, chain tools, or concatenate JSON objects in a single turn. The harness executes strictly ONE tool call at a time.
-- After emitting your tool call, STOP immediately and wait for the tool execution observation.
-- ZERO CONVERSATIONAL CHATTER: Output ONLY your single tool call. Do NOT emit explanations, apologies, plans, or conversational commentary.
-- STRICT NEGATIVE CONSTRAINT ON RAW JSON & TEXT TOOL CALLS: You must ONLY emit tool calls through the native tool-calling interface. NEVER write raw JSON tool objects or pseudo-code function calls into plain text or markdown blocks.
-- STRICT JSON ARGUMENT HYGIENE & ESCAPE SAFETY: Format tool arguments cleanly to prevent unescaped double-quote syntax errors that crash the JSON parser. For complex strings in `repro-check`, pass base64 via `--b64 <payload>`.
-
-2. ABSOLUTELY FORBIDDEN: NEVER TOUCH TEST FILES OR WRITE SCRATCH SCRIPTS IN /WORKSPACE:
-- ABSOLUTELY FORBIDDEN: NEVER modify, edit, or write to ANY test file (`tests/*`, `test_*.py`, `*_test.py`, `conftest.py`)!
-- If a pre-existing unit test fails because it asserts old buggy behavior, LEAVE IT UNTOUCHED. Container B applies the official test patch; modifying test files causes git patch conflicts and instant 0% evaluation score!
-- ABSOLUTELY FORBIDDEN: NEVER write temporary scripts, probe files, or test runners into `/workspace` (e.g. `repro.py`, `scan.py`, `test.py`). Any scratch file in `/workspace` is captured by `git diff HEAD` and pollutes the patch! Use `repro-check` to run Python verification snippets safely in `/tmp`.
-
-3. FASTAPI `docs_src` INVARIANT:
-- In FastAPI tasks, problem statements mentioning 'Update docs...', 'docs for responses', or tutorial features NEVER target markdown files in `docs/en/docs/*.md`. In FastAPI, documentation examples are executable Python tutorial files in `docs_src/**/*.py` (e.g. `docs_src/stream_data/tutorial002_py310.py`) tested by `tests/test_tutorial/`. Locate and modify the corresponding Python code in `docs_src/`.
-
-4. SURGICAL EDITS & SCOPE BOUNDARY:
-- Most tasks require editing only ONE file. Never edit a secondary file without running verification on the primary file.
-- If tests fail after your edit and cannot be refined, REVERT the file using `edit_file` (swap `old_string` and `new_string`).
-- If `edit_file` fails (target string not found), call `read_file` centered around the target lines to inspect the exact indentation and whitespace before retrying.
-- MAXIMUM 2 CONSECUTIVE EDIT ATTEMPTS: Never fail `edit_file` more than 2 consecutive times on the same target lines. On a third attempt, switch to a wider 8–10 line anchor or select an alternate surrounding block to break exact-match whitespace drift loops.
-
-5. ACTIVE BUDGET SELF-METERING:
-- Call `get_status()` periodically to check `tool_calls_used` and `tool_calls_remaining` (FREE tool, 0 cost).
-- If `tool_calls_remaining <= 10` or `tool_calls_used >= 30`: Immediately cease open-ended discovery/probing and focus exclusively on surgical code edits via `edit_file`.
-- If `tool_calls_remaining <= 4` or `tool_calls_used >= 36`: Emergency wrap-up! Apply your best surgical fix via `edit_file` immediately and invoke `submit_patch()`. Never submit an empty patch!
-```
+- **Ref `56883026` (`0.13` Public Leaderboard Score — Oct 6)**: Locked Track 1 adapter-less baseline
+  (`submissions/track1_live/`, SHA-256 `10e32ceb9b...`). Uses 5 direct tools + 5 skills via
+  `run_skill_script`, zero `run_command`, `temperature: 0.15, top_p: 0.9, max_output_tokens: 4096,
+  thinking_budget: 2048, include_thoughts: true`. Outperforms `0.08`–`0.12` public starter baselines.
+- **Ref `56765397` (`0.03` Public Leaderboard Score — Oct 2)**: Early pre-hardening tree (`667472e`) prior
+  to skill/prompt fixes.
+- **Ref `56810465` (`0.00` Public Leaderboard Score — Oct 4)**: Shipped a 90MB LoRA adapter trained on
+  `unsloth/gemma-4-31B-it-unsloth-bnb-4bit` (BitsAndBytes NF4) mounted onto Kaggle's `w4a16-ct`
+  (`compressed-tensors` INT4 packed) vLLM runtime, causing immediate logit/generation collapse (`111/129`
+  tasks had `tool_calls == 0`, `77/95` traces had `0` completion tokens; `18/95` live traces ran tool
+  loops before mid-run server degradation ~7.15h later).
+- **Local `run_B39` (`56/129 = 43.4%`) & `run_B40` (`50/77 = 64.9%`)**: Executed on a LiteRouter proxy
+  (`stealth/space-bunny-alpha`), NOT Gemma 4. Used strictly as teacher trajectories for 5-skill protocol
+  distillation.
+### 2.2 129-Task Benchmark Stratification (`tasks.jsonl`)
+- **Repository Distribution**: FastAPI (`67`), Rich (`48`), Requests (`13`), HTTPX (`1`).
+- **Tier 1 — Core Capture Target (77 tasks, 59.7%)**: Single-file solvable bug fixes:
+  - **Shard A (47 tasks)**: Micro-fixes with `<= 6` lines of churn.
+  - **Shard B (30 tasks)**: Localized single-file fixes with `7–60` lines of churn.
+- **Tier 2 — Moderate Multi-File (15 tasks, 11.6%)**: Coordinated 2-file changes (e.g., `fastapi_14986`).
+- **Tier 3 — Poison Pills (37 tasks, 28.7%)**: Massive multi-file refactors and synthetic traps that
+  cannot be solved reliably within a 40-call budget (e.g., `rich_3930` with 12k lines of generated data,
+  `fastapi_14609` with 2k lines, `fastapi_15661` release script generator, `fastapi_15280` April Fools
+  joke, `httpx_3672` HTTP/2 async lock). Training filters out Tier 3; inference still attempts all 129
+  tasks because budgets are isolated per task.
 
 ---
 
-## 3. Multi-Turn Conversational Tool SFT Pipeline (`scripts/build_unsloth_dataset.py`)
+## Section 3: The 7 Hard Negative Constraints
+
+1. **NO `run_command` or Raw Shell Execution**:
+   - Exposing raw `run_command` to 4-bit quantized Gemma 4 causes three fatal failure modes:
+     (a) un-scoped `pytest` sweeps that hang until the 300s harness kill (`test_exit_code: 124`),
+     (b) scratch reproduction scripts written into `/workspace` that pollute `git add -N . && git diff HEAD`,
+     and (c) multi-line bash heredoc quoting/escaping corruption across JSON tool call boundaries.
+   - `repro-check` (`/tmp` isolation, 15s process-group timeout, mandatory assertion enforcement) and
+     `test-gate` (distance-1 neighbor pytest, read-only diff check, test-file mutation guard) invoked via
+     `run_skill_script` completely replace raw shell access. Omitting `run_command` NEVER caused the
+     historical `0.03` or `0.00` scores (`0` `run_command` errors exist across all cloud traces).
+2. **NO Multi-Agent or Sub-Agent Chains**:
+   - The SWE-Gemma harness enforces a single task-global `max_tool_calls: 40` counter with zero
+     per-sub-agent rationing. Sub-agent pipelines (e.g., Scout -> Coder -> Breaker) exhaust the 40-call
+     budget during exploration before the main agent can execute `edit_file` or `submit_patch`.
+3. **NO BitsAndBytes NF4 (`unsloth-bnb-4bit`) or `load_in_4bit=True` on `w4a16-ct`**:
+   - `google/gemma-4-31b-it-qat-w4a16-ct` is already quantized with `compressed-tensors` (`format:
+     "pack-quantized"`, INT4 group-32 symmetric). Passing `load_in_4bit=True` on `w4a16-ct` raises a
+     `ValueError` or collides with BitsAndBytes NF4 quantization scales. Never train on
+     `unsloth/gemma-4-31B-it-unsloth-bnb-4bit`.
+4. **NO Gemma 2/3 `<start_of_turn>` Tags, Symmetric `<|tool_call|>`, or `<|thought|>`**:
+   - Gemma 4 uses `<|turn>model\n` (`105`), `<turn|>` (`106`), `<|channel>thought\n...<channel|>`
+     (`100`/`101`), and asymmetric `<|tool_call>...<tool_call|>` (`48`/`49`). Token `<|thought|>` does
+     not exist in the 262,144-token vocabulary.
+5. **NO `max_seq_length > 3072` or `eval_strategy="steps"` on Single 24GB L4 GPU**:
+   - Running `trainer.evaluate()` (`eval_strategy="steps"`) materializes `[1, 3072, 262144]` FP32 logits
+     (`7.50 GiB`), spiking VRAM to `27.81 GiB > 22.494 GiB` usable L4 memory and crashing at Step 5.
+     Keep `max_seq_length=3072` and `eval_strategy="no"`.
+6. **NO MLP Layers, Vision Tower Layers, `k_proj`, NEFTune, or Tokenizer Files in LoRA Export**:
+   - Adapt strictly `["q_proj", "v_proj", "o_proj"]` on the language model (`finetune_vision_layers=False`,
+     `finetune_mlp_modules=False`, `neftune_noise_alpha=None`). Ship ONLY `adapter_config.json` and
+     `adapter_model.safetensors` inside `submissions/track1_live/adapters/main_lora/` (shipping
+     `tokenizer.model` fails `g_disallowed_extensions` in `scripts/check_submission.py`).
+7. **NO Training on or Reverse-Engineering `tasks.jsonl` Gold Patches**:
+   -Reverse-engineering gold diffs from the 129 benchmark tasks is benchmark contamination that overfits
+     to public tasks and collapses on private evaluation repositories.
+
+---
+
+## Section 4: Verified Gemma 4 (`models/gemma-4-31b-it-qat-w4a16-ct/`) Chat Template & Prefix-Delta Loss Masking
+
+### 4.1 Verified Control Token ID Table (`tokenizer.json`, Vocab Size = `262,144`)
+
+| Token String | Token ID | Role / Config Key in `tokenizer_config.json` |
+| :--- | :--- | :--- |
+| `<\|tool>` | `46` | Tool declaration block open (`stc_token`) |
+| `<tool\|>` | `47` | Tool declaration block close (`etc_token` for declaration) |
+| `<\|tool_call>` | `48` | Model tool call open |
+| `<tool_call\|>` | `49` | Model tool call close (asymmetric closer) |
+| `<\|tool_response>` | `50` | Tool response open & intermediate model stop cue |
+| `<tool_response\|>` | `51` | Tool response close |
+| `<\|"\|>` | `52` | String delimiter inside tool call / response dicts (`escape_token`) |
+| `<\|think\|>` | `98` | System header thinking mode activation (`think_token`) |
+| `<\|channel>` | `100` | Reasoning channel open (`soc_token`, followed by `thought\n`) |
+| `<channel\|>` | `101` | Reasoning channel close (`eoc_token`) |
+| `<\|turn>` | `105` | Turn open (`sot_token`, followed by `system\n`, `user\n`, or `model\n`) |
+| `<turn\|>` | `106` | Turn close (`eot_token`) |
+
+*(Note: There is NO `<|thought|>` token and NO `<start_of_turn>` token in Gemma 4.)*
+
+### 4.2 Six Canonical `chat_template.jinja` Invariants
+Verified directly against `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja`:
+
+1. **Single-Turn Multi-Step Continuation**: Gemma 4 keeps an entire multi-step tool-calling loop inside a
+   SINGLE open `<|turn>model\n` turn without emitting `<turn|>` until the final text response.
+2. **Turn 1 vs Turn 2+ Prefix Asymmetry (`chat_template.jinja:388`)**:
+   - On **Turn 1** (immediately after `user`), `prefix_text` (`add_generation_prompt=True`) ends with
+     `<|turn>model\n`, and the assistant completion starts with `<|channel>thought\n`.
+   - On **Turn 2+** (immediately after a `tool` response), line 388 executes:
+     ```jinja2
+     {%- if ns.prev_message_type == 'tool' -%}{%- if enable_thinking -%}<|channel>thought
+     {%- endif -%}{%- endif -%}
+     ```
+     Thus `prefix_text` (`add_generation_prompt=True`) ALREADY ends with `<tool_response|><|channel>thought\n`,
+     and the assistant completion starts directly with the reasoning text! Consequently, string-matching
+     `train_on_responses_only("<|turn>model\n")` fails on every Turn 2+ step.
+3. **Turn 2+ Non-Empty Reasoning Requirement (`chat_template.jinja:241` vs `388`)**:
+   - When `add_generation_prompt=False` (`full_text`), line 241 only emits `<|channel>thought\n...<channel|>`
+     if `message['reasoning']` or `message['reasoning_content']` is non-empty. Because line 388
+     unconditionally appends `<|channel>thought\n` to `prefix_text` on Turn 2+ when `enable_thinking=True`,
+     every supervised Turn 2+ assistant step MUST have non-empty `reasoning`, or
+     `full_text.startswith(prefix_text)` fails.
+4. **`strip_thinking()` Trap (`chat_template.jinja:326`)**:
+   - The template macro `strip_thinking()` strips any `<|channel>...<channel|>` blocks placed inside
+     `message["content"]`. Reasoning MUST be stored in `message["reasoning"]` (or `reasoning_content`).
+5. **Structured Dict Tool Arguments (`chat_template.jinja:16-36, 250-264`)**:
+   - `tool_calls[].function.arguments` MUST be a Python `dict` (passing a JSON string raises a Jinja
+     exception at line 258). Keys are formatted unquoted via `dictsort` and string values are wrapped in
+     token `52` (`<|"|>`):
+     ```text
+     <|tool_call>call:read_file{end_line:150,path:<|"|>rich/ansi.py<|"|>,start_line:120}<tool_call|>
+     ```
+6. **Stop Cues**:
+   - Intermediate tool-calling steps end with `<|tool_response>` (token `50`) as the generation stop cue;
+     only the final text response closes the turn with `<turn|>\n` (token `106`).
+
+### 4.3 Reference Implementation: Prefix-Delta Loss Masking (`build_supervised_step_sample`)
 
 ```python
-#!/usr/bin/env python3
-"""Builds high-quality, stratified Multi-Turn Tool SFT training & validation datasets for Unsloth Gemma 31B.
-
-Consensus Architectural Upgrades (Triple-Reviewer Harmonized):
-1. ELIMINATES MODALITY MISMATCH: Formats data as full multi-turn conversational tool-calling
-   trajectories (system -> user -> agent tool_calls -> tool observation -> submit_patch),
-   NOT plain text markdown diffs, preserving autonomous agent reflexes in Google ADK.
-2. OBSERVATION COMPACTION: Compresses voluminous tool outputs (capped at 800 chars) to ensure
-   complete 20-30 turn trajectories fit comfortably inside the 16,384 token window.
-3. OUTLIER FILTERING: Drops non-surgical diffs (>150 lines) and flailing runs (tool_calls > 35).
-4. DEDUPLICATION: Collapses near-duplicate patches (>90% similarity via difflib).
-5. STRATIFIED 80/20 SPLIT: Balances train/val sets across repository domains.
-6. DUAL SCHEMA: Outputs both standard OpenAI-compatible `messages` and rendered Gemma `text` turns.
-7. STRICT INTEGRITY GUARD: Hard-fails if corrupted or skipped traces exceed 5%.
-"""
-
-from collections import defaultdict
-import difflib
-import json
-import logging
-from pathlib import Path
-import random
-from typing import Any, Dict, List, Optional, Tuple
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("build_unsloth_dataset")
-
-ROOT_DIR = Path(__file__).resolve().parent.parent
-B39_DIR = ROOT_DIR / "results" / "run_B39"
-TRACES_DIR = B39_DIR / "traces"
-PATCHES_DIR = B39_DIR / "patches"
-RESULTS_JSONL = B39_DIR / "task_results.jsonl"
-OUT_DIR = ROOT_DIR / "data"
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-TRAIN_OUT_PATH = OUT_DIR / "unsloth_sft_train.jsonl"
-VAL_OUT_PATH = OUT_DIR / "unsloth_sft_val.jsonl"
-
-MAX_DIFF_LINES = 150
-MAX_TOOL_CALLS = 35
-DEDUP_SIMILARITY_THRESHOLD = 0.90
-MAX_SKIP_RATE = 0.05
-VAL_RATIO = 0.20
-MAX_OBSERVATION_CHARS = 800
-SEED = 42
+from typing import Any, Dict, List
 
 
-def compact_observation(raw_obs: Any) -> str:
-    """Compacts tool observation output to fit long trajectories into 16K context."""
-    if isinstance(raw_obs, dict):
-        if "stdout" in raw_obs and raw_obs["stdout"]:
-            text = str(raw_obs["stdout"])
-        elif "content" in raw_obs and raw_obs["content"]:
-            text = str(raw_obs["content"])
-        else:
-            text = json.dumps(raw_obs, ensure_ascii=False)
-    else:
-        text = str(raw_obs or "").strip()
+def build_supervised_step_sample(
+    tokenizer: Any,
+    messages: List[Dict[str, Any]],
+    step_index: int,
+    tools: List[Dict[str, Any]],
+) -> Dict[str, List[int]]:
+    """Build input_ids and prefix-delta masked labels for one assistant step.
 
-    if len(text) <= MAX_OBSERVATION_CHARS:
-        return text
+    Args:
+        tokenizer: Loaded Gemma 4 tokenizer with canonical chat_template.jinja.
+        messages: Full conversation history up to and including step_index.
+        step_index: Index of the target assistant message in `messages`.
+        tools: List of 6 tool schemas (read_file, edit_file, write_file,
+            get_status, submit_patch, run_skill_script).
+    """
+    target_msg = messages[step_index]
+    assert target_msg["role"] == "assistant", f"Expected assistant at {step_index}"
+    reasoning = (
+        target_msg.get("reasoning")
+        or target_msg.get("reasoning_content")
+        or ""
+    ).strip()
+    assert len(reasoning) > 0, (
+        f"Turn {step_index} has empty reasoning; violates Turn 2+ prefix invariant"
+    )
+    target_msg_dict = dict(target_msg)
+    target_msg_dict["reasoning"] = reasoning
 
-    half = MAX_OBSERVATION_CHARS // 2 - 20
-    return text[:half] + "\n... [truncated] ...\n" + text[-half:]
+    prefix_messages = messages[:step_index]
+    full_messages = messages[:step_index] + [target_msg_dict]
 
-
-def extract_trajectory_messages(trace_path: Path) -> Tuple[Optional[str], List[Dict[str, Any]]]:
-    """Extracts system instruction, user prompt, and multi-turn tool interaction messages."""
-    if not trace_path.exists():
-        logger.warning(f"Trace file missing: {trace_path}")
-        return None, []
-
-    try:
-        with open(trace_path, encoding="utf-8") as f:
-            trace = json.load(f)
-    except Exception as exc:
-        logger.error(f"Failed to parse trace {trace_path}: {exc}")
-        return None, []
-
-    steps = trace.get("steps", [])
-    user_prompt = ""
-    messages: List[Dict[str, Any]] = []
-
-    for step in steps:
-        src = step.get("source")
-        msg = (step.get("message") or "").strip()
-        tcalls = step.get("tool_calls", [])
-        obs = step.get("observation")
-
-        if src == "system" and msg:
-            if not messages or messages[0].get("role") != "system":
-                messages.append({"role": "system", "content": msg})
-
-        elif src == "user" and msg:
-            if not user_prompt:
-                user_prompt = msg
-                messages.append({"role": "user", "content": msg})
-
-        elif src == "agent":
-            asst_dict: Dict[str, Any] = {"role": "assistant"}
-            if msg:
-                asst_dict["content"] = msg
-            if tcalls:
-                formatted_calls = []
-                for idx, tc in enumerate(tcalls):
-                    call_id = tc.get("tool_call_id") or f"call_{len(messages)}_{idx}"
-                    formatted_calls.append({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.get("function_name"),
-                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False)
-                        }
-                    })
-                asst_dict["tool_calls"] = formatted_calls
-
-            if "content" in asst_dict or "tool_calls" in asst_dict:
-                messages.append(asst_dict)
-
-            if obs:
-                compact_text = compact_observation(obs)
-                call_id = (tcalls[0].get("tool_call_id") or f"call_{len(messages)-1}_0") if tcalls else "call_0"
-                fn_name = tcalls[0].get("function_name") if tcalls else "tool"
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "name": fn_name,
-                    "content": compact_text
-                })
-
-    return user_prompt, messages
-
-
-def render_gemma_chat_turns(messages: List[Dict[str, Any]]) -> str:
-    """Renders structured messages into canonical Gemma turn markers."""
-    turns: List[str] = []
-
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content") or ""
-        tool_calls = msg.get("tool_calls", [])
-
-        if role == "system":
-            turns.append(f"<start_of_turn>system\n{content}<end_of_turn>")
-        elif role == "user":
-            turns.append(f"<start_of_turn>user\n{content}<end_of_turn>")
-        elif role == "assistant":
-            parts = []
-            if content:
-                parts.append(content)
-            if tool_calls:
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    fn_name = fn.get("name")
-                    fn_args = fn.get("arguments")
-                    parts.append(f"<|tool_call|>call:{fn_name}{fn_args}<|tool_call|>")
-            asst_body = "\n".join(parts)
-            turns.append(f"<start_of_turn>model\n{asst_body}<end_of_turn>")
-        elif role == "tool":
-            turns.append(f"<start_of_turn>tool\n{content}<end_of_turn>")
-
-    return "\n".join(turns)
-
-
-def build_dataset():
-    if not RESULTS_JSONL.exists():
-        raise FileNotFoundError(f"Missing results log: {RESULTS_JSONL}")
-
-    resolved_records = []
-    with open(RESULTS_JSONL, encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            rec = json.loads(line)
-            if rec.get("resolved") is True:
-                resolved_records.append(rec)
-
-    total_resolved = len(resolved_records)
-    logger.info(f"Loaded {total_resolved} verified resolved tasks from run_B39.")
-    assert total_resolved > 0, "No resolved tasks found!"
-
-    skipped_no_patch = 0
-    skipped_no_trace = 0
-    filtered_outliers = 0
-    candidate_examples: List[Dict[str, Any]] = []
-
-    for rec in resolved_records:
-        inst_id = rec.get("instance_id")
-        repo = rec.get("repo")
-        trace_file = TRACES_DIR / f"trace_{inst_id}.json"
-        patch_file = PATCHES_DIR / f"{inst_id}.patch"
-
-        if not patch_file.exists():
-            skipped_no_patch += 1
-            logger.warning(f"Task {inst_id} missing patch file.")
-            continue
-        patch_text = patch_file.read_text(encoding="utf-8").strip()
-        if not patch_text:
-            skipped_no_patch += 1
-            logger.warning(f"Task {inst_id} has empty patch file.")
-            continue
-
-        patch_lines = len(patch_text.splitlines())
-        tool_calls = rec.get("tool_calls", 0)
-
-        # Outlier filtering
-        if patch_lines > MAX_DIFF_LINES:
-            filtered_outliers += 1
-            logger.info(f"Skipping {inst_id}: patch lines ({patch_lines}) > {MAX_DIFF_LINES}")
-            continue
-        if tool_calls > MAX_TOOL_CALLS:
-            filtered_outliers += 1
-            logger.info(f"Skipping {inst_id}: tool calls ({tool_calls}) > {MAX_TOOL_CALLS} (flailing run)")
-            continue
-
-        user_prompt, messages = extract_trajectory_messages(trace_file)
-        if not user_prompt or not messages or len(messages) < 4:
-            skipped_no_trace += 1
-            logger.warning(f"Task {inst_id} invalid or missing trajectory steps.")
-            continue
-
-        candidate_examples.append({
-            "task_id": inst_id,
-            "repo": repo,
-            "patch_lines": patch_lines,
-            "tool_calls": tool_calls,
-            "user_prompt": user_prompt,
-            "patch_text": patch_text,
-            "messages": messages,
-            "turns_count": len(messages),
-        })
-
-    # Hard-fail guard against corrupted traces
-    total_skipped = skipped_no_patch + skipped_no_trace
-    skip_rate = total_skipped / total_resolved
-    if skip_rate > MAX_SKIP_RATE:
-        raise RuntimeError(
-            f"Dataset build failed: skip rate {skip_rate:.2%} ({total_skipped}/{total_resolved}) "
-            f"exceeds allowed maximum {MAX_SKIP_RATE:.0%}!"
-        )
-
-    logger.info(f"Passed quality filters: {len(candidate_examples)} candidates (dropped {filtered_outliers} outliers).")
-
-    # Near-duplicate patch deduplication within same repository
-    deduped_examples: List[Dict[str, Any]] = []
-    collapsed_duplicates = 0
-
-    for cand in candidate_examples:
-        is_duplicate = False
-        for accepted in deduped_examples:
-            if cand["repo"] == accepted["repo"]:
-                sim = difflib.SequenceMatcher(None, cand["patch_text"], accepted["patch_text"]).ratio()
-                if sim >= DEDUP_SIMILARITY_THRESHOLD:
-                    is_duplicate = True
-                    collapsed_duplicates += 1
-                    logger.info(
-                        f"Collapsed near-duplicate patch {cand['task_id']} "
-                        f"(similarity {sim:.2f} with {accepted['task_id']})"
-                    )
-                    break
-        if not is_duplicate:
-            deduped_examples.append(cand)
-
-    logger.info(
-        f"Deduplication complete: {len(deduped_examples)} unique multi-turn trajectories "
-        f"({collapsed_duplicates} collapsed)."
+    prefix_text = tokenizer.apply_chat_template(
+        prefix_messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=True,
+        preserve_thinking=True,
+    )
+    full_text = tokenizer.apply_chat_template(
+        full_messages,
+        tools=tools,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=True,
+        preserve_thinking=True,
     )
 
-    formatted_dataset = []
-    for ex in deduped_examples:
-        raw_text = render_gemma_chat_turns(ex["messages"])
-        formatted_dataset.append({
-            "task_id": ex["task_id"],
-            "repo": ex["repo"],
-            "patch_lines": ex["patch_lines"],
-            "tool_calls": ex["tool_calls"],
-            "turns_count": ex["turns_count"],
-            "messages": ex["messages"],
-            "text": raw_text,
-        })
+    # For intermediate tool-calling steps, append <|tool_response> stop cue
+    if target_msg_dict.get("tool_calls"):
+        if not full_text.endswith("<|tool_response>"):
+            full_text = full_text + "<|tool_response>"
 
-    repo_groups = defaultdict(list)
-    for row in formatted_dataset:
-        repo_groups[row["repo"]].append(row)
+    assert full_text.startswith(prefix_text), (
+        f"Prefix mismatch at step {step_index}:\n"
+        f"PREFIX TAIL: {prefix_text[-120:]!r}\n"
+        f"FULL AT PREFIX LEN: {full_text[len(prefix_text)-60:len(prefix_text)+60]!r}"
+    )
 
-    random.seed(SEED)
-    train_rows: List[Dict[str, Any]] = []
-    val_rows: List[Dict[str, Any]] = []
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+    assert full_ids[: len(prefix_ids)] == prefix_ids, (
+        f"Token boundary BPE merge mismatch at step {step_index}"
+    )
 
-    for repo, rows in sorted(repo_groups.items()):
-        random.shuffle(rows)
-        val_count = max(1, int(round(len(rows) * VAL_RATIO))) if len(rows) > 3 else (1 if len(rows) > 1 else 0)
-        repo_val = rows[:val_count]
-        repo_train = rows[val_count:]
-        val_rows.extend(repo_val)
-        train_rows.extend(repo_train)
-        logger.info(f"Repo {repo}: total={len(rows)}, train={len(repo_train)}, val={len(repo_val)}")
-
-    with open(TRAIN_OUT_PATH, "w", encoding="utf-8") as f_train:
-        for row in train_rows:
-            f_train.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    with open(VAL_OUT_PATH, "w", encoding="utf-8") as f_val:
-        for row in val_rows:
-            f_val.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-    print("\n" + "=" * 65)
-    print("      STRATIFIED MULTI-TURN SFT DATASET CURATION SUMMARY")
-    print("=" * 65)
-    print(f"Total verified input traces:        {total_resolved}")
-    print(f"Passed filters & deduplication:     {len(formatted_dataset)}")
-    print(f"Training set (80%):                 {len(train_rows)} trajectories -> {TRAIN_OUT_PATH}")
-    print(f"Validation set (20% held-out):      {len(val_rows)} trajectories -> {VAL_OUT_PATH}")
-    print(f"Filtered outliers (>150 lines/>35): {filtered_outliers}")
-    print(f"Collapsed near-duplicate patches:   {collapsed_duplicates}")
-    print("=" * 65)
-
-
-if __name__ == "__main__":
-    build_dataset()
+    labels = [-100] * len(prefix_ids) + full_ids[len(prefix_ids) :]
+    return {
+        "input_ids": full_ids,
+        "attention_mask": [1] * len(full_ids),
+        "labels": labels,
+    }
 ```
 
 ---
 
-## 4. Hardened LoRA Training Pipeline with 16K Context (`kaggle_unsloth/`)
+## Section 5: 5-Skill SFT Dataset Audit & Remediation (`scripts/build_unsloth_dataset.py`)
 
-From updated `kaggle_unsloth/train_gemma4_lora.ipynb`:
+### 5.1 Quantitative Profile of `training/sft_data/unsloth_sft_train.jsonl`
+- **Row & Task Counts**: `885` train windows and `222` validation windows (`1,107` total step windows)
+  distilled across `40` resolved teacher trajectories (`FastAPI`, `Rich`, `Requests`).
+- **Token Length Distribution (`max_seq_length=3072` Fit)**:
+  - **Min**: `665` tokens
+  - **Median (P50)**: `1,162` tokens
+  - **P90**: `1,686` tokens
+  - **Max**: `2,822` tokens (`100.0%` of windows are `<= 2,822` tokens -> zero truncation at `3,072`).
+- **Tool Call Distribution Across 596 Tool-Calling Train Windows (`639` Total Tool Calls)**:
 
-```python
-# Unsloth FastLanguageModel QLoRA Initialization with 16,384 Sequence Length
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name="google/gemma-4-31b-it",
-    max_seq_length=16384,          # Expanded from 4096 to prevent truncating multi-turn trajectories!
-    dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
-    load_in_4bit=True,
-)
+| Tool Name | Call Count | Share (%) | Role in 5-Skill Architecture |
+| :--- | :--- | :--- | :--- |
+| `run_skill_script` | `411` | `64.3%` | Executes `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate` |
+| `read_file` | `110` | `17.2%` | Targeted line-window code inspection |
+| `edit_file` | `71` | `11.1%` | Surgical source modification |
+| `submit_patch` | `44` | `6.9%` | Final patch submission |
+| `write_file` | `3` | `0.5%` | New file creation |
+| `run_command` | `0` | `0.0%` | **Strictly zero** (withheld by design) |
 
-# Targeted Rank-8 PEFT: attention + output projection only (freeze MLPs)
-model = FastLanguageModel.get_peft_model(
-    model,
-    r=8,
-    target_modules=["q_proj", "v_proj", "o_proj"],
-    lora_alpha=16,
-    lora_dropout=0.05,
-    bias="none",
-    use_gradient_checkpointing="unsloth",
-    random_state=42,
-)
+### 5.2 Four Dataset Builder Bugs in `scripts/build_unsloth_dataset.py` & Exact Fixes
 
-training_args = TrainingArguments(
-    output_dir="/kaggle/working/training_outputs",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=4,  # Effective batch size = 8
-    warmup_steps=3,
-    max_steps=20,                   # ~2.5 epochs across 38 rows (prevents memorization)
-    learning_rate=2.0e-5,
-    fp16=not torch.cuda.is_bf16_supported(),
-    bf16=torch.cuda.is_bf16_supported(),
-    logging_steps=2,
-    eval_strategy="steps",
-    eval_steps=5,                   # Tracks held-out validation loss across 10 held-out rows
-    optim="adamw_8bit",
-    weight_decay=0.05,
-    lr_scheduler_type="cosine",
-    neftune_noise_alpha=5,          # Embedding noise regularizer
-    seed=42,
-    report_to="none",
-)
-```
-
----
-
-## 5. Line-Level Audit: Subprocess Defensive Shield & Timeouts (`check.py` & `oracle.py`)
-
-### A. Subprocess Process-Group Termination & Fast Socket Timeout in `repro-check` (`check.py`)
-```python
-# 1. Runner environment hardening (lines 1780-1798):
-try:
-    import socket
-    socket.setdefaulttimeout(3.0)  # Fast-fail external network calls rather than hanging
-except Exception:
-    pass
-
-try:
-    import resource
-    curr_soft, curr_hard = resource.getrlimit(resource.RLIMIT_AS)
-    limit_1g = 1024 * 1024 * 1024
-    if curr_hard == resource.RLIM_INFINITY or curr_hard >= limit_1g:
-        resource.setrlimit(resource.RLIMIT_AS, (min(limit_1g, curr_hard), curr_hard))
-except Exception:
-    pass
-
-# 2. Process Group Spawning and Clean SIGKILL Termination (lines 2090-2157):
-proc = subprocess.Popen(
-    cmd,
-    cwd=temp_dir_path,
-    env=env,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-    text=True,
-    encoding="utf-8",
-    start_new_session=True,  # Distinct process group (setsid)
-)
-try:
-    stdout_out, stderr_out = proc.communicate(timeout=timeout_secs)
-except subprocess.TimeoutExpired:
-    # Cleanly kill entire process group on timeout
-    if proc is not None:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            proc.communicate(timeout=2)
-        except Exception:
-            pass
-    return 124, "", f"⏱️ Execution timed out after {timeout_secs}s", timeout_report
-```
-
-### B. Timeout & Sentinel Handling in `code-oracle` (`oracle.py`)
-```python
-def _eval_alarm_handler(signum: int, frame: Any) -> None:
-    raise EvalTimeoutError("Execution timed out (infinite loop or execution exceeded 5.0s limit).")
-
-# Set timer for timeout / infinite loop protection (5.0s for heavy imports)
-timer_armed = False
-try:
-    if hasattr(signal, "SIGALRM") and hasattr(signal, "setitimer"):
-        signal.signal(signal.SIGALRM, _eval_alarm_handler)
-        signal.setitimer(signal.ITIMER_REAL, 5.0)
-        timer_armed = True
-except Exception:
-    pass
-```
+1. **Bug 1 — Legacy Gemma 2/3 `<start_of_turn>` Formatting (`lines 303-336`)**:
+   - *Defect*: Manually formats strings with `<start_of_turn>user`, `<start_of_turn>model`, `<|thought|>`,
+     and symmetric `<|tool_call|>` tags instead of invoking Gemma 4's `apply_chat_template`.
+   - *Fix*: Replace manual string concatenation with `build_supervised_step_sample()` using the canonical
+     `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja` and Python `dict` tool arguments.
+2. **Bug 2 — `289/885` (`32.66%`) `target_tools: []` Dead-Thought Rows**:
+   - *Defect*: Emits standalone supervised examples for assistant turns that contain only reasoning and
+     zero tool calls (`289` of `885` train rows), training Gemma 4 to stop generating after emitting a
+     thought without invoking a tool.
+   - *Fix*: Merge consecutive thought-only assistant turns into the immediately following tool-calling
+     turn's `reasoning` field, and drop any trailing orphan thought-only turns (`885 -> 596` clean,
+     100% tool-calling windows).
+3. **Bug 3 — `100%` `task_id` Overlap Between Train and Validation Splits**:
+   - *Defect*: Splits step windows randomly across rows rather than grouping by `task_id`, leaking all
+     `40/40` tasks into both `unsloth_sft_train.jsonl` and `unsloth_sft_val.jsonl`.
+   - *Fix*: Group all windows by `task_id` prior to splitting (e.g., `34` train tasks / `6` val tasks,
+     enforcing `0.0%` `task_id` overlap).
+4. **Bug 4 — 3-Line Stub System Prompt Instead of Production `prompts/main.md`**:
+   - *Defect*: Training examples prepend a 3-line generic system prompt stub instead of the production
+     5-skill system prompt (`submissions/track1_live/prompts/main.md`) and the 6 ADK tool declarations.
+   - *Fix*: Embed verbatim `submissions/track1_live/prompts/main.md` and the exact 6 tool schemas
+     (`read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`, `run_skill_script`) so SFT
+     prefixes match vLLM inference prefixes token-for-token.
 
 ---
 
-## 6. Architectural Index of All 5 Skill Engines
+## Section 6: Single L4 (24GB) Unsloth LoRA Training, Geometry & Packaging Specification
 
-| Skill | Lines of Code | Entry Script | Core Architectural Function |
-| :--- | :---: | :--- | :--- |
-| **`fast-grep`** | 2,342 | `grep.py` | AST-aware keyword/regex search. Auto-fallback to literal substring on `re.error`; flashes enclosing functions; outputs `[CLEAN CODE FOR edit_file]`; fuzzy AST symbol suggestions on zero matches; max 500KB / 5000 lines bounds per file. |
-| **`code-map`** | 2,494 | `map.py` | Symbol call-graph & workspace indexer. Builds caller/callee AST graph across modules; `--file <path>` produces compact outlines under 100 lines without language server dependencies. |
-| **`code-oracle`** | 2,087 | `oracle.py` | Multi-domain evaluation oracle. Expression eval with 5.0s timeout; ANSI/hex terminal escape code validation (`\x1b[0m` check); CJK/emoji display width calculation; OWASP script tag escaping verification; OpenAPI schema resolution. |
-| **`repro-check`** | 2,746 | `check.py` | Isolated bug reproduction. Executes in `/tmp` using repo `PYTHONPATH`; distinct process group (`start_new_session=True`) killed via `os.killpg`; default socket timeout (3.0s); 1GB memory runaway guard; base64 argument bypass (`--b64 <payload>`); `--expect-exception` verification. |
-| **`test-gate`** | 1,612 | `gate.py` | Pre-submission regression gatekeeper. Blast-radius neighbor test runner; asserts zero test files (`tests/*`) modified; asserts no untracked scratch files in `/workspace`; validates AST syntax before `submit_patch()`. |
+### 6.1 Base Checkpoint Architecture & Dual-Path Loading Contract
+- **Local Verified Checkpoint (`models/gemma-4-31b-it-qat-w4a16-ct/`)**:
+  - `23,265,352,448` bytes across `2,009` tensors (`model.safetensors`).
+  - `quant_method: "compressed-tensors"`, `format: "pack-quantized"`, INT4 group-32 symmetric on the 60
+    language model layers (`model.language_model.layers.0..59`, `19.36 GB`), BF16 on the vision tower
+    (`model.vision_tower.*`, `1.15 GB`, listed in `ignore`).
+- **Primary Loading Path (`w4a16-ct` Direct via Unsloth)**:
+  ```python
+  model, tokenizer = FastModel.from_pretrained(
+      model_name="google/gemma-4-31b-it-qat-w4a16-ct",
+      max_seq_length=3072,
+      dtype=torch.bfloat16,
+      load_in_4bit=False,          # Mandatory: already pack-quantized compressed-tensors
+      use_exact_model_name=True,   # Mandatory: prevents Unsloth remapping to BnB NF4
+      text_only=False,             # Mandatory: preserves base_model.model.language_model.* prefix
+  )
+  ```
+- **Contingency Fallback Path (If Unsloth Blocks Backprop on `Int4PackedLinear`)**:
+  - Load `google/gemma-4-31B-it-qat-q4_0-unquantized` (the official BF16 QAT twin) with
+    `load_in_4bit=True, dtype=torch.bfloat16, text_only=False` for training, then rewrite
+    `"base_model_name_or_path": "google/gemma-4-31b-it-qat-w4a16-ct"` in `adapter_config.json` on export.
+
+### 6.2 Exact LoRA Geometry (`attention_k_eq_v=True` on 10 Global Full-Attention Layers)
+- **PEFT Configuration**:
+  ```python
+  model = FastModel.get_peft_model(
+      model,
+      r=8,
+      lora_alpha=16,
+      lora_dropout=0.0,
+      bias="none",
+      finetune_vision_layers=False,
+      finetune_language_layers=True,
+      finetune_attention_modules=True,
+      finetune_mlp_modules=False,
+      target_modules=["q_proj", "v_proj", "o_proj"],
+      use_gradient_checkpointing="unsloth",
+      random_state=3407,
+  )
+  ```
+- **Why `170` Adapted Modules (`340` Tensors) Instead of `180`**:
+  - Gemma 4's 60 language layers consist of **50 sliding-window attention layers** (which have `q_proj`,
+    `k_proj`, `v_proj`, `o_proj`) and **10 global full-attention layers** configured with
+    `attention_k_eq_v=True` (where `k_proj` serves as both key and value, so `v_proj` is omitted).
+  - Adapting `["q_proj", "v_proj", "o_proj"]` yields `60 (q_proj) + 50 (v_proj) + 60 (o_proj) = 170`
+    adapted linear modules (`340` LoRA `A`/`B` matrices), totaling exactly **`18,124,800` trainable
+    parameters** (`34.57 MiB` in BF16).
+
+### 6.3 Component-by-Component 24GB NVIDIA L4 (`22.494 GiB` Usable) VRAM Budget
+Training hyperparameters: `max_seq_length=3072`, `per_device_train_batch_size=1`,
+`gradient_accumulation_steps=8`, `optim="paged_adamw_8bit"`, `learning_rate=1e-4`, `num_train_epochs=1`,
+`max_grad_norm=0.3`, `neftune_noise_alpha=None`, `eval_strategy="no"`.
+
+| VRAM Component | Memory (GiB) | Notes |
+| :--- | :--- | :--- |
+| Base Checkpoint Weights (`w4a16-ct` language + BF16 vision) | `17.77 GiB` | Static resident model footprint |
+| LoRA Parameters + BF16 Gradients (`18,124,800` params) | `0.07 GiB` | `34.57 MiB` weights + `34.57 MiB` grads |
+| Optimizer States (`paged_adamw_8bit`) | `0.04 GiB` | 8-bit first/second moments + CPU paging |
+| Checkpointed Activations + Cut Cross-Entropy (`seq_len=3072`) | `1.58 GiB` | Avoids 262K FP32 logit tensor |
+| CUDA Context / Triton / PyTorch Allocator Reserve | `0.85 GiB` | Runtime kernel workspace |
+| **Total Peak Training VRAM** | **`20.31 GiB`** | **`+2.18 GiB` safe headroom** under `22.494 GiB` L4 limit |
+| *(Forbidden `eval_strategy="steps"` FP32 Logit Spike)* | *(`+7.50 GiB`)* | *(`[1, 3072, 262144]` -> `27.81 GiB` OOM)* |
+
+### 6.4 Strict 2-File Export & 15-Gate Verification Contract
+- **Export Directory (`submissions/track1_live/adapters/main_lora/`)**:
+  1. `adapter_config.json` (with `"base_model_name_or_path": "google/gemma-4-31b-it-qat-w4a16-ct"`).
+  2. `adapter_model.safetensors` (`~34.6 MiB`, every key matching
+     `base_model.model.language_model.layers.{i}.self_attn.{q,v,o}_proj.lora_{A,B}.weight`; zero
+     `vision_tower` keys).
+  3. **Zero tokenizer files**: Do NOT save `tokenizer.json`, `tokenizer.model`, or `special_tokens_map.json`
+     into `adapters/main_lora/`.
+- **Verification Command**:
+  ```bash
+  python3 scripts/check_submission.py && python3 scripts/baseline_gate.py verify --mode=compute --check-zip
+  ```
+
+---
+
+## Section 7: Concrete Review Questions for External Consultants (Q1–Q4)
+
+Please provide concrete, deeply technical, code-level answers to the following four questions
+(synchronized 100% with `training/research_dossier/00_CONSULTANT_PROMPT.md`):
+
+### Q1: Gemma 4 Native Chat Template & Prefix-Delta Loss Masking
+We verified directly against `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja` that Gemma 4 keeps
+an entire multi-step tool-calling loop inside a **single open `<|turn>model\n` block** without emitting
+`<turn|>` until the final text response. Furthermore:
+- On **Turn 1** (immediately after `user`), `prefix_text` (`add_generation_prompt=True`) ends with
+  `<|turn>model\n`, and `completion_text` starts with `<|channel>thought\n`.
+- On **Turn 2+** (immediately after `tool`), `chat_template.jinja:388`
+  (`{%- if ns.prev_message_type == 'tool' -%}{%- if enable_thinking -%}<|channel>thought\n{%- endif -%}`)
+  appends `<|channel>thought\n` to `prefix_text` **before** the completion begins, while line 241
+  (`add_generation_prompt=False`) only emits `<|channel>thought\n...<channel|>` in `full_text` when
+  `reasoning` / `reasoning_content` is non-empty.
+- Consequently, standard substring splitters like Unsloth's
+  `train_on_responses_only(response_part="<|turn>model\n")` fail on Turn 2+. We replaced it with
+  **prefix-delta loss masking** (`full_text[len(prefix_text):]`) with `enable_thinking=True,
+  preserve_thinking=True` and a hard assertion that every supervised Turn 2+ step has non-empty
+  `reasoning` (`assert full_text.startswith(prefix_text)`).
+
+**Questions for Q1**:
+1. Audit our prefix-delta masking implementation against `chat_template.jinja`. Are there any BPE
+   boundary token-merging ("token-healing") edge cases in Gemma 4's SentencePiece/BPE tokenizer
+   (`vocab_size=262,144`) when slicing token IDs via `full_ids[len(prefix_ids):]` right after
+   `<|channel>thought\n` (where `\n` is followed by plain-text reasoning)?
+2. Should we compute the `-100` label mask using character-offset mapping
+   (`tokenizer(full_text, return_offsets_mapping=True, add_special_tokens=False)`) against
+   `len(prefix_text)` rather than `len(prefix_ids)`, and how should the boundary token be handled if BPE
+   merges the trailing `\n` of `<|channel>thought\n` with the first character of the reasoning string?
+
+### Q2: Unsloth `w4a16-ct` Int4PackedLinear Training vs `q4_0-unquantized` Fallback & vLLM Serving Parity
+Kaggle serves `google/gemma-4-31b-it-qat-w4a16-ct` (`quant_method: "compressed-tensors"`, `format:
+"pack-quantized"`, INT4 group-32 symmetric on `model.language_model.layers.0..59`, BF16 on
+`model.vision_tower`) under vLLM (`tp=4`, `--enable-lora`). Our primary training load passes
+`FastModel.from_pretrained("google/gemma-4-31b-it-qat-w4a16-ct", max_seq_length=3072,
+dtype=torch.bfloat16, load_in_4bit=False, use_exact_model_name=True, text_only=False)` with
+`finetune_vision_layers=False`. If Unsloth/PyTorch blocks gradient backpropagation through
+`compressed-tensors` `Int4PackedLinear` kernels, our fallback loads the official unquantized QAT sibling
+`google/gemma-4-31B-it-qat-q4_0-unquantized` with `load_in_4bit=True` and rewrites
+`base_model_name_or_path` to `"google/gemma-4-31b-it-qat-w4a16-ct"` on export.
+
+**Questions for Q2**:
+1. Verify our Unsloth loading contract and fallback mechanics. When training on `q4_0-unquantized` with
+   `load_in_4bit=True`, does the QAT-trained weight geometry align closely enough with `w4a16-ct`
+   `pack-quantized` INT4 group-32 weights at `r=8, lora_alpha=16` to prevent the logit collapse observed
+   when mounting a non-QAT `unsloth-bnb-4bit` adapter?
+2. Verify our vLLM `--enable-lora` tensor-name and module-count parity: across 60 language layers (50
+   sliding-attention layers with `q/k/v/o_proj` and 10 global full-attention layers where
+   `attention_k_eq_v=True` omits `v_proj`), targeting `["q_proj", "v_proj", "o_proj"]` yields
+   `60 + 50 + 60 = 170` adapted modules (`340` LoRA A/B tensors) named
+   `base_model.model.language_model.layers.{i}.self_attn.{q,v,o}_proj.lora_{A,B}.weight`. Are any
+   additional key transformations or `adapter_config.json` fields required by vLLM's `Gemma4ForCausalLM`
+   / multimodal wrapper?
+
+### Q3: 5-Skill SFT Dataset Curation, Filtering, and Overfitting Prevention
+Our teacher dataset (`training/sft_data/unsloth_sft_train.jsonl`, `885` train / `222` val windows across
+`40` resolved teacher trajectories from `run_B39`/`run_B40`) reduces to **`596` valid tool-calling train
+windows** (`639` tool calls: `run_skill_script` `64.3%`, `read_file` `17.2%`, `edit_file` `11.1%`,
+`submit_patch` `6.9%`, `write_file` `0.5%`, `run_command` `0.0%`) after merging the `289` (`32.66%`)
+`target_tools: []` dead-thought windows into subsequent action turns and splitting strictly by `task_id`
+(`0%` task overlap).
+
+**Questions for Q3**:
+1. With `18,124,800` trainable parameters and `596` decision windows (~`75,000`–`90,000` supervised
+   completion tokens), what is the optimal sample-weighting or window-filtering strategy so the adapter
+   masters high-leverage transition boundaries (`repro-check` -> `edit_file` -> `test-gate` ->
+   `submit_patch`) rather than over-allocating capacity to repetitive early-turn `fast-grep` calls?
+2. Audit our regularization and optimization hyperparameters (`lr=1e-4`, `1` epoch, `warmup_ratio=0.10`,
+   `weight_decay=0.01`, `max_grad_norm=0.3`, `lora_dropout=0.0`, `neftune_noise_alpha=None`). How do we
+   prevent the Rank-8 adapter from memorizing FastAPI/Rich/Requests file paths and repository-specific
+   symbol names?
+
+### Q4: Contamination-Free 5-Skill Trajectory Augmentation
+Our 40 resolved teacher trajectories come from `fastapi` (`21` tasks), `rich` (`13` tasks), and
+`requests` (`6` tasks). Under Invariant 3, we will **never** extract or train on gold patches from
+`tasks.jsonl`. Under Invariant 1, we will **never** synthesize `run_command` calls.
+
+**Questions for Q4**:
+1. If `596` clean decision windows are insufficient or require augmentation, what is the
+   highest-leverage, 100% contamination-free method to synthesize or harvest additional 5-skill
+   trajectories (`fast-grep` -> `code-map` -> `read_file` -> `repro-check` -> `edit_file` -> `test-gate`
+   -> `submit_patch`) — for example, using external open-source commits/PRs or negative-to-positive
+   self-correction loops (`repro-check` assertion failure -> `edit_file` fix -> `test-gate` pass)?
+2. What exact offline validation gate (e.g., held-out task exact-match tool syntax rate, `<|"|>`
+   delimiter validity, `submit_patch` termination rate, and perplexity on held-out `task_id`s) should
+   govern whether the trained Track 2 LoRA adapter is promoted to our Kaggle Compute staging kernel
+   before touching the 1/day Leaderboard quota?

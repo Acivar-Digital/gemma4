@@ -1,86 +1,82 @@
-# 05. Executive Summary & External Consultant Review Packet
+# 05 — Executive Summary for External Consultants
 
-**Document Purpose:** This briefing packet contains the full technical context, architectural choices, data audit, and empirical constraints of the **Gemma 4 Developer Agent** project for external review and expert feedback.
-
----
-
-## 1. Executive Summary & Objective
-
-- **Competition:** Google Gemma 4 Developer Agent (Kaggle).
-- **Benchmark:** 129 hidden SWE-bench-style tasks across real Python repositories (FastAPI 67, Rich 48, Requests 13, HTTPX 1).
-- **Leaderboard Reality:**
-  - Solo Leader (Rank 1): **0.24** (Yurnero — 31/129 tasks).
-  - Dense Cluster (Ranks 2–20): **0.17 – 0.18** (22–23/129 tasks).
-  - Official Baseline / Public Starter: **0.08 – 0.12** (10–16/129 tasks).
-- **Core Diagnosis:** Pure declarative prompt and tool engineering tops out at **~0.17–0.18**. Un-finetuned Gemma 31B lacks domain familiarity with complex FastAPI lifespan protocols and Rich render hierarchies. To reach $\ge 0.20$ and contend for Rank 1, we must deploy a parameter-efficient adapter (**Track 2 LoRA**).
+**Competition**: Kaggle — *Gemma 4 Developer Agent* (SWE-bench style autonomous Python bug-fixing on 129 tasks across FastAPI, Rich, Requests, and HTTPX)  
+**Current Standing**: **`0.13` Verified Public Leaderboard Baseline** (Submission Ref `56883026`, Oct 6 — Track 1 adapter-less 5-skill single-agent monolith; outperforms the `0.08`–`0.12` public starter baselines). Top of leaderboard is `0.24` (`~31/129` tasks).  
+**Objective of This Review**: Validate our **Track 2 Rank-8 LoRA Supervised Fine-Tuning (SFT)** architecture on `google/gemma-4-31b-it-qat-w4a16-ct` (single 24 GB NVIDIA L4 GPU) to lift our verified `0.13` (`~17/129`) baseline into the `0.20`–`0.25+` (`26–32/129`) leaderboard tier without regressing tool-call syntax or triggering quantization/VRAM failures.
 
 ---
 
-## 2. Confirmed Technical Decisions (Non-Negotiable Baseline)
+## 1. Production Architecture Invariant: 5 Tools + 5 Skills (ZERO `run_command`)
 
-1. **Framework:** **Unsloth** for low-memory, fast PEFT training.
-2. **Base Model Checkpoint:** **`google/gemma-4-31B-it-qat-q4_0-unquantized`**
-   - *Rationale:* Must match the exact weight lineage of Kaggle's served model (`gemma-4-31b-it-qat-w4a16-ct`). Using BitsAndBytes NF4 is strictly forbidden because quantization scale mismatch previously caused a 0.00 score and 0-completion crash.
-3. **PEFT Configuration:**
-   - **Rank 8, Alpha 16** on attention projections only: **`q_proj`, `v_proj`, `o_proj`**.
-   - Freeze all MLPs (`gate_proj`, `up_proj`, `down_proj`) and `k_proj`.
-   - Resulting adapter size: **~18 MB** (clean, fast loading in vLLM).
-4. **Hardware Target:** Single **NVIDIA L4 GPU (24GB VRAM)** on Kaggle Compute or GCP.
+Our production agent (`submissions/track1_live/agent.yaml`) is a **single-agent monolith** (`name: main`, `model: gemma-4-31b-it-qat-w4a16-ct`) operating under a strict **40-tool-call task-global ceiling** (`eval_config.yaml`: `max_tool_calls: 40`, `max_time_seconds: 270`, `max_llm_turns: 100`).
 
----
-
-## 3. Negative Constraints (What We Will NOT Do & Why)
-
-1. **NO Heterogeneous / Multiple LLMs:** The Kaggle scoring container has zero internet connectivity and strictly serves one local vLLM instance of Gemma 31B across 4× L4 GPUs. Any router or secondary model is physically impossible.
-2. **NO Omitting `run_command` in the Agent:** Our earlier Track 1 v2 run scored 0.03 because omitting `run_command` stripped the agent of dynamic verification. The agent must have shell access to run `/tmp/repro.py`, `python -m py_compile`, and `pytest -k`.
-3. **NO Single-Turn Diff Datasets:** The SWE-Gemma harness is an interactive multi-turn ADK agent loop. The model must learn structured tool calling and observation parsing, not static markdown diffs.
-4. **NO Runaway Context / 16K Sequences on 1x L4:**
-   - A 31B 4-bit model takes ~16.5 GB base VRAM.
-   - At sequence length 16,384, activation memory exceeds 12 GB, causing guaranteed OOM on a 24GB L4 GPU.
-   - We cap sequence length at **3,072 tokens**, which leaves 5.2 GB of safe VRAM headroom.
-
----
-
-## 4. Empirical Data Audit (Current State of Training Data)
-
-We audited the existing SFT dataset in `training/sft_data/`:
-- **Volume:** **885 training samples** + **222 validation samples** (1,107 total decision windows).
-- **Token Lengths:** Min 665, **Median 1,162**, P90 1,686, Max 2,822 tokens.
-  - **100% of samples fit inside 3,072 tokens.**
-- **Repository Domain:** 50.7% FastAPI, 35.0% Rich, 14.2% Requests.
-- **Tool Invocations in Supervised Turns:**
-  - `run_skill_script`: 383 turns (64.3%)
-  - `read_file`: 113 turns (19.0%)
-  - `edit_file`: 66 turns (11.1%)
-  - `submit_patch`: 32 turns (5.4%)
-  - `run_command`: **0 turns (0.0%)**
-- **Data Origin:** Decision windows sliced from successful trajectories produced by LiteRouter proxy (`stealth/space-bunny-alpha`). This functions as **Teacher-Student Knowledge Distillation** into Gemma 31B.
+1. **Why Single-Agent Monolith**: The Google ADK SWE-Gemma harness enforces a single task-global `max_tool_calls` counter with zero per-subagent rationing. Sub-agent chains (`Scout -> Coder -> Breaker`) starve the budget before `edit_file` or `submit_patch` can run.
+2. **Direct Native Tools (5)**:
+   - `read_file` (150-line window; omit `end_line`)
+   - `edit_file` (exact line replacement)
+   - `write_file` (new file creation when required)
+   - `get_status` (100% FREE — 0 budget cost)
+   - `submit_patch` (100% FREE — final diff extraction)
+3. **Pre-Installed Structured Skills (5, invoked exclusively via `run_skill_script`)**:
+   - `fast-grep` (`file_path: "grep.py"`) — AST-aware token/regex search with 0-match fallback diagnostics.
+   - `code-map` (`file_path: "map.py"`) — AST call graph, class hierarchy, and file outline mapper.
+   - `code-oracle` (`file_path: "oracle.py"`) — isolated Python expression (`--eval`), ANSI/hex (`--hex`), terminal cell width (`--width`), HTML escaping (`--html-esc`), JSON Schema (`--schema`), and AST syntax (`--syntax`) verifier.
+   - `repro-check` (`file_path: "check.py"`) — isolated `/tmp` reproduction runner (`15s` process-group timeout, `1 GB` RAM guard, mandatory assertion verification, string/repr/hex/dict diff breakdown).
+   - `test-gate` (`file_path: "gate.py"`) — distance-1 neighbor regression `pytest` runner, read-only `git diff` viewer (`--diff`), and protected test-file guard (`--status`).
+4. **Why `run_command` is Withheld by Design**:
+   - Raw `run_command` (along with `get_code_neighbors`, `search_similar_code`, `get_code_subgraph`) is intentionally excluded from `agent.yaml`, `prompts/main.md`, and all SFT data.
+   - On 4-bit Gemma 4, raw shell commands cause three fatal failure modes: (a) 300-second full-repo `pytest` hangs (`exit 124`), (b) untracked scratch files in `/workspace` swept into `git add -N . && git diff HEAD` (corrupting the graded patch in Container B), and (c) multi-line bash heredoc JSON escaping crashes.
+   - **Empirical Proof**: Omitting `run_command` NEVER caused the historical `0.03` or `0.00` scores (`0` `run_command` errors across all 95 Kaggle cloud traces), and our locked `0.13` leaderboard baseline (`56883026`) uses this exact 5-tool + 5-skill (`0` `run_command`) architecture.
 
 ---
 
-## 5. Explicit Questions for External Consultants
+## 2. Forensic Provenance of All Historical Runs
 
-We request your review and guidance on the following four strategic questions:
+| Run / Submission ID | Date | Model Served | Adapter State | Score / Resolution | Verified Root Cause |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Kaggle Ref `56883026`** | Oct 6 | `gemma-4-31b-it-qat-w4a16-ct` (4x L4 vLLM) | **None** (Track 1 baseline) | **`0.13` Public LB** (`~17/129`) | **Locked Production Baseline**: 5 direct tools + 5 skills via `run_skill_script`, zero `run_command`, `temperature: 0.15, top_p: 0.9, max_output_tokens: 4096, thinking_budget: 2048, include_thoughts: true`. |
+| **Kaggle Ref `56765397`** | Oct 2 | `gemma-4-31b-it-qat-w4a16-ct` (4x L4 vLLM) | Early prototype | **`0.03` Public LB** (`~4/129`) | Early pre-hardening tree (`667472e`) prior to skill/prompt hardening and `repro-check` missing-assertion exit-code fix. |
+| **Kaggle Ref `56810465`** | Oct 4 | `gemma-4-31b-it-qat-w4a16-ct` (4x L4 vLLM) | **90 MB Broken LoRA** (`unsloth-bnb-4bit`) | **`0.00` Public LB** (`0/129`) | **Quantization Lineage + Template Mismatch**: Adapter trained on BitsAndBytes NF4 (`unsloth-bnb-4bit`) with Gemma 2/3 `<start_of_turn>` tags and mounted onto vLLM's `compressed-tensors` INT4 (`w4a16-ct`) engine. Caused immediate generation collapse (`111/129` tasks had `tool_calls == 0`, `77/95` traces had `0` completion tokens; `18/95` ran tool loops before server degradation). |
+| **Local `run_B39` / `run_B40`** | Oct 3–5 | `stealth/space-bunny-alpha` (LiteRouter proxy) | None | `56/129` (`43.4%`) / `50/77` (`64.9%`) | **Teacher Proxy Trajectories**: Executed on a frontier proxy model, **not** Gemma 4. Used strictly as a teacher corpus to distill 5-skill protocol trajectories. |
 
-### Question 1: Data Augmentation vs. Baseline Adapter
-The current 885 samples heavily emphasize `run_skill_script` (64.3%) and contain 0 turns of `run_command`. 
-- **Option A:** Train immediately on the existing 885 samples to establish a working v1 LoRA pipeline and measure validation loss.
-- **Option B:** Synthesize ~150–200 multi-turn trajectories demonstrating `run_command` (reproducing in `/tmp/repro.py`, checking syntax with `py_compile`, running `pytest -k`) and merge them before the first training run.
-- **Your recommendation?**
+---
 
-### Question 2: Learning Rate & Hyperparameter Tuning for 31B PEFT
-For a 31B base model using Rank 8 LoRA on attention projections across 885 high-density samples:
-- Is a learning rate of **`2e-4`** (with cosine decay to `2e-5` and 5% warmup) appropriate, or is **`1e-4`** safer to prevent degradation of Python syntax generation?
-- Are **2 to 3 epochs** (~220–330 optimization steps with effective batch size 8) optimal to avoid overfitting on 40 distinct tasks?
+## 3. Verified Gemma 4 SFT & LoRA Ground Truth (`models/gemma-4-31b-it-qat-w4a16-ct/`)
 
-### Question 3: Sequence Length & VRAM Trade-off
-We proved that on a single 24GB L4 GPU, training Gemma 31B with sequence length 16,384 will instantly OOM, whereas sequence length 3,072 consumes ~18.8 GB total and covers 100% of our training samples with zero truncation.
-- Do you agree with locking `max_seq_length = 3072` for the training phase, or should we push to `4096` with paged 8-bit AdamW?
+Direct inspection of the local competition checkpoint (`tokenizer.json`, `chat_template.jinja`, `config.json`, `model.safetensors`) established four critical engineering truths:
 
-### Question 4: vLLM LoRA Serving Quirks
-When Kaggle's evaluation runtime starts:
-```bash
-vllm serve google/gemma-4-31b-it-qat-w4a16-ct --enable-lora --lora-modules main_lora=/kaggle/working/submission/adapters/main_lora ...
-```
-- Are there known pitfalls in how vLLM handles LoRA adapters trained on `google/gemma-4-31B-it-qat-q4_0-unquantized`?
-- Specifically, does the tokenizer or chat template embedded in the adapter directory override or clash with the base model's native template?
+1. **Native Gemma 4 Control Tokens (`vocab_size = 262,144`)**:
+   - Turn delimiters are `<|turn>` (`105`) and `<turn|>` (`106`) — **Gemma 2/3 `<start_of_turn>` does not exist**.
+   - Reasoning delimiters are `<|channel>thought\n...<channel|>` (`<|channel>` = `100`, `<channel|>` = `101`, system header `<|think|>` = `98`) — **there is NO `<|thought|>` token in Gemma 4**.
+   - Tool calls use asymmetric tags `<|tool_call>` (`48`) and `<tool_call|>` (`49`) with unquoted sorted keys and `<|"|>` (`52`) string delimiters: `<|tool_call>call:run_skill_script{args:[<|"|>pattern<|"|>],file_path:<|"|>grep.py<|"|>,skill_name:<|"|>fast-grep<|"|>}<tool_call|><|tool_response>`.
+2. **Turn 2+ Prefix Asymmetry & Prefix-Delta Loss Masking (`chat_template.jinja:232-243, 381-390`)**:
+   - Gemma 4 keeps an entire multi-step tool loop inside a **single open `<|turn>model\n` block** without emitting `<turn|>` until the final text response.
+   - On Turn 1 (after `user`), `prefix_text` (`add_generation_prompt=True`) ends with `<|turn>model\n` and completion starts with `<|channel>thought\n`.
+   - On Turn 2+ (after `tool`), `chat_template.jinja:388` **already appends `<|channel>thought\n` to the end of `prefix_text`**! Therefore, `train_on_responses_only("<|turn>model\n")` fails on Turn 2+.
+   - **Solution**: Supervise each decision window via **Prefix-Delta Token Masking** (`labels = [-100] * len(prefix_ids) + full_ids[len(prefix_ids):]`) with `enable_thinking=True, preserve_thinking=True`, and enforce non-empty `reasoning` on every Turn 2+ target step (`assert full_text.startswith(prefix_text)`).
+3. **Dataset Remediation (`scripts/build_unsloth_dataset.py`)**:
+   - The current `885` train / `222` val windows (`100% <= 2,822` tokens, `0%` `run_command`, `64.3%` `run_skill_script`) suffer from 4 bugs: (a) Gemma 2/3 `<start_of_turn>` formatting, (b) `289/885` (`32.66%`) `target_tools: []` dead-thought rows teaching premature stopping, (c) `100%` `task_id` overlap between train and val (`40/40` tasks leaked), and (d) a 3-line stub system prompt instead of `submissions/track1_live/prompts/main.md`.
+   - Merging thought-only turns into the subsequent tool-calling turn's `reasoning` and dropping trailing orphans yields **`596` clean 100%-tool-calling windows**, split strictly by `task_id` (`34` train tasks / `6` val tasks = `0%` task leakage).
+4. **170-Module LoRA Geometry & Single-L4 VRAM (`20.31 GiB` Peak)**:
+   - Because the `10` global full-attention layers set `attention_k_eq_v=True` (`K=V`) and physically omit `v_proj`, targeting `["q_proj", "v_proj", "o_proj"]` (`r=8, lora_alpha=16`) adapts **`60 q_proj + 50 v_proj + 60 o_proj = 170` linear modules** (`340` LoRA A/B tensors, `18,124,800` trainable params = `34.57 MiB` BF16).
+   - At `max_seq_length=3072, batch_size=1, grad_accum=8, paged_adamw_8bit, eval_strategy="no"`, peak VRAM is **`20.31 GiB`** (`+2.18 GiB` headroom on a 24 GB L4). Setting `eval_strategy="steps"` materializes `[1, 3072, 262144]` FP32 logits (`+7.50 GiB`) and OOMs (`27.81 GiB > 22.494 GiB`).
+
+---
+
+## 4. Dossier Map & Specific Questions for Consultants
+
+### 4.1 Dossier Structure (`training/research_dossier/00`–`07`)
+- **`00_README_FOR_CONSULTANTS.md`**: Review charter, ground-truth invariants, and key questions.
+- **`01_SYSTEM_ARCHITECTURE_AND_HARNESS.md`**: Container A/B lifecycle, 5-tool + 5-skill contract, and 15-gate verification pipeline.
+- **`02_NEGATIVE_CONSTRAINTS.md`**: Hard physical, token, and tool boundaries (why `run_command` and sub-agents are forbidden).
+- **`03_DATA_AND_TRAJECTORY_ANALYSIS.md`**: 129-task Tier 1/2/3 stratification (`77` single-file target) and `885 -> 596` SFT window audit.
+- **`04_TRAINING_METHOD_AND_GPU_FEASIBILITY.md`**: `w4a16-ct` loading contract, 170-module LoRA math, and `20.31 GiB` L4 VRAM budget.
+- **`05_EXECUTIVE_SUMMARY_FOR_CONSULTANTS.md`**: This executive overview.
+- **`06_ESSENTIAL_CODE_AND_SAMPLES.md`**: Exact production configs, `build_unsloth_dataset.py` & notebook bug annotations, and replacement code.
+- **`07_INTERNAL_RESEARCH_FINDINGS.md`**: Deep technical reference of all verified Gemma 4 (`w4a16-ct`) tokenizer, Jinja, and safetensors invariants.
+
+### 4.2 Consultant Deliverables Requested (`Q1`–`Q4`)
+- **Q1 (Autograd on `compressed-tensors` `w4a16-ct` vs `q4_0-unquantized` Fallback)**: Verify whether any additional Triton/PEFT hook is needed when training LoRA directly on `pack-quantized` `compressed-tensors` in Unsloth, or if we should default immediately to the `q4_0-unquantized` twin with `base_model_name_or_path` rewrite.
+- **Q2 (Prefix-Delta Loss Masking & Thought Weighting)**: Validate our `build_supervised_step_sample()` prefix-delta masking on Turn 1 vs Turn 2+ and advise whether `<|channel>thought\n...<channel|>` tokens should receive full (`1.0`) cross-entropy weight or reduced weight relative to `<|tool_call>...<tool_call|><|tool_response>`.
+- **Q3 (Small-Sample Regularization on `596` Windows / `34` Train Tasks)**: Validate `r=8, lora_alpha=16, lr=1e-4, 1 epoch, max_grad_norm=0.3, neftune_noise_alpha=None` on `["q_proj", "v_proj", "o_proj"]` (`170` modules) to prevent overfitting to teacher repo identifiers while instilling strict 5-skill discipline.
+- **Q4 (Inference Sampling Interaction with LoRA)**: Advise whether `temperature: 0.15, top_p: 0.9, thinking_budget: 2048` should remain unchanged once the Rank-8 LoRA adapter is attached in vLLM.

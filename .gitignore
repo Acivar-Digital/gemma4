@@ -72,3 +72,8 @@ submission.zip
 
 # poll_state.sh runtime state (self-referential; must not dirty git status)
 .poll_state/
+
+# Dynamic tmux/VPS environment snapshot
+.vps_env.sh
+.tmux.conf
+tmux.sh
