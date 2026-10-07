@@ -25,8 +25,8 @@ All three external consultants and our internal research pool reached **100% una
 
 | Dimension | Internal Audit (`07`) | Consultant 1 | Consultant 2 | Consultant 3 | **Unified Decision** |
 |---|---|---|---|---|---|
-| **Chat Template** | Native `<|turn>`, `<|thought>`, `<|tool_call>`, `<tool_call|>` | Rewrite template, mask `<|turn>model\n` | Native asymmetric tokens, merge thought+tool | Exact prefix-delta masking with precomputed labels, `<|tool_response>` stop cue | **Consultant 3 Prefix-Delta Masking** (Byte-identical to vLLM serving template) |
-| **Base Checkpoint** | `q4_0-unquantized` (Path A) or `w4a16-ct` (Path B) | Direct `w4a16-ct` via `Int4PackedLinear` / `compressed-tensors` | Direct `w4a16-ct` via Unsloth Triton kernels | Two-track: `w4a16-ct` for final, `q4_0` for smoke test | **Direct `w4a16-ct` Primary**; fail-loud assertions rejecting NF4/BnB |
+| **Chat Template** | Native `<|turn>`, `<|thought>`, `<|tool_call>`, `<tool_call|>` | Rewrite template, mask `<|turn>model\n` | Native asymmetric tokens, merge thought+tool | Exact prefix-delta masking with precomputed labels, `<|tool_response>` stop cue | **Consultant 3 Prefix-Delta Masking** with `<|channel>thought\n...<channel|>` (Gemma 4 has no `<|thought>` token) |
+| **Base Checkpoint** | `q4_0-unquantized` (Path A) or `w4a16-ct` (Path B) | Direct `w4a16-ct` via `Int4PackedLinear` / `compressed-tensors` | Direct `w4a16-ct` via Unsloth Triton kernels | Two-track: `w4a16-ct` (`load_in_4bit=False`) for final, `q4_0` (`load_in_4bit=True`) for smoke test | **Direct `w4a16-ct` (`load_in_4bit=False`) Primary**; fail-loud assertions rejecting NF4/BnB |
 | **LoRA Targets** | `q_proj, v_proj, o_proj` | `q_proj, k_proj, v_proj, o_proj` | `q_proj, v_proj, o_proj` | `q_proj, v_proj, o_proj` (strictly no `k_proj` or MLPs) | **`q_proj, v_proj, o_proj` (Rank 8, $\alpha=16$)**; omit `k_proj` to protect base syntax |
 | **Max Sequence Length** | 3072 (100% data fits; +2.18GB L4 headroom) | 3072 | 3072 | 3072 | **Locked: 3072** |
 | **Evaluation Strategy** | `eval_strategy = "no"` (avoid 262K logits OOM) | `eval_strategy = "no"` | `eval_strategy = "no"` | `eval_strategy = "no"` (post-training chunked eval) | **Locked: `eval_strategy = "no"`** |
@@ -101,14 +101,13 @@ def render_supervised_decision_window(
     }
 ```
 
-#### Special Token Contract
-- Turn delimiters: `<|turn>user\n...<turn|>` and `<|turn>model\n...<turn|>`
-- Reasoning block: `<|channel>thought\n...<channel|>` (or `<|thought>\n...<thought|>`)
-- Tool call delimiters (asymmetric): `<|tool_call>call:{fn_name}{args}<tool_call|>`
-- Tool response cues: `<|tool_response>response:{fn_name}{result}<tool_response|>`
+#### Special Token Contract (Verified against `models/gemma-4-31b-it-qat-w4a16-ct/tokenizer.json`)
+- Turn delimiters: `<|turn>user\n...<turn|>` (token 105 / 106) and `<|turn>model\n...<turn|>`
+- Reasoning block: `<|channel>thought\n...<channel|>` (token 100 `soc_token`, token 101 `eoc_token`). **Note:** Gemma 4 has NO `<|thought>` token in its 262,144 vocabulary; reasoning is expressed strictly as a channel named `thought`.
+- Tool call delimiters (asymmetric): `<|tool_call>call:{fn_name}{args}<tool_call|>` (token 48 / 49)
+- Tool response cues: `<|tool_response>response:{fn_name}{result}<tool_response|>` (token 50 / 51)
 - **Intermediate Tool-Call Stop Cue:** Intermediate assistant turns terminate with `<|tool_response>`, triggering the runtime tool executor. The tool output itself belongs to the subsequent context and is **strictly masked** (`-100`).
 - **Final Non-Tool Response:** Supervised through `<turn|>`.
-
 ### 2.2 Base Model Loading & QAT Integrity (1× 24GB L4)
 To avoid the NF4 remapping that destroyed model performance on Oct 4:
 
@@ -125,14 +124,15 @@ model, tokenizer = FastModel.from_pretrained(
     model_name=MODEL_NAME,
     max_seq_length=3072,
     dtype=torch.bfloat16,
-    load_in_4bit=True,              # Triggers Unsloth Int4PackedLinear Triton kernel
+    load_in_4bit=False,             # CRITICAL: w4a16-ct is ALREADY pack-quantized compressed-tensors.
+                                    # Passing load_in_4bit=True causes ValueError or BnB collision!
+                                    # (Reserve load_in_4bit=True strictly for unquantized q4_0 fallback).
     load_in_8bit=False,
     full_finetuning=False,
     use_exact_model_name=True,      # CRITICAL: Blocks unsloth/mapper.py fallback to BnB NF4
     text_only=False,                # CRITICAL: Retains .language_model. keys for vLLM
     trust_remote_code=False,
 )
-
 # Fail-loud assertions
 config_str = str(model.config).lower()
 assert "bnb" not in config_str, "FATAL: BitsAndBytes detected in base model!"
