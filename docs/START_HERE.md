@@ -40,7 +40,7 @@ the harness' `compile_submission`. There is no `agent.py`.
   117 of 129 predictions were empty.
 - **The gates do not cover this.** `scripts/preflight_check.py` runs 8 real
   checks and never opens `sampling.yaml`.
-  `scripts/verify_submission.py` reads `agent.yaml` from the *directory* while
+  The legacy packaging check read `agent.yaml` from the *directory* while
   reading `adapters/` from the *zip* — so an adapter present in one and absent
   from the other passes the gate and silently serves the base model.
 - **The graded artifact is `submission.zip`, not `my_submission/`.** Three
@@ -66,7 +66,7 @@ strong model does into Gemma 4 via LoRA SFT. Roughly two months of runway.
 | `docs/FINDINGS.md` | evidence store, F1-F11, each with a `file:line` |
 | `docs/0*.md` | numbered context docs (constraints, failure modes, verify protocol) |
 | `scripts/preflight_check.py` | current gate — 8 checks, **no config/serving layer** |
-| `scripts/verify_submission.py` | packaging gate — **wrong artifact for most checks** |
+| legacy packaging check (deleted) | packaging gate — **wrong artifact for most checks** |
 | `scripts/build_kaggle_kernel.py` | builds the Kaggle notebook; contains the silent-failure code |
 | `cloud_results/` | the only real Gemma 4 artifacts |
 | `adapters_staging/`, `checkpoints/` | LoRA weights; **not** in the submission |

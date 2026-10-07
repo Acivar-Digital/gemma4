@@ -18,7 +18,7 @@ Three independent causes, each verified:
 | Cause | Evidence |
 |---|---|
 | **Preflight checked the wrong layer.** 8 real checks (module imports, 124 wheels, compilation, sandbox pytest, snapshot pytest, live diagnostics) and **zero** references to `max_output_tokens`, `thinking_config`, `adapter`, `lora`, `sampling.yaml`. It never opens the file that broke. | `scripts/preflight_check.py` — no `import yaml` anywhere |
-| **Packaging gate checked the wrong artifact.** `verify_submission.py:59` reads `agent.yaml` from `my_submission/`; `:62` reads `adapters/` from the zip; `:105/:117/:136` all read the directory. An adapter injected into the directory but absent from the zip **passes the gate** and silently serves the base model. | `scripts/verify_submission.py:48-136` |
+| **Packaging gate checked the wrong artifact.** Legacy packaging check (:59) read `agent.yaml` from `my_submission/`; `:62` read `adapters/` from the zip; `:105/:117/:136` all read the directory. An adapter injected into the directory but absent from the zip **passed the gate** and silently served the base model. | Legacy packaging check (deleted) |
 | **The kernel was written to swallow the exact errors we needed.** `litellm.drop_params = True` discards unrecognised params instead of erroring; `except Exception` at cell_3 converts every per-task fault to a printed line never written to `task_results.jsonl`; `MODEL_PATH.exists()` is printed but never asserted; the full-eval kernel has **no adapter mount step and no adapter print**. | `scripts/build_kaggle_kernel.py:149`, `:153-157`, `:288` |
 
 A lesson was written down and lost anyway: `gotcha-litellm-reasoning-effort-rejection`
@@ -90,7 +90,7 @@ useless by construction.
 5. `.DS_Store`/`._*`/`.pyc`/`__pycache__` count == 0 in the zip.
 6. **Unpacked** total < 3 GiB (README:134). Today's gate uses
    `ZIP_PATH.stat().st_size` — the *compressed* size — against a 3072 MB
-   threshold (`verify_submission.py:78-79`). Wrong metric, and the message even
+   threshold (legacy packaging check :78-79). Wrong metric, and the message even
    prints "< 3 GiB". Fix to sum the unpacked entry sizes.
 7. `max_file_count <= 10000`, `max_yaml_files <= 1000`, YAML <= 50 MiB,
    skill dir <= 50 MiB (README:135-138).
@@ -184,7 +184,7 @@ new scripts. The design constraint is therefore:
 - **G1/G2/G4 require nothing.** They run anywhere, in under 4 seconds total.
   They are the ones that must always run.
 - **Reuse, do not rewrite**: `preflight_check.py` keeps its 6 checks as a
-  sub-suite invoked by G2; `verify_submission.py`'s correct checks are folded in
+  sub-suite invoked by G2; legacy packaging check's valid checks are folded in
   rather than duplicated. Net new files: 4, not 10.
 - **One report format** (JSON) written to `artifacts/gate_report.json` so runs
   are diffable across time.

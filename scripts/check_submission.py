@@ -1067,7 +1067,7 @@ def g_sampling_output_cap(policy: Dict[str, Dict[str, Any]]) -> GateResult:
 def g_submission_size_unpacked(policy: Dict[str, Dict[str, Any]]) -> GateResult:
     """Total UNPACKED size of the zip vs policy max_unpacked_mb.
 
-    The known defect is verify_submission.py computing size from the COMPRESSED
+    The known defect in the legacy packaging check was computing size from the COMPRESSED
     file and printing '< 3 GiB'; HARNESS_README sets the limit on UNPACKED
     total. We compute from the zip's member file_size, not ZIP_PATH.stat().
     If the zip is absent, WARN (nothing to measure yet) rather than crash.

@@ -240,7 +240,7 @@ Follow the **Track 2 Promotion Gate**:
    bash scripts/submit_safe.sh             # gate -> pack -> gate -> hash -> quota -> prompt
    ```
    Thresholds live in `scripts/gate_policy.yaml`; the gate inventory is `scripts/check_submission.py`.
-   `scripts/verify_submission.py` was **deleted** — it read the wrong artifact for most checks,
+   The legacy packaging check script was **deleted** — it read the wrong artifact for most checks,
    measured the compressed size against the unpacked limit, and hard-coded a 50-call assertion
    the submission does not satisfy.
 

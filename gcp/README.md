@@ -178,7 +178,7 @@ Before mounting any newly trained LoRA adapter into the production submission:
      bash scripts/submit_safe.sh --dry-run   # gates only; packs and submits nothing
      bash scripts/submit_safe.sh             # gate -> pack -> gate -> hash -> quota -> prompt
      ```
-     `scripts/verify_submission.py` was deleted; `scripts/submit_safe.sh` +
+     The legacy packaging check script was deleted; `scripts/submit_safe.sh` +
      `scripts/check_submission.py` replaced it.
 
 ---
