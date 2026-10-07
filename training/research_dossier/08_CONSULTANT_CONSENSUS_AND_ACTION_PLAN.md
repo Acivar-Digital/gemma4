@@ -101,13 +101,15 @@ def render_supervised_decision_window(
     }
 ```
 
-#### Special Token Contract (Verified against `models/gemma-4-31b-it-qat-w4a16-ct/tokenizer.json`)
-- Turn delimiters: `<|turn>user\n...<turn|>` (token 105 / 106) and `<|turn>model\n...<turn|>`
-- Reasoning block: `<|channel>thought\n...<channel|>` (token 100 `soc_token`, token 101 `eoc_token`). **Note:** Gemma 4 has NO `<|thought>` token in its 262,144 vocabulary; reasoning is expressed strictly as a channel named `thought`.
-- Tool call delimiters (asymmetric): `<|tool_call>call:{fn_name}{args}<tool_call|>` (token 48 / 49)
-- Tool response cues: `<|tool_response>response:{fn_name}{result}<tool_response|>` (token 50 / 51)
-- **Intermediate Tool-Call Stop Cue:** Intermediate assistant turns terminate with `<|tool_response>`, triggering the runtime tool executor. The tool output itself belongs to the subsequent context and is **strictly masked** (`-100`).
-- **Final Non-Tool Response:** Supervised through `<turn|>`.
+#### Special Token & Canonical `chat_template.jinja` Contract (Verified against `models/gemma-4-31b-it-qat-w4a16-ct/`)
+- **Control Token IDs (`tokenizer.json`):** `<|tool>` (46), `<tool|>` (47), `<|tool_call>` (48), `<tool_call|>` (49), `<|tool_response>` (50), `<tool_response|>` (51), `<|"|>` (52, `escape_token`), `<|think|>` (98, `think_token`), `<|channel>` (100, `soc_token`), `<channel|>` (101, `eoc_token`), `<|turn>` (105, `sot_token`), `<turn|>` (106, `eot_token`).
+- **1. System Thinking Header (`<|think|>\n`):** When `enable_thinking=True`, `chat_template.jinja` (lines 193–196) injects `<|think|>\n` (token 98) at the very top of `<|turn>system\n` before the system prompt and `<|tool>` declarations. When `enable_thinking=False` (line 385), it injects an empty `<|channel>thought\n<channel|>` block to suppress reasoning.
+- **2. Single-Turn Multi-Step Continuation & Turn 1 vs. Turn 2+ Prefix Asymmetry:** Gemma 4 keeps an entire multi-step tool loop inside a **single** open `<|turn>model\n` turn (`continue_same_model_turn`, lines 232–236) without closing `<turn|>`. On **Turn 1** (after `user`), `prefix_text` ends with `<|turn>model\n` and `completion_text` starts with `<|channel>thought\n...`. On **Turn 2+** (after `tool`), `prefix_text` **already ends with `<tool_response|><|channel>thought\n`** (line 388), so `completion_text` starts directly with the thought text (`Now I see...\n<channel|>`). String-matching `train_on_responses_only("<|turn>model\n")` fails completely on Turn 2+; Consultant 3's `full_text[len(prefix_text):]` delta handles both cases automatically.
+- **3. `strip_thinking()` Trap on `message["content"]`:** `chat_template.jinja` (lines 156–166, 326) runs `strip_thinking(message["content"])` on assistant messages, deleting any `<|channel>...<channel|>` placed in `content`. Reasoning **must** be passed in `message["reasoning"]` or `message["reasoning_content"]` (line 239).
+- **4. Structured Argument Syntax (`<|"|>` & Unquoted Keys, Dict Input Required):** Tool arguments are **not** formatted as standard JSON strings. `chat_template.jinja` (lines 124–155, 248–264) requires `tool_calls[].function.arguments` to be a Python `dict` (raising a Jinja exception if passed as a JSON string) and formats keys unquoted in alphabetical order (`dictsort`) with string values wrapped in token 52 (`<|"|>`): `<|tool_call>call:read_file{path:<|"|>app.py<|"|>}<tool_call|>`.
+- **5. Intermediate Stop Cue (`<|tool_response>`) vs. Final Stop Cue (`<turn|>\n`):** Assistant turns that emit a tool call terminate with `<|tool_response>` (token 50, line 370), triggering the runtime tool executor. Tool outputs (`response:fn_name{...}<tool_response|>`) belong to the subsequent context and are **strictly masked** (`-100`). Only the final non-tool response closes with `<turn|>\n` (token 106, line 373).
+- **6. `preserve_thinking` Across User Turns:** `chat_template.jinja` (line 240) strips historical assistant thoughts prior to the last `user` message unless `preserve_thinking=True`. If a trajectory contains a mid-run user/harness nudge, pass `preserve_thinking=True` consistently in both `prefix_text` and `full_text`.
+
 ### 2.2 Base Model Loading & QAT Integrity (1× 24GB L4)
 To avoid the NF4 remapping that destroyed model performance on Oct 4:
 
