@@ -51,14 +51,25 @@ def render_supervised_decision_window(
     messages: list[dict],
     target_index: int,
     tools: list[dict],
-    enable_thinking: bool = True
+    enable_thinking: bool = True,
+    preserve_thinking: bool = True,
 ) -> dict:
     """
     Renders context + target assistant turn using Gemma 4 native templates.
     Masks all prompt tokens with -100, supervising strictly the target completion.
     """
     context = messages[:target_index]
-    target = messages[target_index]
+    target = dict(messages[target_index])
+    
+    # CRITICAL (Turn 2+ Prefix Invariant): When enable_thinking=True, chat_template.jinja:388
+    # unconditionally appends '<|channel>thought\n' to prefix_text after a tool_response,
+    # whereas line 241 only emits '<|channel>thought\n...<channel|>' in full_text if
+    # reasoning/reasoning_content is non-empty! Ensure non-empty reasoning on all target steps.
+    if enable_thinking and not (target.get("reasoning") or target.get("reasoning_content")):
+        raise ValueError(
+            f"Target turn {target_index} has empty reasoning/reasoning_content with enable_thinking=True; "
+            "this violates chat_template.jinja Turn 2+ prefix invariant!"
+        )
     
     # 1. Render prompt prefix with generation prompt open
     prefix_text = tokenizer.apply_chat_template(
@@ -67,6 +78,7 @@ def render_supervised_decision_window(
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=enable_thinking,
+        preserve_thinking=preserve_thinking,
     )
     
     # 2. Render full text including target assistant completion
@@ -76,6 +88,7 @@ def render_supervised_decision_window(
         tokenize=False,
         add_generation_prompt=False,
         enable_thinking=enable_thinking,
+        preserve_thinking=preserve_thinking,
     )
     
     if not full_text.startswith(prefix_text):
@@ -144,8 +157,8 @@ assert getattr(model.config, "torch_dtype", None) in (torch.bfloat16, "bfloat16"
 
 ### 2.3 LoRA Hyperparameters & Capacity Control
 We reject adding `k_proj` (proposed by Consultant 1) and agree with Consultant 3 and our Internal Audit:
-- Gemma 4 has 10 layers with `attention_k_eq_v=True` (no distinct `k_proj` tensor).
-- Adapting `k_proj` unnecessarily expands parameter count and risks disturbing base syntactic representations.
+- Gemma 4 has 10 full-attention layers with `attention_k_eq_v=True`, where keys are reused as values (`K=V`) and there is **no `v_proj` tensor** (`60 q_proj + 50 v_proj + 60 o_proj = 170` modules / `340` LoRA tensors).
+- Adapting `k_proj` on those 10 shared K/V layers simultaneously perturbs both attention keys and values, expanding parameter count (+22.6%) and risking base syntactic representation drift.
 - We reject `neftune_noise_alpha=5` because adding noise to embedding tokens corrupts strict JSON tool-call schema formatting.
 
 ```python
