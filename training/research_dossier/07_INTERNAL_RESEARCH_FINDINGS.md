@@ -31,11 +31,14 @@ Below are the empirical findings across **Method** and **Data**.
 - **Architecture:** Gemma 4 31B has 60 layers (50 sliding-attention layers + 10 full-attention layers where `attention_k_eq_v=True`, meaning those 10 layers have no `v_proj` tensor).
 - **Trainable Parameters (`r=8` on `q_proj, v_proj, o_proj`):** Exactly **18,124,800 parameters** (34.57 MiB in BF16; 340 weight tensors across 170 modules).
 - **Overfitting Ratio:** In the current 885-sample dataset, there are only **90,853 supervised assistant tokens** (~200.8 trainable parameters per supervised token). Training for $>1$ epoch over 22.1× repeated task windows rapidly memorizes the 40 task prompts.
-- **Recommended Schedule:**
-  - `max_seq_length = 3072` (covers 100% of $\le 2,822$-token windows; ~18.8 GB peak VRAM on 24GB L4, leaving 5.2 GB headroom).
-  - `per_device_train_batch_size = 1`, `gradient_accumulation_steps = 8` (effective batch size 8).
-  - `learning_rate = 1e-4` (safer than `2e-4` for preserving base Python syntax), `lr_scheduler_type = "cosine"`, `warmup_ratio = 0.05`, `weight_decay = 0.05`, `lora_dropout = 0.05`.
-  - **1.0 to 1.5 epochs** (~85–130 optimization steps; remove the `max_steps=25` truncation bug).
+- **Recommended Schedule & OOM Guards on 1× 24GB L4 (22.494 GiB ECC Usable):**
+  - `max_seq_length = 3072`: Covers 100.0% of $\le 2,822$-token windows (`0%` data loss vs `4096`). Peak VRAM is **20.31 GiB** (17.77 GiB static base incl. 1.07 GiB vision tower + 0.21 GiB LoRA/optimizer + 1.51 GiB Unsloth dynamic workspace + 0.85 GiB CUDA reserve), leaving **+2.185 GiB safety headroom**. Because Gemma 4 uses proportional RoPE (`max_position_embeddings = 262,144`) and LoRA only touches linear `q, v, o` projections, training at `S=3072` does **not** restrict vLLM's `32,768` context window at inference time.
+  - **`eval_strategy = "no"` During Training (Critical 262K-Vocab OOM Trap):** Gemma 4 has `vocab_size = 262,144`. Unsloth bounds training cross-entropy to `287.5 MiB` via Triton chunked CE, but `eval_strategy = "steps"` (`eval_steps = 5` in `train_gemma4_lora_minimal.ipynb`) invokes standard HF evaluation, materializing full `[1, 3072, 262144]` logits (`7.50 GiB`) and **guaranteeing OOM at step 5**. Run validation post-training or with chunked loss only.
+  - `PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"`: Set before `import torch` to prevent block fragmentation across variable-length (665–2,822 token) windows.
+  - `per_device_train_batch_size = 1`, `gradient_accumulation_steps = 8` (effective batch size 8; ~1,560 supervised response tokens/step).
+  - `optim = "paged_adamw_8bit"`: Saves 103 MiB over FP32 AdamW (`35.11 MiB` total) and uses CUDA unified-memory paging (`cudaMallocManaged`) to page optimizer states to CPU RAM if a transient spike hits the L4 ceiling.
+  - `learning_rate = 1e-4` (with `lora_alpha = 16, r = 8`, effective scaling $\alpha/r = 2.0$; `2e-4` shifts pre-activations outside the QAT `group_size=32` observer clip range), `lr_scheduler_type = "cosine"`, `warmup_ratio = 0.08`, `weight_decay = 0.01`, `lora_dropout = 0.0`, `packing = False`.
+  - **1.0 to 2.0 epochs** (~110–220 optimization steps; remove the `max_steps = 25` truncation bug).
 
 ### 4. vLLM Adapter Packaging Contract
 - **Exclude All Tokenizer Files:** Do **NOT** call `tokenizer.save_pretrained(ADAPTER_DIR)`.
@@ -45,7 +48,6 @@ Below are the empirical findings across **Method** and **Data**.
 - **Sanitize `adapter_config.json`:**
   - `base_model_name_or_path`: `"google/gemma-4-31b-it-qat-w4a16-ct"`
   - `target_modules`: `["q_proj", "v_proj", "o_proj"]` (clean JSON list, never regex string; if Unsloth uses a regex internally to exclude vision layers, convert or post-filter vision tensors before saving).
-
 ---
 
 ## Part 2: How to Make LoRA Training Effective via DATA
