@@ -1,7 +1,7 @@
 # Workplan — Gemma 4 Developer Agent: Error Taxonomy & Isolation Sequence
 
-**Created:** 2026-10-05
-**Status:** ACTIVE
+**Created:** 2026-10-05 | **Updated:** 2026-10-08
+**Status:** ACTIVE (Track 1 Locked at 0.13; Track 2 Master Plan in §7 — Epic `gemma4-wzlk`)
 **Rule:** one variable per submission. No bundling. Execution is user-only via `./start.sh`.
 
 ---
@@ -19,8 +19,8 @@ Section 1 predates it and is partly superseded by C5.**
 | Submission `56765397` → **0.03** | 2026-10-02 04:10 | **HAD** `thinking_level: 2` |
 | Commit `bfc0614` removes `thinking_level` | 2026-10-03 11:31 | — |
 | Submission `56810465` → **0.00** | 2026-10-04 00:51 | **DID NOT have it** (never re-added) |
-| **Submission `56883026` → PENDING** | **2026-10-06 14:21** | **Track 1 verified adapter-less baseline** (sha256 `10e32ceb...`) |
-| **Kernel `francisclyap/gemma4-eval-40calls` → QUEUED** | **2026-10-06 14:20** | **Kaggle Compute diagnostic notebook** (197 KB, 6 fail-loud guards) |
+| **Submission `56883026` → ✅ COMPLETED (Scored 0.13)** | **2026-10-06 14:21** | **Track 1 verified adapter-less baseline LOCKED** (`configs/baseline_registry.json`, sha256 `10e32ceb...`) |
+| **Kernel `francisclyap/gemma4-eval-40calls` → ✅ COMPLETED** | **2026-10-06 14:20** | **Kaggle Compute diagnostic notebook** (197 KB, 6 fail-loud guards) |
 The 0/129 diagnosis and the 0.00 score come from **different trees**. Any sentence that treats
 them as one measurement is wrong.
 
@@ -141,15 +141,15 @@ Measured from `cloud_results/results/traces/` (95 traces, real Gemma 4 per `mode
 - **Read:** the agent searches far more than it commits. The mandatory Turns 1–10 discovery window in `prompts/main.md:68` is a likely contributor.
 - **Fixable?** Yes — prompt-side. This is the only genuinely behavioural defect in the table.
 
-### E4 — LoRA/Track 2 poisoned training data — **OURS, HARD NO-GO**
+### E4 — LoRA/Track 2 poisoned training data — **OURS, HARD NO-GO [✅ RESOLVED / SUPERSEDED 2026-10-08 IN §7 PHASE 1]**
 - **Evidence:** three independent fatal defects (`decision-track2-no-go`):
   1. **Tokenizer:** `build_unsloth_dataset.py:319` emits `<|tool_call|>` on both sides; staged tokenizer wants asymmetric pair. All 1,107 rows malformed.
   2. **Provenance:** 100% rows distilled from `space-bunny-alpha`, never Gemma 4.
   3. **No error filter:** `compact_observation` keeps failures verbatim → ≥166/306 rows train on pytest FAILED output.
   - Plus: served base is QAT INT4, inference-only — not a supported fine-tuning target.
-- **Status:** adapter NOT shipped (verified: no `adapters/` in `submission.zip`). Blocked.
+- **Status:** adapter NOT shipped in Track 1 (verified: no `adapters/` in `submission.zip`). **[✅ RESOLVED 2026-10-08: Rebuilt `scripts/build_unsloth_dataset.py` with official Gemma 4 `chat_template.jinja`, 0% `space-bunny-alpha` local `run_B*` traces, 0% `tasks.jsonl` benchmark overlap, and 100% resolved external Source B trajectories (`swe_smith`, `swe_rebench`, `swe_zero`). See §7 Phase 1.]**
 
-### E5 — Adapter obligation coupled to submission mode — **FIXED, SHIPPED**
+### E5 — Adapter obligation coupled to submission mode — **FIXED, SHIPPED [✅ COMPLETED]**
 - **Evidence:** `local_test` was the effective pack-time mode and FAILed any declared adapter; would have blocked Track 2 packaging.
 - **Status:** fixed via policy scalar `adapter.required`, commit `665d352`, pushed. Tests pass (87).
 
@@ -248,10 +248,10 @@ Textualize/rich   AAAAAAAAAAAAAAAAABAAAAABAAAA…BBBBBBBB    → 34 A, 14 B, 0 D
 
 | # | Variable | Isolates | Status |
 |---|---|---|---|
-| **T1** | baseline, adapter-less | **E1 / Base Gemma 4** | **DISPATCHED 2026-10-06 — Leaderboard ref `56883026` & Kernel `gemma4-eval-40calls`** |
-| ~~T2~~ | `include_thoughts: false` | E2 | **REVOKED** — premise refuted (3.506× vs 0.35×) |
-| ~~T3~~ | relax Turns 1–10 window | E3 | **DEFERRED** — wrong-fix, not search-loop |
-| **T4** | LoRA Upgrade (Unsloth on `qat-q4_0-unquantized`) | Target: 77 Tier-1 tasks | **PLANNED FOR TOMORROW** — gated on baseline score landing |
+| **T1** | baseline, adapter-less | **E1 / Base Gemma 4** | **✅ COMPLETED (2026-10-06)** — Leaderboard ref `56883026` scored **0.13**; locked as Track 1 Baseline (`configs/baseline_registry.json`) |
+| ~~T2~~ | `include_thoughts: false` | E2 | **❌ DROPPED / REVOKED** — premise refuted (3.506× vs 0.35×); thinking (`4096`) retained |
+| ~~T3~~ | relax Turns 1–10 window | E3 | **🔄 SUPERSEDED** — superseded by locked Track 1 `0.13` prompt governor and Track 2 LoRA SFT (§7) |
+| ~~T4 (old)~~ | LoRA Upgrade on 77 Tier-1 tasks | Target: 77 Tier-1 tasks | **🔄 DROPPED / SUPERSEDED BY §7** — training on 77 Tier-1 tasks from `tasks.jsonl` (local `run_B*`) was **DROPPED** due to test-set benchmark leakage; superseded by Zero-Leakage External Source B SFT (§7) |
 
 **T1 dispatched (2026-10-06):** verified by 15 automated submission quality gates (`python3 scripts/check_submission.py`),
 14 PASS / 0 gating FAIL. Package `submission.zip` = **124,196 bytes**, SHA-256 **`10e32ceb9b2ca6bf40b40c485d9279e837a1e4ce67fa2f4df5c3fcb5e4bc4a83`**,
@@ -259,9 +259,9 @@ strictly adapter-less, 0 stray weights.
 
 **Diagnostic Kernel dispatched (2026-10-06):** `francisclyap/gemma4-eval-40calls` (197 KB, 5 cells, 6 fail-loud runtime guards).
 
-**Next Action (Tomorrow):**
-1. Read graded public score from ref `56883026` and runtime trace metrics from kernel `francisclyap/gemma4-eval-40calls`.
-2. Once pure base resolution rate is confirmed, execute Track 2 LoRA fine-tuning using Unsloth on `google/gemma-4-31B-it-qat-q4_0-unquantized` trained exclusively on the 77 Tier 1 task trajectories.
+**Next Action (Historical 2026-10-06 — Preserved with Status):**
+1. **[✅ COMPLETED]** Read graded public score from ref `56883026` (**Scored 0.13** on Public Leaderboard; locked in `configs/baseline_registry.json`) and runtime trace metrics from kernel `francisclyap/gemma4-eval-40calls`.
+2. **[❌ DROPPED / 🔄 SUPERSEDED BY §7]** ~~Once pure base resolution rate is confirmed, execute Track 2 LoRA fine-tuning using Unsloth on `google/gemma-4-31B-it-qat-q4_0-unquantized` trained exclusively on the 77 Tier 1 task trajectories.~~ *(Dropped training on the 77 Tier-1 benchmark tasks / local `run_B*` traces because they are evaluations on the 129 `tasks.jsonl` benchmark tasks and would leak the test set into SFT. Superseded by the Zero-Leakage External Source B Track 2 Master Plan in Section 7 below.)*
 
 **Why T1 dominates — REWRITTEN after C5.** The argument is **not** "E1 is 89% of tasks": E1's
 mechanism is refuted (C5), so we cannot lean on its share. The argument is that **no post-Oct-1
@@ -317,3 +317,125 @@ Agents must NOT run evaluations. `AGENTS.md`: execution is exclusively the user'
 - **T3:** edit-conversion improves on the 5.6:1 baseline → prompt is a real lever.
 
 Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurrence from behavioural failure. **Verify the field exists first** (see Correction log).
+
+
+---
+
+## 7. Track 2 LoRA Master Plan (2026-10-08 — Active Workplan, Epic `gemma4-wzlk`)
+
+**References:**
+- **Beads Epic:** `gemma4-wzlk` (`bd show gemma4-wzlk`)
+- **Beads Persistent Memory:** `track-2-lora-master-plan-logged-in-bd`, `planning-mode-rule-when-planning-with-the-user`
+- **Deep Research Engineering Specification:** `/home/vps466a/services/agy-agents/deep-research/reports/Gemma4_Unsloth_LoRA_Adapter_Settings_Eng_20261008_1303.md` (918 lines)
+
+### 7.1 Activity Status Ledger (Historical & Current)
+
+| Activity / Milestone | Status | Outcome / Notes |
+|---|---|---|
+| **Track 1 Adapter-less Baseline (`56883026`)** | ✅ **COMPLETED** | Scored **0.13** on Public Leaderboard; locked in `configs/baseline_registry.json` (`sha256: 10e32ceb...`). |
+| **16-Gate Submission & Proxy Eval Shield** | ✅ **COMPLETED** | `scripts/check_submission.py` (14 veto gates + 2 hygiene/health checks) and `scripts/baseline_gate.py` active. |
+| **T2 (`include_thoughts: false` ablation)** | ❌ **DROPPED / REVOKED** | Premise refuted by 3.506× token growth measurement on cloud traces. |
+| **T3 (Turns 1–10 prompt window relaxation)** | 🔄 **SUPERSEDED** | Superseded by locked 0.13 baseline governor and Track 2 LoRA fine-tuning. |
+| **Old T4 (LoRA SFT on 77 Tier-1 / 223 `run_B*` local traces)** | ❌ **DROPPED / SUPERSEDED** | **Dropped** because `run_B*` traces are evaluations on the 129 `tasks.jsonl` benchmark tasks (test-set leakage + `space-bunny-alpha` proxy provenance). Superseded by External Source B SFT below. |
+| **Track 2 Prep A: External Source B Dataset Download** | ✅ **COMPLETED** | Downloaded 14.31 GB across 79 Parquet shards in `data/source_b/` (`swe_smith` 1.00 GB, `swe_rebench` 1.94 GB, `swe_zero` 11.37 GB). |
+| **Track 2 Prep B: Deep Research Engineering Spec** | ✅ **COMPLETED** | Completed 5-persona engineering report (`Gemma4_Unsloth_LoRA_Adapter_Settings_Eng_20261008_1303.md`) establishing exact FP4/QAT autograd, LoRA module count, and vLLM key mapping invariants. |
+| **Track 2 Phase 1: Zero-Leakage Dataset Curation** | ✅ **COMPLETED** | Updated `scripts/build_unsloth_dataset.py` and generated `data/unsloth_sft/` (1,500 samples: 500 `swe_smith`, 500 `swe_rebench`, 500 `swe_zero`; 0% `tasks.jsonl` overlap; 0% `run_B*` traces). |
+| **Track 2 Phase 2: Unsloth FP4 Training Script Alignment** | ⏸️ **PENDING REVIEW** | Waiting on joint plan review before modifying `scripts/train_gemma4_unsloth_cloud.py` and notebook builders. |
+| **Track 2 Phase 3: vLLM Multimodal Key Normalizer** | ✅ **SCRIPT COMPLETED / ⏸️ RUN PENDING** | `scripts/normalize_adapter_vllm.py` created on disk; will run post-training to remap keys to `base_model.model.language_model.model.layers.*` and verify 340 BF16 tensors (<35 MB). |
+| **Track 2 Phase 4: 14-Task Gauntlet / Compute Staging (`gemma4-9r1`)** | ⏸️ **PENDING** | Evaluate normalized LoRA under authentic vLLM `w4a16-ct` before touching `submission.zip`. |
+
+---
+
+### 7.2 End-to-End Track 2 Architecture Flow
+
+```
+  [External Source B Parquet Shards: swe_smith + swe_rebench + swe_zero]
+                         │
+                         ▼  Strict Filter: 0% tasks.jsonl (129 IDs excluded), 0% local run_B*
+        [data/unsloth_sft/train.jsonl (1,365 samples / 53 tasks)]
+        [data/unsloth_sft/val.jsonl   (  135 samples /  7 tasks)]
+                         │
+                         ▼  Pre-tokenize full_text + slice labels[:K] = -100
+  [Unsloth Training: google/gemma-4-31B-it-qat-q4_0-unquantized (BnB FP4)]
+    • 170 Attention Modules: q_proj (60), v_proj (50), o_proj (60) -> 340 tensors
+    • r = 8, lora_alpha = 16, use_rslora = False, neftune_noise_alpha = None
+    • LR = 1.5e-4 (cosine), B = 1, GAS = 8, ~170 steps, eval_strategy = "no"
+                         │
+                         ▼  Post-training hook
+       [scripts/normalize_adapter_vllm.py]
+    • Rewrite prefix -> base_model.model.language_model.model.layers.{i}...
+    • Verify 340 torch.bfloat16 tensors, file size < 35.0 MB
+                         │
+                         ▼  Staging Gate (gemma4-9r1)
+  [vLLM w4a16-ct Serving -> 14-Task Gauntlet / Kaggle Compute Kernel]
+                         │
+                         ▼  Promote ONLY if > 0.13 Track 1 Baseline
+                  [submission.zip]
+```
+
+---
+
+### 7.3 Phase-by-Phase Engineering Plan
+
+#### Phase 1: Zero-Leakage Multi-Turn SFT Dataset (**✅ COMPLETED**)
+- **Script**: `scripts/build_unsloth_dataset.py`
+- **Benchmark Leakage Guard**: Loads all 129 `instance_id`s from `tasks.jsonl` into `benchmark_exclusions` and excludes all local `run_B*` traces.
+- **External Source B Balance**:
+  - `swe_smith`: 500 decision steps (from resolved trajectories)
+  - `swe_rebench`: 500 decision steps (from `resolved == 1` trajectories)
+  - `swe_zero`: 500 decision steps (from trajectories with verified non-empty patches $\le 150$ lines)
+- **Production Tool & Skill Contract**:
+  - Strictly 6 callable tools: `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`, `run_skill_script` (`run_command` = 0).
+  - Exact parameter schema matching `HARNESS_README.md:433-460` and `submissions/track1_live/prompts/main.md` (`filepath`, `old_string`, `new_string`, `allow_multiple`).
+  - OpenHands/Claude actions translated cleanly (`str_replace_editor` $	o$ `read_file`/`edit_file`/`write_file`, `pytest` $	o$ `test-gate`, `grep` $	o$ `fast-grep`, `python -c` $	o$ `repro-check`, `think` folded into `reasoning`).
+- **Gemma 4 Chat Template & Prefix-Delta Formatting**:
+  - Rendered with `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja` (`enable_thinking=True`, `preserve_thinking=True`).
+  - Verified `full_text.startswith(prefix_text)` on 100% of samples.
+- **Generated Dataset Breakdown (`data/unsloth_sft/metadata.json`)**:
+  - **Total Samples**: 1,500 (`train`: 1,365 samples across 53 tasks; `val`: 135 samples across 7 disjoint tasks).
+  - **Tool Distribution**: `read_file`: 610 (40.7%), `run_skill_script`: 502 (33.5%), `edit_file`: 179 (11.9%), `write_file`: 118 (7.9%), `submit_patch`: 81 (5.4%), `get_status`: 10 (0.7%).
+
+#### Phase 2: Unsloth LoRA Training on 1x 24GB L4 GPU (**⏸️ PENDING REVIEW**)
+- **Target Scripts**: `scripts/train_gemma4_unsloth_cloud.py`, `scripts/build_unsloth_notebook.py`, `scripts/build_unsloth_training_kernel.py`.
+- **Locked Engineering Parameters**:
+
+| Parameter | Locked Value | Engineering Rationale |
+|---|---|---|
+| **Base Checkpoint** | `google/gemma-4-31B-it-qat-q4_0-unquantized` | `w4a16-ct` (`CompressedLinear`) lacks PyTorch autograd backward dequant kernels for $
+abla_X = 
+abla_Y W^T$. |
+| **Quantization Config** | `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)` | Uniform symmetric `fp4` grid aligns with Google's symmetric `q4_0` QAT training grid; `nf4` non-linear quantiles distort QAT weights. Fits in ~15.35 GiB static VRAM. |
+| **Target Modules** | `["q_proj", "v_proj", "o_proj"]` | **170 modules** across 60 layers (10 global full-attention layers have `attention_k_eq_v=True` and omit `v_proj`). Freeze `k_proj`, MLPs, and vision tower. Trainable params: **13,926,400** (26.56 MB in BF16). |
+| **LoRA Rank & Alpha** | `r = 8`, `lora_alpha = 16`, `lora_dropout = 0.0`, `bias = "none"` | Scaling $lpha/r = 2.0$; `lora_dropout = 0.0` required for Unsloth fast Triton kernels. |
+| **rsLoRA & NEFTune** | `use_rslora = False`, `neftune_noise_alpha = None` | `use_rslora=True` increases effective step size by $\sqrt{8} pprox 2.83	imes$; NEFTune corrupts discrete control tokens (`<|tool_call>`, `<|"|>`). |
+| **Tokenization & Masking** | Pre-tokenized `.map()` on `full_text` with `labels[:K] = -100` | Avoids SentencePiece boundary merge misalignment ($	ext{enc}(A) + 	ext{enc}(B) 
+eq 	ext{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
+| **Sequence Length & Eval** | `max_seq_length = 3072`, `eval_strategy = "no"` | `eval_strategy="steps"` materializes a 7.50 GiB `[1, 3072, 262144]` FP32 logit tensor and OOMs a 24GB L4 GPU. Peak training VRAM with `eval_strategy="no"`: **~20.43 GiB**. |
+| **Optimizer & Schedule** | `optim = "paged_adamw_8bit"`, `LR = 1.5e-4`, `cosine`, `warmup_steps = 15`, `B = 1`, `GAS = 8`, `num_train_epochs = 1` (~170 steps) | Effective batch size 8; `weight_decay = 0.01`, `max_grad_norm = 1.0`, `seed = 3407`. |
+
+#### Phase 3: Post-Training vLLM Key Normalization & Gate (**✅ SCRIPT COMPLETED / ⏸️ EXECUTION PENDING**)
+- **Script**: `scripts/normalize_adapter_vllm.py` (created and executable).
+- **Why**: vLLM instantiates Gemma 4 via multimodal `Gemma4ForConditionalGeneration`, which namespaces text layers under `language_model.model.layers.{i}`. Standard PEFT/Unsloth text saves emit `base_model.model.model.layers.{i}`, which vLLM silently ignores during LoRA loading.
+- **Verification Assertions**:
+  1. All 340 tensor keys start with `base_model.model.language_model.model.layers.`.
+  2. Exact tensor count = **340** ($170 	imes 2$).
+  3. All tensors cast to `torch.bfloat16`.
+  4. `adapter_model.safetensors` size $< 35.0	ext{ MB}$ (~26.6 MB expected).
+
+#### Phase 4: Staging Verification Before Touching `submission.zip` (**⏸️ PENDING**)
+- Stage normalized adapter in a compute/test submission directory (never overwrite `submissions/track1_live/` or `submission.zip` unverified).
+- Run the **14-task gauntlet (`gemma4-9r1`)** / Kaggle Compute diagnostic kernel under authentic vLLM `gemma-4-31b-it-qat-w4a16-ct`.
+- Compare resolution rate, tool-call syntax validity, and patch submission rate against the locked **0.13** Track 1 baseline.
+
+---
+
+### 7.4 Open Architectural Questions for Joint Planning
+
+1. **Compute Target for the 1x L4 Training Run**:
+   - **Option A (GCP L4 VM)**: Launch via `gcp/deploy_gemma4_lora.sh` / `scripts/train_gemma4_unsloth_cloud.py` on a single 24GB L4 instance (~25–35 mins for 170 steps).
+   - **Option B (Kaggle GPU Kernel)**: Package dataset + script via `scripts/build_unsloth_training_kernel.py` and run on Kaggle Compute.
+2. **Dataset Action Balance (Natural vs. Edit/Submit Up-weighting)**:
+   - Currently: `read_file` (40.7%), `run_skill_script` (33.5%), `edit_file` (11.9%), `write_file` (7.9%), `submit_patch` (5.4%), `get_status` (0.7%).
+   - Decide whether to keep natural trajectory step proportions or up-weight `edit_file` and `submit_patch` windows.
+3. **Cross-Quantization Smoke Check (`q4_0` BnB FP4 $	o$ `w4a16-ct` vLLM)**:
+   - Decide whether to run a 1–2 task vLLM adapter-loading smoke test on Kaggle Compute immediately after training before running the full 14-task gauntlet.

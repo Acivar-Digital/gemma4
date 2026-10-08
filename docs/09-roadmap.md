@@ -2,11 +2,11 @@
 
 Scope: theory-first. Code/YAML only after explicit approval.
 
-## Phase 0 — Theory (current, docs 01–08)
+## Phase 0 — Theory (docs 01–08) — **✅ COMPLETED**
 - Finish 01–08 design docs from HARNESS_README + sample_submission.
 - Gate: user approves theory before any YAML draft.
 
-## Phase 1 — YAML draft (after approval)
+## Phase 1 — YAML draft (after approval) — **✅ COMPLETED (Superseded by single-agent 5-tool + 5-skill monolith in `submissions/track1_live/`)**
 - Mirror `sample_submission` filenames (`agent.yaml`, `eval_config.yaml`,
   `configs/sampling.yaml`, `prompts/system.md` + `analyzer.md`,
   `sub_agents/code_analyzer.yaml`).
@@ -15,7 +15,7 @@ Scope: theory-first. Code/YAML only after explicit approval.
   `agent_tool skip_summarization:true`.
 - No LoRA adapters v1.
 
-## Phase 2 — Local test + iterate — **SUPERSEDED 2026-10-05, never executable**
+## Phase 2 — Local test + iterate — **❌ DROPPED / 🔄 SUPERSEDED 2026-10-05, never executable**
 
 The original Phase 2 said "run locally, inspect traces, iterate until patches
 resolve". **There is no local Gemma 4.** The competition model
@@ -33,7 +33,7 @@ Consequences, all measured:
 - Therefore local iteration cannot gate anything. It can only validate syntax
   and plumbing. The single measuring instrument is one Kaggle kernel run.
 
-## Phase 2b — Kaggle kernel bring-up (settled; the actual blocker)
+## Phase 2b — Kaggle kernel bring-up (settled; the actual blocker) — **✅ COMPLETED**
 
 Iteration is blocked by getting the harness to import at all. Three kernel
 versions were spent here, and the fault was always *plumbing*, never the agent:
@@ -62,7 +62,7 @@ Two durable lessons from v3, both now encoded in
    can load plus whether it can supply `adk_submission`, install from the winner,
    and print the scoring table so the choice is auditable in the log.
 
-## Phase 3 — Measure (current)
+## Phase 3 — Measure (Track 1 Baseline) — **✅ COMPLETED (Scored 0.13 on Public Leaderboard, ref `56883026`; locked in `configs/baseline_registry.json`)**
 
 Kernel `francisclyap/gemma4-baseline-v1` v4 is queued. On completion, read the
 output in this order and stop at the first failure:
@@ -80,6 +80,13 @@ output in this order and stop at the first failure:
 **A `DEGENERATE` verdict is a serving-path fault, not a model result.** Report
 it and stop. Do not escalate to GCP on the first zero; §5 of the recovery plan
 prices GCP at $2–30 per identical run for no added fidelity.
+
+## Phase 4 — Track 2 LoRA Master Plan (2026-10-08 — **ACTIVE**, Epic `gemma4-wzlk`)
+- Full specification and phase status ledger published in **[`docs/workplan.md` §7](workplan.md#7-track-2-lora-master-plan-2026-10-08--active-workplan-epic-gemma4-wzlk)**.
+- **Phase 4.1 (✅ COMPLETED):** Zero-leakage multi-turn SFT dataset built in `data/unsloth_sft/` from external Source B only (`500 swe_smith`, `500 swe_rebench`, `500 swe_zero`; 0% `tasks.jsonl` overlap; 0% local `run_B*` traces; 6-tool production schema; Gemma 4 prefix-delta masking).
+- **Phase 4.2 (⏸️ PENDING REVIEW):** Unsloth Rank-8 LoRA training on 1x 24GB L4 GPU (`google/gemma-4-31B-it-qat-q4_0-unquantized`, BnB `fp4`, 170 attention modules `["q_proj", "v_proj", "o_proj"]`, `LR=1.5e-4`, `GAS=8`, `B=1`, `eval_strategy="no"`, pre-tokenized `.map()` with `labels[:K] = -100`).
+- **Phase 4.3 (✅ SCRIPT COMPLETED / ⏸️ RUN PENDING):** Post-training vLLM multimodal key normalization via `scripts/normalize_adapter_vllm.py` (`base_model.model.language_model.model.layers.*`, 340 BF16 tensors <35 MB).
+- **Phase 4.4 (⏸️ PENDING):** Staging verification on the 14-task gauntlet (`gemma4-9r1`) / Kaggle Compute under authentic vLLM `w4a16-ct` before promoting to `submission.zip`.
 
 ## Do-NOT list
 - NO `my_submission/` without explicit user approval.
