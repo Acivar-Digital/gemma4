@@ -339,7 +339,8 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 | **Old T4 (LoRA SFT on 77 Tier-1 / 223 `run_B*` local traces)** | ❌ **DROPPED / SUPERSEDED** | **Dropped** because `run_B*` traces are evaluations on the 129 `tasks.jsonl` benchmark tasks (test-set leakage + `space-bunny-alpha` proxy provenance). Superseded by External Source B SFT below. |
 | **Track 2 Prep A: External Source B Dataset Download** | ✅ **COMPLETED** | Downloaded 14.31 GB across 79 Parquet shards in `data/source_b/` (`swe_smith` 1.00 GB, `swe_rebench` 1.94 GB, `swe_zero` 11.37 GB). |
 | **Track 2 Prep B: Deep Research Engineering Spec** | ✅ **COMPLETED** | Completed 5-persona engineering report (`Gemma4_Unsloth_LoRA_Adapter_Settings_Eng_20261008_1303.md`) establishing exact FP4/QAT autograd, LoRA module count, and vLLM key mapping invariants. |
-| **Track 2 Phase 1: Zero-Leakage Dataset Curation** | 🔄 **SPEC REFINED (LOCKDOWN PENDING)** | Refined with strict single-file .py gate, <=20 tool-call ceiling, swe_rebench dropped (51 calls median), and Constructive Pivot mining (6,221 candidate pool on disk). |
+| **Track 2 Phase 1a: Initial 3-Source SFT Draft (`500/500/500`)** | 🔄 **SUPERSEDED** | Initial 1,500-sample build (`500 swe_smith`, `500 swe_rebench`, `500 swe_zero`) superseded after audit showed `swe_rebench` has median 51 tool calls (98.9% $>30$ calls) and multi-file noise. |
+| **Track 2 Phase 1b: Zero-Leakage Single-File $\le 20$-Call Curriculum** | 🔄 **SPEC REFINED (LOCKDOWN PENDING)** | Refined with strict 100% single-file `.py` gate, $\le 20$ tool-call ceiling, `swe_rebench` dropped, and Straight-Shot (4,387) vs. Constructive Pivot (1,834) mining from 6,221 candidate pool on disk. |
 | **Track 2 Phase 2: Unsloth FP4 Training Script Alignment** | ⏸️ **PENDING REVIEW** | Waiting on joint plan review before modifying `scripts/train_gemma4_unsloth_cloud.py` and notebook builders. |
 | **Track 2 Phase 3: vLLM Multimodal Key Normalizer** | ✅ **SCRIPT COMPLETED / ⏸️ RUN PENDING** | `scripts/normalize_adapter_vllm.py` created on disk; will run post-training to remap keys to `base_model.model.language_model.model.layers.*` and verify 340 BF16 tensors (<35 MB). |
 | **Track 2 Phase 4: 14-Task Gauntlet / Compute Staging (`gemma4-9r1`)** | ⏸️ **PENDING** | Evaluate normalized LoRA under authentic vLLM `w4a16-ct` before touching `submission.zip`. |
@@ -411,15 +412,12 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 
 | Parameter | Locked Value | Engineering Rationale |
 |---|---|---|
-| **Base Checkpoint** | `google/gemma-4-31B-it-qat-q4_0-unquantized` | `w4a16-ct` (`CompressedLinear`) lacks PyTorch autograd backward dequant kernels for $
-abla_X = 
-abla_Y W^T$. |
+| **Base Checkpoint** | `google/gemma-4-31B-it-qat-q4_0-unquantized` | `w4a16-ct` (`CompressedLinear`) lacks PyTorch autograd backward dequant kernels for $\nabla_X = \nabla_Y W^T$. |
 | **Quantization Config** | `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)` | Uniform symmetric `fp4` grid aligns with Google's symmetric `q4_0` QAT training grid; `nf4` non-linear quantiles distort QAT weights. Fits in ~15.35 GiB static VRAM. |
 | **Target Modules** | `["q_proj", "v_proj", "o_proj"]` | **170 modules** across 60 layers (10 global full-attention layers have `attention_k_eq_v=True` and omit `v_proj`). Freeze `k_proj`, MLPs, and vision tower. Trainable params: **13,926,400** (26.56 MB in BF16). |
-| **LoRA Rank & Alpha** | `r = 8`, `lora_alpha = 16`, `lora_dropout = 0.0`, `bias = "none"` | Scaling $lpha/r = 2.0$; `lora_dropout = 0.0` required for Unsloth fast Triton kernels. |
-| **rsLoRA & NEFTune** | `use_rslora = False`, `neftune_noise_alpha = None` | `use_rslora=True` increases effective step size by $\sqrt{8} pprox 2.83	imes$; NEFTune corrupts discrete control tokens (`<|tool_call>`, `<|"|>`). |
-| **Tokenization & Masking** | Pre-tokenized `.map()` on `full_text` with `labels[:K] = -100` | Avoids SentencePiece boundary merge misalignment ($	ext{enc}(A) + 	ext{enc}(B) 
-eq 	ext{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
+| **LoRA Rank & Alpha** | `r = 8`, `lora_alpha = 16`, `lora_dropout = 0.0`, `bias = "none"` | Scaling $\alpha/r = 2.0$; `lora_dropout = 0.0` required for Unsloth fast Triton kernels. |
+| **rsLoRA & NEFTune** | `use_rslora = False`, `neftune_noise_alpha = None` | `use_rslora=True` increases effective step size by $\sqrt{8} \approx 2.83\times$; NEFTune corrupts discrete control tokens (`<|tool_call>`, `<|"|>`). |
+| **Tokenization & Masking** | Pre-tokenized `.map()` on `full_text` with `labels[:K] = -100` | Avoids SentencePiece boundary merge misalignment ($\text{enc}(A) + \text{enc}(B) \neq \text{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
 | **Sequence Length & Eval** | `max_seq_length = 3072`, `eval_strategy = "no"` | `eval_strategy="steps"` materializes a 7.50 GiB `[1, 3072, 262144]` FP32 logit tensor and OOMs a 24GB L4 GPU. Peak training VRAM with `eval_strategy="no"`: **~20.43 GiB**. |
 | **Optimizer & Schedule** | `optim = "paged_adamw_8bit"`, `LR = 1.5e-4`, `cosine`, `warmup_steps = 15`, `B = 1`, `GAS = 8`, `num_train_epochs = 1` (~170 steps) | Effective batch size 8; `weight_decay = 0.01`, `max_grad_norm = 1.0`, `seed = 3407`. |
 
@@ -428,9 +426,9 @@ eq 	ext{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
 - **Why**: vLLM instantiates Gemma 4 via multimodal `Gemma4ForConditionalGeneration`, which namespaces text layers under `language_model.model.layers.{i}`. Standard PEFT/Unsloth text saves emit `base_model.model.model.layers.{i}`, which vLLM silently ignores during LoRA loading.
 - **Verification Assertions**:
   1. All 340 tensor keys start with `base_model.model.language_model.model.layers.`.
-  2. Exact tensor count = **340** ($170 	imes 2$).
+  2. Exact tensor count = **340** ($170 \times 2$).
   3. All tensors cast to `torch.bfloat16`.
-  4. `adapter_model.safetensors` size $< 35.0	ext{ MB}$ (~26.6 MB expected).
+  4. `adapter_model.safetensors` size $< 35.0\text{ MB}$ (~26.6 MB expected).
 
 #### Phase 4: Staging Verification Before Touching `submission.zip` (**⏸️ PENDING**)
 - Stage normalized adapter in a compute/test submission directory (never overwrite `submissions/track1_live/` or `submission.zip` unverified).
