@@ -339,7 +339,7 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 | **Old T4 (LoRA SFT on 77 Tier-1 / 223 `run_B*` local traces)** | ❌ **DROPPED / SUPERSEDED** | **Dropped** because `run_B*` traces are evaluations on the 129 `tasks.jsonl` benchmark tasks (test-set leakage + `space-bunny-alpha` proxy provenance). Superseded by External Source B SFT below. |
 | **Track 2 Prep A: External Source B Dataset Download** | ✅ **COMPLETED** | Downloaded 14.31 GB across 79 Parquet shards in `data/source_b/` (`swe_smith` 1.00 GB, `swe_rebench` 1.94 GB, `swe_zero` 11.37 GB). |
 | **Track 2 Prep B: Deep Research Engineering Spec** | ✅ **COMPLETED** | Completed 5-persona engineering report (`Gemma4_Unsloth_LoRA_Adapter_Settings_Eng_20261008_1303.md`) establishing exact FP4/QAT autograd, LoRA module count, and vLLM key mapping invariants. |
-| **Track 2 Phase 1: Zero-Leakage Dataset Curation** | ✅ **COMPLETED** | Updated `scripts/build_unsloth_dataset.py` and generated `data/unsloth_sft/` (1,500 samples: 500 `swe_smith`, 500 `swe_rebench`, 500 `swe_zero`; 0% `tasks.jsonl` overlap; 0% `run_B*` traces). |
+| **Track 2 Phase 1: Zero-Leakage Dataset Curation** | 🔄 **SPEC REFINED (LOCKDOWN PENDING)** | Refined with strict single-file .py gate, <=20 tool-call ceiling, swe_rebench dropped (51 calls median), and Constructive Pivot mining (6,221 candidate pool on disk). |
 | **Track 2 Phase 2: Unsloth FP4 Training Script Alignment** | ⏸️ **PENDING REVIEW** | Waiting on joint plan review before modifying `scripts/train_gemma4_unsloth_cloud.py` and notebook builders. |
 | **Track 2 Phase 3: vLLM Multimodal Key Normalizer** | ✅ **SCRIPT COMPLETED / ⏸️ RUN PENDING** | `scripts/normalize_adapter_vllm.py` created on disk; will run post-training to remap keys to `base_model.model.language_model.model.layers.*` and verify 340 BF16 tensors (<35 MB). |
 | **Track 2 Phase 4: 14-Task Gauntlet / Compute Staging (`gemma4-9r1`)** | ⏸️ **PENDING** | Evaluate normalized LoRA under authentic vLLM `w4a16-ct` before touching `submission.zip`. |
@@ -349,11 +349,14 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 ### 7.2 End-to-End Track 2 Architecture Flow
 
 ```
-  [External Source B Parquet Shards: swe_smith + swe_rebench + swe_zero]
+  [External Source B Parquet Shards: swe_smith + swe_zero (swe_rebench dropped)]
                          │
-                         ▼  Strict Filter: 0% tasks.jsonl (129 IDs excluded), 0% local run_B*
-        [data/unsloth_sft/train.jsonl (1,365 samples / 53 tasks)]
-        [data/unsloth_sft/val.jsonl   (  135 samples /  7 tasks)]
+                         ▼  Strict Filter: 100% single-file .py, <=20 calls, 0% tasks.jsonl
+     [Candidate Pool: 6,221 challenges (4,387 Straight-Shot, 1,834 Constructive Pivot)]
+                         │
+                         ▼  Balanced Sampling (~1,500 decision step windows)
+        [data/unsloth_sft/train.jsonl (~1,350 samples / ~80-120 tasks)]
+        [data/unsloth_sft/val.jsonl   (  ~150 samples / ~10-15 disjoint tasks)]
                          │
                          ▼  Pre-tokenize full_text + slice labels[:K] = -100
   [Unsloth Training: google/gemma-4-31B-it-qat-q4_0-unquantized (BnB FP4)]
@@ -366,8 +369,8 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
     • Rewrite prefix -> base_model.model.language_model.model.layers.{i}...
     • Verify 340 torch.bfloat16 tensors, file size < 35.0 MB
                          │
-                         ▼  Staging Gate (gemma4-9r1)
-  [vLLM w4a16-ct Serving -> 14-Task Gauntlet / Kaggle Compute Kernel]
+                         ▼  Staging Gate (gemma4-9r1 + vLLM smoke check)
+  [vLLM w4a16-ct Serving -> 1-2 Task Smoke Check -> 14-Task Gauntlet]
                          │
                          ▼  Promote ONLY if > 0.13 Track 1 Baseline
                   [submission.zip]
@@ -377,24 +380,31 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 
 ### 7.3 Phase-by-Phase Engineering Plan
 
-#### Phase 1: Zero-Leakage Multi-Turn SFT Dataset (**✅ COMPLETED**)
+#### Phase 1: Zero-Leakage Multi-Turn SFT Dataset (**🔄 SPEC REFINED (LOCKDOWN PENDING)**)
 - **Script**: `scripts/build_unsloth_dataset.py`
-- **Benchmark Leakage Guard**: Loads all 129 `instance_id`s from `tasks.jsonl` into `benchmark_exclusions` and excludes all local `run_B*` traces.
-- **External Source B Balance**:
-  - `swe_smith`: 500 decision steps (from resolved trajectories)
-  - `swe_rebench`: 500 decision steps (from `resolved == 1` trajectories)
-  - `swe_zero`: 500 decision steps (from trajectories with verified non-empty patches $\le 150$ lines)
+- **Benchmark Leakage Guard**: Loads all 129 `instance_id`s from `tasks.jsonl` into `benchmark_exclusions` and excludes all local `run_B*` traces (100% external Source B only).
+- **Single-File Scope Constraint**: 100% single-file `.py` fixes only (0% multi-file, 0% non-`.py`). Eliminates multi-file trajectory wandering in SFT (`max_seq_length=3072`) and aligns with the 85.3% 1-2 file complexity ceiling of `tasks.jsonl`.
+- **Strict Budget Ceiling**: Trajectory total tool calls $\le 20$. Pruning long trajectories guarantees a 20+ call safety margin inside the competition's 40-call budget for reasoning, exploration, and recovery.
+- **Source Dataset Filtering**:
+  - `swe_smith`: Retained (Claude 3.7 Sonnet tool-split trajectories with native thoughts and tool calls).
+  - `swe_rebench`: **Dropped entirely** (median 51 tool calls, 98.9% $>30$ calls; teaches budget thrashing and exceeds the 40-call budget).
+  - `swe_zero`: Retained (OpenHands trajectories with verified non-empty patches $\le 150$ lines).
+- **Curriculum Stratification (Straight-Shot vs. Constructive Pivot)**:
+  - **Straight-Shot Challenges**: 0 tool errors, clean linear exploration and edit execution in $\le 20$ calls.
+  - **Constructive Pivot Challenges**: Measured causal disconfirmation and recovery in $\le 20$ calls:
+    - *Red-to-Green Test Pivots*: Pre-edit test execution fails with `AssertionError` / `exit_code != 0` $\to$ edit applied $\to$ post-edit test passes (`exit_code == 0`). Teaches genuine hypothesis testing and test-driven repair.
+    - *Tool Error Recovery*: Tool call fails or returns 0 matches $\to$ assistant immediately pivots strategy without repeating the mistake.
+- **Measured Empirical Pool on Disk (`data/source_b/`)**:
+  - `swe_smith`: 1,077 eligible single-file $\le 20$-call challenges (1,015 Straight-Shot, 62 Constructive Pivot / 32 Red-to-Green).
+  - `swe_zero` (first 5 shards): 5,144 eligible single-file $\le 20$-call challenges (3,372 Straight-Shot, 1,772 Constructive Pivot / 1,767 Red-to-Green).
+  - **Combined Pool**: 6,221 unique qualified challenges (4,387 Straight-Shot, 1,834 Constructive Pivot) vs. 1,500 target sample size ($>4\times$ surplus).
 - **Production Tool & Skill Contract**:
   - Strictly 6 callable tools: `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`, `run_skill_script` (`run_command` = 0).
   - Exact parameter schema matching `HARNESS_README.md:433-460` and `submissions/track1_live/prompts/main.md` (`filepath`, `old_string`, `new_string`, `allow_multiple`).
-  - OpenHands/Claude actions translated cleanly (`str_replace_editor` $	o$ `read_file`/`edit_file`/`write_file`, `pytest` $	o$ `test-gate`, `grep` $	o$ `fast-grep`, `python -c` $	o$ `repro-check`, `think` folded into `reasoning`).
+  - OpenHands/Claude actions translated cleanly (`str_replace_editor` $\to$ `read_file`/`edit_file`/`write_file`, `pytest` $\to$ `test-gate`, `grep` $\to$ `fast-grep`, `python -c` $\to$ `repro-check`, `think` folded into `reasoning`).
 - **Gemma 4 Chat Template & Prefix-Delta Formatting**:
   - Rendered with `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja` (`enable_thinking=True`, `preserve_thinking=True`).
   - Verified `full_text.startswith(prefix_text)` on 100% of samples.
-- **Generated Dataset Breakdown (`data/unsloth_sft/metadata.json`)**:
-  - **Total Samples**: 1,500 (`train`: 1,365 samples across 53 tasks; `val`: 135 samples across 7 disjoint tasks).
-  - **Tool Distribution**: `read_file`: 610 (40.7%), `run_skill_script`: 502 (33.5%), `edit_file`: 179 (11.9%), `write_file`: 118 (7.9%), `submit_patch`: 81 (5.4%), `get_status`: 10 (0.7%).
-
 #### Phase 2: Unsloth LoRA Training on 1x 24GB L4 GPU (**⏸️ PENDING REVIEW**)
 - **Target Scripts**: `scripts/train_gemma4_unsloth_cloud.py`, `scripts/build_unsloth_notebook.py`, `scripts/build_unsloth_training_kernel.py`.
 - **Locked Engineering Parameters**:
@@ -429,13 +439,9 @@ eq 	ext{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
 
 ---
 
-### 7.4 Open Architectural Questions for Joint Planning
+### 7.4 Locked Planning Decisions (User Approved 2026-10-08)
 
-1. **Compute Target for the 1x L4 Training Run**:
-   - **Option A (GCP L4 VM)**: Launch via `gcp/deploy_gemma4_lora.sh` / `scripts/train_gemma4_unsloth_cloud.py` on a single 24GB L4 instance (~25–35 mins for 170 steps).
-   - **Option B (Kaggle GPU Kernel)**: Package dataset + script via `scripts/build_unsloth_training_kernel.py` and run on Kaggle Compute.
-2. **Dataset Action Balance (Natural vs. Edit/Submit Up-weighting)**:
-   - Currently: `read_file` (40.7%), `run_skill_script` (33.5%), `edit_file` (11.9%), `write_file` (7.9%), `submit_patch` (5.4%), `get_status` (0.7%).
-   - Decide whether to keep natural trajectory step proportions or up-weight `edit_file` and `submit_patch` windows.
-3. **Cross-Quantization Smoke Check (`q4_0` BnB FP4 $	o$ `w4a16-ct` vLLM)**:
-   - Decide whether to run a 1–2 task vLLM adapter-loading smoke test on Kaggle Compute immediately after training before running the full 14-task gauntlet.
+1. **Compute Target**: **Option A (GCP 1x L4 24GB VM)** via `gcp/deploy_gemma4_lora.sh` + `scripts/train_gemma4_unsloth_cloud.py`. Provides dedicated VRAM, avoids Kaggle kernel queue timeouts, and runs 170 steps in ~25–35 mins.
+2. **Dataset Action Distribution**: **Keep Natural Trajectory Step Ratio** (`read_file` 40.7%, `run_skill_script` 33.5%, `edit_file` 11.9%, `write_file` 7.9%, `submit_patch` 5.4%, `get_status` 0.7%). Preserves authentic agent exploration-to-repair balance without artificial distortion.
+3. **Cross-Quantization Smoke Check**: **Approved**. Run a 1–2 task vLLM `w4a16-ct` adapter-loading smoke check on Kaggle Compute immediately after normalizing the adapter before committing GPU quota to the 14-task gauntlet (`gemma4-9r1`).
+4. **Complexity & Budget Guardrails**: **Locked**. Enforce 100% single-file `.py` fixes, strict $\le 20$ tool-call budget ceiling, prune `swe_rebench`, and mine Straight-Shot vs. Constructive Pivot challenges from the 6,221-challenge verified pool.
