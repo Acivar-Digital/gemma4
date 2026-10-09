@@ -1,8 +1,10 @@
 # Ironclad Submission Gates — Plan
 
-Authored 2026-10-04. Status: PROPOSED, nothing implemented. No file in
-`my_submission/` or `submission.zip` has been modified.
-
+Authored 2026-10-04. Status: IMPLEMENTED & VERIFIED (2026-10-08).
+16 gates implemented in `scripts/check_submission.py` under 3 strict categories:
+`CAT_SUBMISSION` (14 veto gates), `CAT_POST_RUN` (1 non-gating historical health gate),
+and `CAT_HYGIENE` (1 non-gating documentation check), configured by `scripts/gate_policy.yaml`
+and backed by the locked 0.13 baseline gate `scripts/baseline_gate.py`.
 ## 1. Thesis
 
 **One command. One verdict. Four gates, ordered by cost.**

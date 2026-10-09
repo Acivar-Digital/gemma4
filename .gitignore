@@ -56,6 +56,7 @@ __pycache__/
 .ipynb_checkpoints/
 venv/
 .venv/
+my_submission
 env/
 test.txt
 checkpoints/
@@ -78,3 +79,11 @@ submission.zip
 .vps_env.sh
 .tmux.conf
 tmux.sh
+
+# Pydantic SFT dataset translation runtime data, logs, and artifacts (80MB+)
+pydantic/gold/
+pydantic/logs/
+pydantic/output/
+pydantic/staging/
+pydantic/test_results/
+pydantic/__pycache__/

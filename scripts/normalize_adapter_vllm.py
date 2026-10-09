@@ -58,15 +58,11 @@ def normalize_adapter_for_vllm(adapter_dir: Path, output_dir: Path = None) -> Tu
 
     for key, val in tensors.items():
         new_key = key
-        # Case A: Standard PEFT text model saved without multimodal prefix
-        if "base_model.model.model.layers." in key and "language_model." not in key:
-            new_key = key.replace("base_model.model.model.layers.", TARGET_PREFIX)
-            renamed_count += 1
-        # Case B: Model saved with base_model.model.layers.
-        elif "base_model.model.layers." in key and "language_model." not in key:
-            new_key = key.replace("base_model.model.layers.", TARGET_PREFIX)
-            renamed_count += 1
-
+        if ".layers." in key:
+            suffix = key.split(".layers.", 1)[1]
+            new_key = f"{TARGET_PREFIX}{suffix}"
+            if new_key != key:
+                renamed_count += 1
         # Force torch.bfloat16 precision
         if val.dtype != torch.bfloat16:
             val = val.to(torch.bfloat16)
@@ -94,6 +90,10 @@ def normalize_adapter_for_vllm(adapter_dir: Path, output_dir: Path = None) -> Tu
     with open(out_config, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
+
+    for p in list(output_dir.iterdir()):
+        if p.is_file() and p.name not in ("adapter_config.json", "adapter_model.safetensors"):
+            p.unlink()
     logger.info(f"Serialized normalized adapter to {output_dir}")
     return verify_adapter(output_dir)
 

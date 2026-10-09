@@ -18,14 +18,32 @@ unset DOLT_ROOT_PATH 2>/dev/null || true
 unset BEADS_DOLT_PASSWORD 2>/dev/null || true
 export PYTHONDONTWRITEBYTECODE=1
 export SWEGEMMA_CONCURRENCY="${SWEGEMMA_CONCURRENCY:-15}"
-export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-thinkingmachines/inkling:free}"
+export SWEGEMMA_MODEL="${SWEGEMMA_MODEL:-gemma-4-31b-it-qat-w4a16-ct}"
 export SWEGEMMA_API_KEY="${SWEGEMMA_API_KEY:-lr-or-oa-ch-no}"
+
+# Enforce authentic Gemma 4 model assertion unless SWEGEMMA_ALLOW_PROXY is enabled
+if [ "$SWEGEMMA_MODEL" != "gemma-4-31b-it-qat-w4a16-ct" ] && [ "${SWEGEMMA_ALLOW_PROXY:-0}" != "1" ]; then
+    echo "============================================================"
+    echo "❌ ERROR: PROXY MODEL DETECTED IN SWEGEMMA_MODEL: '$SWEGEMMA_MODEL'"
+    echo "============================================================"
+    echo "Evaluation entrypoints must assert model is 'gemma-4-31b-it-qat-w4a16-ct'."
+    echo "To explicitly allow testing against proxy models, export SWEGEMMA_ALLOW_PROXY=1."
+    exit 1
+fi
 
 # Clean any stray bytecode cache in submission directory before ADK compilation
 find "$PROJECT_DIR/submissions/track1_live" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "$PROJECT_DIR/submissions/track1_live" -name "*.pyc" -delete 2>/dev/null || true
 
-PYTHON_BIN="/tmp/brun/venv/bin/python"
+if [ -x "$PROJECT_DIR/.venv/bin/python" ]; then
+    PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+elif [ -x "/tmp/brun/venv/bin/python" ]; then
+    PYTHON_BIN="/tmp/brun/venv/bin/python"
+elif [ -x "/tmp/g4venv/bin/python" ]; then
+    PYTHON_BIN="/tmp/g4venv/bin/python"
+else
+    PYTHON_BIN="$(which python3)"
+fi
 
 if [ ! -x "$PYTHON_BIN" ]; then
     echo "❌ Error: Virtual environment python not found at $PYTHON_BIN"

@@ -1,7 +1,7 @@
 # Workplan — Gemma 4 Developer Agent: Error Taxonomy & Isolation Sequence
 
-**Created:** 2026-10-05 | **Updated:** 2026-10-08
-**Status:** ACTIVE (Track 1 Locked at 0.13; Track 2 Master Plan in §7 — Epic `gemma4-wzlk`)
+**Created:** 2026-10-05 | **Updated:** 2026-10-09
+**Status:** ACTIVE (Track 1 Locked at 0.13; Track 2 Master Plan in §7 — Epic `gemma4-wzlk`; GCP Post-Mortem Compendium: `docs/COMPENDIUM_LESSONS_LEARNED_GCP.md`)
 **Rule:** one variable per submission. No bundling. Execution is user-only via `./start.sh`.
 
 ---
@@ -340,8 +340,8 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 | **Track 2 Prep A: External Source B Dataset Download** | ✅ **COMPLETED** | Downloaded 14.31 GB across 79 Parquet shards in `data/source_b/` (`swe_smith` 1.00 GB, `swe_rebench` 1.94 GB, `swe_zero` 11.37 GB). |
 | **Track 2 Prep B: Deep Research Engineering Spec** | ✅ **COMPLETED** | Completed 5-persona engineering report (`Gemma4_Unsloth_LoRA_Adapter_Settings_Eng_20261008_1303.md`) establishing exact FP4/QAT autograd, LoRA module count, and vLLM key mapping invariants. |
 | **Track 2 Phase 1a: Initial 3-Source SFT Draft (`500/500/500`)** | 🔄 **SUPERSEDED** | Initial 1,500-sample build (`500 swe_smith`, `500 swe_rebench`, `500 swe_zero`) superseded after audit showed `swe_rebench` has median 51 tool calls (98.9% $>30$ calls) and multi-file noise. |
-| **Track 2 Phase 1b: Zero-Leakage Single-File $\le 20$-Call Curriculum** | 🔄 **SPEC REFINED (LOCKDOWN PENDING)** | Refined with strict 100% single-file `.py` gate, $\le 20$ tool-call ceiling, `swe_rebench` dropped, and Straight-Shot (4,387) vs. Constructive Pivot (1,834) mining from 6,221 candidate pool on disk. |
-| **Track 2 Phase 2: Unsloth FP4 Training Script Alignment** | ⏸️ **PENDING REVIEW** | Waiting on joint plan review before modifying `scripts/train_gemma4_unsloth_cloud.py` and notebook builders. |
+| **Track 2 Phase 1b: Zero-Leakage Single-File Curriculum (`<20` Clean + `<20` Pivoting-Negative)** | ✅ **COMPLETED** | Built 1,500 zero-thought 262K Gemma 4 samples (`750 swe_smith`, `750 swe_zero`, `0 swe_rebench`): 1,194 train (`98` tasks, `sha256: 971ea3765ecdb453...`) + 306 val (`27` tasks, `sha256: 80ffa4e5799c4d70...`), max 3,070 tokens, 100% single-file `.py`, 0 Type-B dumb calls. |
+| **Track 2 Phase 2: Training Script & Template Alignment (`gemma4-wzlk.6`)** | ✅ **COMPLETED (2026-10-08)** | Dual-path loader (`google/gemma-4-31b-it-qat-w4a16-ct` primary with `load_in_4bit=False, use_exact_model_name=True` + `compressed-tensors`/`llm-compressor`; `google/gemma-4-31B-it-qat-q4_0-unquantized` fallback with `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=False)`). Inline vLLM adapter normalization (`normalize_adapter_for_vllm`, 340 BF16 tensors $\le 35.0$ MB under `base_model.model.language_model.model.layers.*`). Synchronized across `scripts/train_gemma4_unsloth_cloud.py`, `gcp/deploy_gemma4_lora.sh`, `scripts/build_unsloth_notebook.py`, and `scripts/build_unsloth_training_kernel.py`. Verified by `tests/test_unsloth_sft_dataset.py` (6/6 passing). |
 | **Track 2 Phase 3: vLLM Multimodal Key Normalizer** | ✅ **SCRIPT COMPLETED / ⏸️ RUN PENDING** | `scripts/normalize_adapter_vllm.py` created on disk; will run post-training to remap keys to `base_model.model.language_model.model.layers.*` and verify 340 BF16 tensors (<35 MB). |
 | **Track 2 Phase 4: 14-Task Gauntlet / Compute Staging (`gemma4-9r1`)** | ⏸️ **PENDING** | Evaluate normalized LoRA under authentic vLLM `w4a16-ct` before touching `submission.zip`. |
 
@@ -352,10 +352,14 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 ```
   [External Source B Parquet Shards: swe_smith + swe_zero (swe_rebench dropped)]
                          │
-                         ▼  Strict Filter: 100% single-file .py, <=20 calls, 0% tasks.jsonl
-     [Candidate Pool: 6,221 challenges (4,387 Straight-Shot, 1,834 Constructive Pivot)]
-                         │
-                         ▼  Balanced Sampling (~1,500 decision step windows)
+                         ▼  Strict Filter:
+                         │  • 0% tasks.jsonl (129 IDs excluded), 0% local run_B*
+                         │  • 100% single-file .py fixes only
+                         │  • < 20 clean tool calls AND < 20 negative tool calls (< 40 total)
+                         │  • Two-Kind Negative Call Filter:
+                         │      KEEP: Endgame-Pivoting negatives (Red-to-Green repro/test, hypothesis pivot)
+                         │      DROP: Dumb/stupid negatives (failed edits, bad paths/args, thrashing)
+                         ▼
         [data/unsloth_sft/train.jsonl (~1,350 samples / ~80-120 tasks)]
         [data/unsloth_sft/val.jsonl   (  ~150 samples / ~10-15 disjoint tasks)]
                          │
@@ -381,45 +385,72 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 
 ### 7.3 Phase-by-Phase Engineering Plan
 
-#### Phase 1: Zero-Leakage Multi-Turn SFT Dataset (**🔄 SPEC REFINED (LOCKDOWN PENDING)**)
+#### Phase 1: Zero-Leakage Multi-Turn SFT Dataset (**✅ COMPLETED — 1,500 Samples / 125 Tasks Verified**)
 - **Script**: `scripts/build_unsloth_dataset.py`
 - **Benchmark Leakage Guard**: Loads all 129 `instance_id`s from `tasks.jsonl` into `benchmark_exclusions` and excludes all local `run_B*` traces (100% external Source B only).
-- **Single-File Scope Constraint**: 100% single-file `.py` fixes only (0% multi-file, 0% non-`.py`). Eliminates multi-file trajectory wandering in SFT (`max_seq_length=3072`) and aligns with the 85.3% 1-2 file complexity ceiling of `tasks.jsonl`.
-- **Strict Budget Ceiling**: Trajectory total tool calls $\le 20$. Pruning long trajectories guarantees a 20+ call safety margin inside the competition's 40-call budget for reasoning, exploration, and recovery.
+- **Single-File Scope Constraint**: **100% single-file `.py` fixes only** (0% multi-file, 0% non-`.py`). Eliminates multi-file trajectory wandering in SFT (`max_seq_length=3072`) and aligns with the 85.3% 1–2 file complexity ceiling of `tasks.jsonl`.
+- **Dual `< 20` Tool-Call Budget Gate ($< 20$ Clean + $< 20$ Negative $< 40$ Total)**:
+  - **Clean Tool Calls $< 20$**: Total productive exploration, edit, verification, and submission calls must be strictly $< 20$.
+  - **Negative Tool Calls $< 20$**: Total negative/error-returning calls must be strictly $< 20$, guaranteeing the combined trajectory ($<20\text{ clean} + <20\text{ negative}$) fits inside the competition's 40-call global budget.
+- **Two-Kind Negative Tool Call Filter (Keep Endgame-Pivoting Only, Drop Dumb Calls)**:
+  1. **Endgame-Pivoting Negative Calls (✅ KEEP)**: Negative outcomes that provide causal signal and pivot the agent directly toward the root cause and endgame fix:
+     - *Red-to-Green Reproduction / Test Failure*: Pre-edit `repro-check` or `test-gate` fails with `AssertionError` / traceback reproducing the issue $\to$ agent applies `edit_file` $\to$ post-edit test passes (`exit_code == 0`).
+     - *Hypothesis-Disconfirming Probe*: A targeted search (`fast-grep` / `code-map`) or inspection disconfirms an initial candidate and immediately pivots the agent to the true target symbol/file without repeating the failed query.
+  2. **Dumb / Stupid Negative Tool Calls (❌ EXCLUDE / SCRUB)**: Uninformative mechanical blunders and thrashing that waste budget without advancing the fix:
+     - Failed `edit_file` / `str_replace` calls due to mismatched `old_string` or syntax corruption.
+     - Reading non-existent filepaths (`FileNotFoundError`), invalid tool arguments, or malformed commands.
+     - Repeated identical failing calls or blind multi-turn wandering that does not pivot to the fix.
 - **Source Dataset Filtering**:
   - `swe_smith`: Retained (Claude 3.7 Sonnet tool-split trajectories with native thoughts and tool calls).
   - `swe_rebench`: **Dropped entirely** (median 51 tool calls, 98.9% $>30$ calls; teaches budget thrashing and exceeds the 40-call budget).
-  - `swe_zero`: Retained (OpenHands trajectories with verified non-empty patches $\le 150$ lines).
-- **Curriculum Stratification (Straight-Shot vs. Constructive Pivot)**:
-  - **Straight-Shot Challenges**: 0 tool errors, clean linear exploration and edit execution in $\le 20$ calls.
-  - **Constructive Pivot Challenges**: Measured causal disconfirmation and recovery in $\le 20$ calls:
-    - *Red-to-Green Test Pivots*: Pre-edit test execution fails with `AssertionError` / `exit_code != 0` $\to$ edit applied $\to$ post-edit test passes (`exit_code == 0`). Teaches genuine hypothesis testing and test-driven repair.
-    - *Tool Error Recovery*: Tool call fails or returns 0 matches $\to$ assistant immediately pivots strategy without repeating the mistake.
-- **Measured Empirical Pool on Disk (`data/source_b/`)**:
-  - `swe_smith`: 1,077 eligible single-file $\le 20$-call challenges (1,015 Straight-Shot, 62 Constructive Pivot / 32 Red-to-Green).
-  - `swe_zero` (first 5 shards): 5,144 eligible single-file $\le 20$-call challenges (3,372 Straight-Shot, 1,772 Constructive Pivot / 1,767 Red-to-Green).
-  - **Combined Pool**: 6,221 unique qualified challenges (4,387 Straight-Shot, 1,834 Constructive Pivot) vs. 1,500 target sample size ($>4\times$ surplus).
+  - `swe_zero`: Retained (OpenHands trajectories with verified non-empty single-file `.py` patches $\le 150$ lines).
+- **Verified Empirical Pool on Disk (`data/source_b/`)**:
+  - `swe_smith`: **2,891 strict tasks** with zero dumb calls (>45,000 decision steps; mean 15.96 steps/task).
+  - `swe_zero`: **3,531 strict tasks** in first 5 of 64 shards (56,209 decision steps; ~45,000 tasks / >700,000 steps across all 64 shards).
+  - **Combined Pool**: **>6,400 qualified tasks** and **>100,000 clean decision steps** ($>60\times$ surplus over the 1,500 target).
 - **Production Tool & Skill Contract**:
   - Strictly 6 callable tools: `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`, `run_skill_script` (`run_command` = 0).
   - Exact parameter schema matching `HARNESS_README.md:433-460` and `submissions/track1_live/prompts/main.md` (`filepath`, `old_string`, `new_string`, `allow_multiple`).
   - OpenHands/Claude actions translated cleanly (`str_replace_editor` $\to$ `read_file`/`edit_file`/`write_file`, `pytest` $\to$ `test-gate`, `grep` $\to$ `fast-grep`, `python -c` $\to$ `repro-check`, `think` folded into `reasoning`).
-- **Gemma 4 Chat Template & Prefix-Delta Formatting**:
-  - Rendered with `models/gemma-4-31b-it-qat-w4a16-ct/chat_template.jinja` (`enable_thinking=True`, `preserve_thinking=True`).
-  - Verified `full_text.startswith(prefix_text)` on 100% of samples.
-#### Phase 2: Unsloth LoRA Training on 1x 24GB L4 GPU (**⏸️ PENDING REVIEW**)
-- **Target Scripts**: `scripts/train_gemma4_unsloth_cloud.py`, `scripts/build_unsloth_notebook.py`, `scripts/build_unsloth_training_kernel.py`.
+- **Gemma 4 262K Vocabulary, Natural Chat Template & Thinking Turned OFF**:
+  - **Official 262,144-Token Vocabulary Binding**:
+    - Local tokenizer source: `models/gemma-4-31b-it-qat-w4a16-ct/` (`tokenizer.json` 30.7 MB, `tokenizer_config.json` 3.6 KB, `chat_template.jinja` 18.2 KB).
+    - Cloud tokenizer source: `AutoTokenizer.from_pretrained("google/gemma-4-31B-it-qat-q4_0-unquantized")` (or `google/gemma-4-31B-it`).
+    - Both dataset generation and Unsloth training MUST bind directly to the official 262,144-token Gemma 4 tokenizer to preserve exact embedding and control-token alignment.
+  - **Natural Behavior Formatting via `apply_chat_template` (Zero Manual Concatenation)**:
+    - Never manually concatenate strings or guess control tags (e.g. generic `<|begin_of_turn|>` snippets vs authentic Gemma 4 `<|turn>user\n...<turn|>\n<|turn>model\n...<turn|>`).
+    - **Role Preservation Invariant**: Keep `"role": "assistant"` in input conversation dictionaries. **Do NOT manually rename `"assistant"` to `"model"` in the raw data**. In `chat_template.jinja:230`, the template automatically converts `'assistant'` to `'model'`, while lines 232 and 365 explicitly inspect `prev_non_tool_role == 'assistant'` and `next_nt.role == 'assistant'` to correctly merge multi-step tool turns. Manually renaming to `'model'` beforehand breaks multi-turn tool continuation!
+    - **Single `<bos>` Token Invariant**: `chat_template.jinja:188` explicitly prepends `{{- bos_token -}}` (`<bos>`). Dataset pre-tokenization MUST call `tokenizer(full_text, add_special_tokens=False)["input_ids"]`. This guarantees exactly ONE `<bos>` token at index 0, preventing both missing `<bos>` and double `<bos><bos>` sequence corruption.
+    - **Canonical Special Tokens vs Hallucinations**: Gemma 4 uses `<|turn>` / `<turn|>`, `<|channel>thought\n` / `<channel|>`, and `<|tool_call>...<tool_call|>`. Legacy tags from Gemma 2/3 (`<start_of_turn>`, `<end_of_turn>`) or DeepSeek/Qwen (`<think_start>`, `<think_end>`) do NOT exist in Gemma 4 and must never be referenced in regexes or collators.
+    - Always pass structured conversation dictionaries through `tokenizer.apply_chat_template(..., tokenize=False, add_generation_prompt=..., enable_thinking=False)` to produce `prefix_text` and `full_text`, then convert into the 262,144-token vocabulary via `tokenizer(full_text, add_special_tokens=False)["input_ids"]`.
+  - **Thinking MUST BE TURNED OFF during SFT**: Rendered with `enable_thinking=False`. Target completions contain ZERO `<|channel>thought` tokens; model directly predicts tool calls (`<|tool_call>call:fn{...}<tool_call|><turn|>`). Eliminates dummy thought synthesis boilerplate, cuts sequence tokens to fit well within 3072, avoids empty-thought traps, and teaches pure 5-tool + 5-skill routing.
+  - **Template & Harness Bridge Mechanics**:
+    1. `chat_template.jinja` with `enable_thinking=False` omits `<|think|>` from the system prompt. On Turn 0 (`add_generation_prompt=True`), it appends `<|channel>thought\n<channel|>` to signal thinking is closed. The dataset generator reconciles `prefix_text` and `full_text` to verify `full_text.startswith(prefix_text)` on 100% of samples.
+    2. **Eval Bridge Pairing**: When evaluating the adapter, `configs/sampling.yaml` in the staged submission directory sets `include_thoughts: false` (`thinking_budget: 0`), so the ADK bridge passes `extra_body.chat_template_kwargs.enable_thinking = False` to vLLM, avoiding `<|think|>` prompt injection.
+#### Phase 2: Training Script & Template Alignment (`gemma4-wzlk.6`) (**✅ COMPLETED (2026-10-08)**)
+- **Target Scripts**: `scripts/train_gemma4_unsloth_cloud.py`, `gcp/deploy_gemma4_lora.sh`, `scripts/build_unsloth_notebook.py`, `scripts/build_unsloth_training_kernel.py`.
+- **Verified Alignment Details**:
+  - **Dual-Path Base Model Loader**: Primary path attempts `google/gemma-4-31b-it-qat-w4a16-ct` natively via `compressed-tensors` + `llm-compressor` with `load_in_4bit=False, use_exact_model_name=True` (preventing `BitsAndBytesConfig` errors on pack-quantized models). Fallback path loads `google/gemma-4-31B-it-qat-q4_0-unquantized` with `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=False)` to prevent non-linear scale distortion.
+  - **Inline vLLM Adapter Normalization Hook**: Immediately after `model.save_pretrained()`, `normalize_adapter_for_vllm()` rewrites keys from `base_model.model.model.layers.*` to `base_model.model.language_model.model.layers.*`, recasts all 340 LoRA tensors (170 attention modules: 60 `q_proj`, 50 `v_proj`, 60 `o_proj`; `k_proj` omitted per `attention_k_eq_v=True`) to `torch.bfloat16` ($\le 35.0$ MB), and strips extraneous non-adapter artifacts.
+  - **Codebase Synchronization**: Synchronized across `scripts/train_gemma4_unsloth_cloud.py`, `gcp/deploy_gemma4_lora.sh`, `scripts/build_unsloth_notebook.py`, and `scripts/build_unsloth_training_kernel.py`.
+  - **Automated Test Gate**: Verified by `tests/test_unsloth_sft_dataset.py` (6/6 passing).
 - **Locked Engineering Parameters**:
 
 | Parameter | Locked Value | Engineering Rationale |
 |---|---|---|
-| **Base Checkpoint** | `google/gemma-4-31B-it-qat-q4_0-unquantized` | `w4a16-ct` (`CompressedLinear`) lacks PyTorch autograd backward dequant kernels for $\nabla_X = \nabla_Y W^T$. |
-| **Quantization Config** | `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)` | Uniform symmetric `fp4` grid aligns with Google's symmetric `q4_0` QAT training grid; `nf4` non-linear quantiles distort QAT weights. Fits in ~15.35 GiB static VRAM. |
+| **Base Checkpoint** | Primary: `google/gemma-4-31b-it-qat-w4a16-ct`<br>Fallback: `google/gemma-4-31B-it-qat-q4_0-unquantized` | Dual-path loader prioritizes authentic served `w4a16-ct` INT4 base, with robust unquantized QAT fallback. |
+| **Quantization Config** | `load_in_4bit=False` (for `w4a16-ct`) / `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="fp4", bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=False)` (fallback) | Uniform symmetric `fp4` grid aligns with Google's symmetric `q4_0` QAT training grid; `use_double_quant=False` prevents scale distortion. Fits in ~15.35 GiB static VRAM. |
 | **Target Modules** | `["q_proj", "v_proj", "o_proj"]` | **170 modules** across 60 layers (10 global full-attention layers have `attention_k_eq_v=True` and omit `v_proj`). Freeze `k_proj`, MLPs, and vision tower. Trainable params: **13,926,400** (26.56 MB in BF16). |
 | **LoRA Rank & Alpha** | `r = 8`, `lora_alpha = 16`, `lora_dropout = 0.0`, `bias = "none"` | Scaling $\alpha/r = 2.0$; `lora_dropout = 0.0` required for Unsloth fast Triton kernels. |
 | **rsLoRA & NEFTune** | `use_rslora = False`, `neftune_noise_alpha = None` | `use_rslora=True` increases effective step size by $\sqrt{8} \approx 2.83\times$; NEFTune corrupts discrete control tokens (`<|tool_call>`, `<|"|>`). |
-| **Tokenization & Masking** | Pre-tokenized `.map()` on `full_text` with `labels[:K] = -100` | Avoids SentencePiece boundary merge misalignment ($\text{enc}(A) + \text{enc}(B) \neq \text{enc}(A+B)$) and prevents `SFTTrainer` from stripping custom columns. |
+| **Tokenization & Masking** | Official **262,144-token** Gemma 4 `AutoTokenizer` (`apply_chat_template` $\to$ pre-tokenized `.map()` on `full_text` with `labels[:K] = -100`) | Preserves 262K embedding alignment, avoids SentencePiece boundary merge misalignment ($\text{enc}(A) + \text{enc}(B) \neq \text{enc}(A+B)$). **Strict Prefix Masking Rule**: Do NOT use `DataCollatorForCompletionOnlyLM` on `<|turn>model\n`; in Gemma 4 multi-turn trajectories, `<|tool_response>` blocks are nested inside the continuing `model` turn. A response collator would compute loss on massive tool outputs (file contents, tracebacks). Instead, setting `labels[:K] = -100` (`K = len(prefix_ids)`) masks 100% of prompt and prior tool-response tokens, computing loss exclusively on the target tool call. |
 | **Sequence Length & Eval** | `max_seq_length = 3072`, `eval_strategy = "no"` | `eval_strategy="steps"` materializes a 7.50 GiB `[1, 3072, 262144]` FP32 logit tensor and OOMs a 24GB L4 GPU. Peak training VRAM with `eval_strategy="no"`: **~20.43 GiB**. |
+| **Precision & Hardware** | `bf16 = True`, `fp16 = False`, `bnb_4bit_compute_dtype = torch.bfloat16` | **Strict Bfloat16 Enforcement**: No `fp16` fallback. Gemma 4's 262K vocabulary and high activation scales cause immediate `NaN` loss under FP32-to-FP16 overflow (`max 65504`). GCP L4 GPU (Ada Lovelace, compute capability 8.9) natively executes BF16. |
 | **Optimizer & Schedule** | `optim = "paged_adamw_8bit"`, `LR = 1.5e-4`, `cosine`, `warmup_steps = 15`, `B = 1`, `GAS = 8`, `num_train_epochs = 1` (~170 steps) | Effective batch size 8; `weight_decay = 0.01`, `max_grad_norm = 1.0`, `seed = 3407`. |
+
+- **Preflight Thinking Behavior Deployment Probe (Mandatory Gate Before Full Training)**:
+  - Before committing full GPU resources to 170-step training, execute a 10-step preflight probe on 5 samples on GCP 1x L4 GPU.
+  - Empirically inspect generation output: verify the fine-tuned checkpoint immediately generates `<|tool_call>` without emitting `<|channel>thought` tokens or degraded ghost thoughts.
 
 #### Phase 3: Post-Training vLLM Key Normalization & Gate (**✅ SCRIPT COMPLETED / ⏸️ EXECUTION PENDING**)
 - **Script**: `scripts/normalize_adapter_vllm.py` (created and executable).
@@ -442,4 +473,12 @@ Read `final_metrics.total_completion_tokens` per trace to distinguish E1 recurre
 1. **Compute Target**: **Option A (GCP 1x L4 24GB VM)** via `gcp/deploy_gemma4_lora.sh` + `scripts/train_gemma4_unsloth_cloud.py`. Provides dedicated VRAM, avoids Kaggle kernel queue timeouts, and runs 170 steps in ~25–35 mins.
 2. **Dataset Action Distribution**: **Keep Natural Trajectory Step Ratio** (`read_file` 40.7%, `run_skill_script` 33.5%, `edit_file` 11.9%, `write_file` 7.9%, `submit_patch` 5.4%, `get_status` 0.7%). Preserves authentic agent exploration-to-repair balance without artificial distortion.
 3. **Cross-Quantization Smoke Check**: **Approved**. Run a 1–2 task vLLM `w4a16-ct` adapter-loading smoke check on Kaggle Compute immediately after normalizing the adapter before committing GPU quota to the 14-task gauntlet (`gemma4-9r1`).
-4. **Complexity & Budget Guardrails**: **Locked**. Enforce 100% single-file `.py` fixes, strict $\le 20$ tool-call budget ceiling, prune `swe_rebench`, and mine Straight-Shot vs. Constructive Pivot challenges from the 6,221-challenge verified pool.
+4. **Single-File & `< 20` Clean / `< 20` Pivoting-Negative Filter Rule**: **Locked**. Enforce 100% single-file `.py` fixes, $< 20$ clean tool calls, and $< 20$ negative tool calls ($< 40$ total). Within negative tool calls, strictly separate the two types: **keep** endgame-pivoting negative calls (Red-to-Green test/repro disconfirmation that pivots to the fix) and **exclude/scrub** dumb/stupid negative tool calls (failed `old_string` edits, nonexistent file reads, bad arguments, thrashing); drop `swe_rebench`.
+5. **Thinking Turned OFF during SFT (User Locked 2026-10-08)**: Set `enable_thinking=False` in `chat_template.jinja`. SFT sequences and target completions contain ZERO `<|channel>thought` tokens; model directly predicts tool actions. Eliminates dummy thought fallback boilerplate, prevents empty-thought traps, and keeps sequence length well inside 3072 tokens.
+6. **Preflight Thinking Behavior Deployment Probe (Locked 2026-10-08)**: Mandatory 10-step probe on 5 samples deployed to GCP 1x L4 GPU before running the full 170-step training run. Confirms empirically that the adapter outputs `<|tool_call>` directly without emitting `<|channel>thought` tokens.
+7. **Gemma 4 262,144-Token Vocabulary, Natural Behavior Mapping & Template Invariants (Locked 2026-10-08)**: Bind dataset formatting and Unsloth training directly to the official Gemma 4 31B IT 262,144-token tokenizer (`models/gemma-4-31b-it-qat-w4a16-ct/` locally; `google/gemma-4-31B-it-qat-q4_0-unquantized` / `google/gemma-4-31B-it` on cloud).
+   - **Role Preservation**: Keep `"role": "assistant"` in input dictionaries. Do NOT rename to `"model"`. `chat_template.jinja` requires `'assistant'` to merge multi-step tool turns and automatically converts to `<|turn>model\n`.
+   - **Single `<bos>` Invariant**: Pre-tokenization calls `tokenizer(full_text, add_special_tokens=False)["input_ids"]` to preserve the single `<bos>` emitted by `chat_template.jinja:188`, avoiding missing or duplicate `<bos><bos>`.
+   - **Multi-Turn Masking Guard**: Do NOT use `DataCollatorForCompletionOnlyLM` on `<|turn>model\n`; in multi-turn tool trajectories, `<|tool_response>` blocks are nested inside the continuing `model` turn. Exact prefix-length masking `labels[:K] = -100` (`K = len(prefix_ids)`) masks all user prompts and prior tool responses, computing loss strictly on the target tool call.
+   - **Canonical Special Tokens**: Use authentic Gemma 4 tokens (`<|turn>` / `<turn|>`, `<|channel>thought\n` / `<channel|>`, `<|tool_call>...<tool_call|>`). Never use legacy/hallucinated tags (`<start_of_turn>`, `<think_start>`).
+8. **Strict Bfloat16 Precision Gate (Locked 2026-10-08)**: Enforce `bf16 = True`, `fp16 = False`, `bnb_4bit_compute_dtype = torch.bfloat16`. Zero `fp16` fallback on GCP 1x L4 GPU. Prevents catastrophic `NaN` loss spikes caused by Gemma 4's massive 262,144-token vocabulary and high activation scales exceeding FP16 dynamic range (`max 65504`).

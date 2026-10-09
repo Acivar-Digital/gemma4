@@ -207,6 +207,41 @@ def test_g_sampling_no_thinking_level_passes(policy):
     assert "absent" in result.message
 
 
+
+def test_g_sampling_no_thinking_level_fails_on_forbidden_key(policy, tmp_path, monkeypatch):
+    """A sampling.yaml containing thinking_level -> FAIL (red-proof).
+
+    Proves g_sampling_no_thinking_level is falsifiable and actually turns red
+    when a bad artifact introduces the forbidden key (bd gemma4-5etw).
+    """
+    fake_sub = tmp_path / "submission"
+    fake_configs = fake_sub / "configs"
+    fake_configs.mkdir(parents=True)
+    bad_yaml = fake_configs / "sampling.yaml"
+    bad_yaml.write_text(
+        "temperature: 0.15\ntop_p: 0.9\nthinking_level: 2\nmax_output_tokens: 4096\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(fake_sub))
+
+    result = cs.g_sampling_no_thinking_level(policy)
+    assert result.status == cs.FAIL, (
+        f"expected FAIL when thinking_level is present, got {result.status}: {result.message}"
+    )
+    assert "forbidden sampling key 'thinking_level' present" in result.message
+    assert "Delete 'thinking_level'" in result.remediation
+
+
+def test_g_sampling_no_thinking_level_fails_when_missing(policy, tmp_path, monkeypatch):
+    """Missing configs/sampling.yaml -> FAIL."""
+    fake_sub = tmp_path / "empty_sub"
+    fake_sub.mkdir()
+    monkeypatch.setattr(cs, "SUBMISSION_DIR", str(fake_sub))
+
+    result = cs.g_sampling_no_thinking_level(policy)
+    assert result.status == cs.FAIL
+    assert "missing" in result.message
+
 def test_g_prompt_ladder_consistency_passes_on_current_prompt(policy):
     """The CORRECTED main.md (Turns 1-10 / Turn 11 / 12-32 / 33-36) -> PASS.
 
@@ -1224,7 +1259,7 @@ def test_category_and_only_compose_including_empty_intersection(policy, tmp_path
 
 
 def test_every_gate_is_classified_into_exactly_one_valid_category():
-    """All 15 gates are classified; none uncategorized; valid set is exactly the 3.
+    """All 16 gates are classified; none uncategorized; valid set is exactly the 3.
 
     Proves the classification registry is a total, well-typed mapping: every
     registered gate has exactly one category, no category names a non-existent
@@ -1249,9 +1284,9 @@ def test_every_gate_is_classified_into_exactly_one_valid_category():
         f"category names non-registered gate(s): {sorted(classified - registered)}"
     )
     # The mapping is exactly one-category-per-gate with the right total size.
-    assert len(cs.ALL_GATES) == 15, f"expected 15 registered gates, got {len(cs.ALL_GATES)}"
-    assert len(cs.GATE_CATEGORY) == 15, (
-        f"expected 15 classified gates, got {len(cs.GATE_CATEGORY)}"
+    assert len(cs.ALL_GATES) == 16, f"expected 16 registered gates, got {len(cs.ALL_GATES)}"
+    assert len(cs.GATE_CATEGORY) == 16, (
+        f"expected 16 classified gates, got {len(cs.GATE_CATEGORY)}"
     )
     # The valid category set is exactly {submission, post_run, hygiene}.
     assert set(cs.GATE_CATEGORIES) == {"submission", "post_run", "hygiene"}
@@ -1266,24 +1301,26 @@ def test_every_gate_is_classified_into_exactly_one_valid_category():
     )
 
 
-def test_warning_and_unknown_gate_exit_semantics_unchanged(policy):
+def test_warning_and_unknown_gate_exit_semantics_unchanged(policy, monkeypatch):
     """The pre-existing, category-independent exit rules still hold.
 
     Two unchanged rules, kept in their own test so a failure localises:
-      * a WARN alone never affects the exit code (g_sampling_output_cap is a real
-        WARN on the real tree), and
+      * a WARN alone never affects the exit code (tested by lowering project_cap
+        so g_sampling_output_cap produces a WARN), and
       * an unknown --only gate name is a hard error (guards --only typos
         silently "passing" by running nothing).
     """
     # WARN alone -> exit 0.
-    output_cap = dict(cs.ALL_GATES)["g_sampling_output_cap"](policy)
+    warn_policy = json.loads(json.dumps(policy))
+    warn_policy["serving"]["max_output_tokens_project_cap"] = 2048
+    monkeypatch.setattr(cs, "load_policy", lambda *args, **kwargs: warn_policy)
+    output_cap = dict(cs.ALL_GATES)["g_sampling_output_cap"](warn_policy)
     assert output_cap.status == cs.WARN, (
-        f"precondition broken: expected the real tree to WARN, got {output_cap.status}"
+        f"precondition broken: expected lower project_cap to WARN, got {output_cap.status}"
     )
     rc_warn, warn_out = _main_exit(["--only", "g_sampling_output_cap"])
     assert rc_warn == 0, "a WARN alone must NOT affect the exit code"
     assert "[WARN]" in warn_out
-
     # Unknown gate name -> hard error.
     rc_unknown, _ = _main_exit(["--only", "g_does_not_exist"])
     assert rc_unknown == 1, "an unknown --only gate name must be a hard error"

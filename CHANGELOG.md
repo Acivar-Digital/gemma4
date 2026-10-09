@@ -2,6 +2,46 @@
 
 All notable changes to the SWE-Gemma Autonomous Developer Agent submission architecture and evaluation harness.
 
+## [2026-10-10] - Pydantic AI 2.0 & pydantic_graph SFT Translation Pipeline & External Review Dossier
+
+### SFT Trajectory Translation DAG Pipeline (`pydantic/translate_sft_dag.py`)
+- **5-Node Typed DAG**: Built automated, serial DAG orchestrator (`IngestRawTaskNode` -> `RunPydanticAgentNode` -> `ReconcileObservationsNode` -> `RenderGemma4JinjaNode` -> `PersistTaskArtifactsNode`) using `pydantic-ai` (2.54.0) and `pydantic-graph` (1.63.0).
+- **Diagnostic Pivot Loop & ModelRetry**: Implemented multi-turn diagnostic feedback loop (up to 3 pivot turns with `message_history`) with Pydantic V2 `@agent.output_validator` `ModelRetry` self-correction, Markdown/JSON fence stripping, and balanced JSON extraction fallback.
+- **Jinja Argument Serialization Bugfix**: Fixed Gemma 4 official `chat_template.jinja` crash by passing dictionary mappings directly (`"arguments": fn_args`) instead of JSON strings.
+- **Token Prefix-Delta Alignment**: Guaranteed `full_ids[:len(prefix_ids)] == prefix_ids` loss masking, sequence length ceiling (<= 3072 tokens), and zero-thought `<|channel>thought` format for single L4 GPU LoRA training.
+- **5/5 Deterministic Unit Tests**: Added unit tests in `pydantic/test_translate_sft_dag.py` covering schema validation, trajectory structural rules, ModelRetry, Jinja tokenization, and multi-turn pivot loops (5 passed in 11.6s).
+- **1-Task Smoke Test Verified**: Executed smoke test against LiteRouter (`thinkingmachines/inkling:free`) on `scipy__scipy-13879`, successfully pivoting on attempt 2 to yield 5 verified SFT decision windows.
+
+### External Review Dossier (`pydantic/external_consultants.md`)
+- **Consultant Analysis on Behavioral Shift**: Documented detailed audit addressing the DAgger / Behavioral Cloning Distribution Shift dilemma, explaining how negative observations (failing pytest repro assertions) are retained while scrubbing unproductive shell noise.
+- **Auditing Questionnaire**: Formulated comprehensive verification questions spanning dataset composition, token length bounds, loss convergence, and the runtime Prompt Governor safety net.
+
+## [2026-10-08] - Architecture Single Truth, Fallacy Purge, Proxy Shield & Persistent Test Bootstrap
+
+### 5-Skill + 5-Tool Single-Truth Architecture (`gemma4-m5og`, `gemma4-bxmw`, `gemma4-stub`, `gemma4-b482`)
+- **Purged `run_command` Fallacy**: Removed phantom `run_command` directives and claims from `submissions/track1_live/agent.yaml`, `prompts/main.md`, `AGENTS.md`, and all persistent records.
+- **Architectural Invariant Locked**: Enforced the locked 10-tool operational contract:
+  - 5 structured skill scripts invoked via `run_skill_script`: `fast-grep`, `code-map`, `code-oracle`, `repro-check`, `test-gate`.
+  - 5 direct file/status tools: `read_file`, `edit_file`, `write_file`, `get_status`, `submit_patch`.
+  - Strictly 0 raw shell access (`run_command`), eliminating 300s hanging pytest sweeps, bash heredoc escaping bugs, and `/workspace` scratch git pollution.
+- **Consultant Research Dossier Rebuilt**: Generated clean, authoritative dossier chapters `training/research_dossier/00_CONSULTANT_PROMPT.md` through `08_CONSULTANT_CONSENSUS_AND_ACTION_PLAN.md` with verified math, 4-dataset builder recipes (`build_unsloth_dataset.py`), and L4 GPU LoRA feasibility (20.31 GiB peak VRAM).
+- **External Review Packet Reconstructed**: Replaced `EXTERNAL_REVIEW_PACKET.md` and `docs/EXTERNAL_REVIEW_PACKET.md` with byte-identical single-truth executive summaries.
+- **Verified 0.13 Baseline Registry**: Repackaged `submission.zip` matching locked `0.13` public leaderboard baseline (`56883026`, SHA-256 `b380102d...`) across all 15 submission gates.
+
+### Persistent Test Environment Bootstrap (`gemma4-owvn`)
+- **Decoupled from `/tmp`**: Created `scripts/bootstrap_test_env.sh` and pinned `requirements-test.txt` to manage a repository-local persistent virtual environment (`.venv`).
+- **Backward Compatibility**: Maintained seamless fallback to `/tmp/g4venv` symlink so existing runner scripts and gauntlets run uninterrupted.
+- **Git Hygiene**: Added `.venv/` to `.gitignore` to prevent virtual environment pollution.
+
+### Proxy Model Detection & Eval Shield (`gemma4-46k2`)
+- **Authentic Target Enforcement**: Updated all evaluation and diagnostic entrypoints (`scripts/run_eval.py`, `scripts/preflight_check.py`, `start.sh`, `scripts/test_agents_diagnostic.py`) to default to `gemma-4-31b-it-qat-w4a16-ct`.
+- **Silent Proxy Guard**: Added loud failure assertions that reject proxy models (e.g., `stealth/space-bunny-alpha` or `thinkingmachines/inkling:free`) unless `--allow-proxy` / `SWEGEMMA_ALLOW_PROXY=1` is explicitly specified, preventing repeat of the B01–B40 proxy measurement confusion.
+- **Post-Run Trace Verification**: Added automated scan of evaluation traces (`trace_*.json`) to detect and invalidate proxy model contamination.
+
+### Gate Falsifiability & Root Cause Correction (`gemma4-5etw`)
+- **`thinking_level` Hypothesis Refutation**: Recorded that unscoped repository history confirms `thinking_level` was never present in the Oct-1 crashing artifact; the crash mechanism remains unexplained and cannot be attributed to LiteLLM `thinking_level` translation.
+- **Red-Proof Test Added**: Added `test_g_sampling_no_thinking_level_fails_on_forbidden_key` and `test_g_sampling_no_thinking_level_fails_when_missing` in `tests/test_check_submission.py`, proving `g_sampling_no_thinking_level` is genuinely falsifiable on malformed artifacts. Full 99-test suite passing.
+
 ## [Unreleased] - 2026-10-05 (Tool-Call Syntax Bleed Fix, Adapter Gate Corrected, Basename Gate Added)
 
 ### Tool-Call Syntax Bleed Fix (`gemma4-1dwj`, `gemma4-plx3`, `gemma4-if78`, `gemma4-icsd`)

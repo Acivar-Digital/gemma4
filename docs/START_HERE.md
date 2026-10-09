@@ -38,16 +38,14 @@ the harness' `compile_submission`. There is no `agent.py`.
   cause is **not** model quality: 77 of 95 traces have
   `total_completion_tokens: 0` and zero tool calls. The model emitted nothing.
   117 of 129 predictions were empty.
-- **The gates do not cover this.** `scripts/preflight_check.py` runs 8 real
-  checks and never opens `sampling.yaml`.
-  The legacy packaging check read `agent.yaml` from the *directory* while
-  reading `adapters/` from the *zip* — so an adapter present in one and absent
-  from the other passes the gate and silently serves the base model.
-- **The graded artifact is `submission.zip`, not `my_submission/`.** Three
-  divergent packagers exist and none is authoritative.
-  `scripts/verify_and_install_adapter.py` mutates the directory **without**
-  repacking the zip, which desynchronises them.
-
+- **The gates now cover this completely**: `scripts/check_submission.py` enforces
+  16 gates across 3 strict categories: `CAT_SUBMISSION` (14 veto gates),
+  `CAT_POST_RUN` (1 non-gating historical health check), and `CAT_HYGIENE`
+  (1 non-gating doc check), backed by `scripts/gate_policy.yaml` and verified by
+  `scripts/baseline_gate.py` against the locked 0.13 baseline (`56883026`).
+- **The graded artifact is `submission.zip`**, kept byte-identical with the canonical
+  source directory `submissions/track1_live/` (`my_submission` is a compatibility symlink).
+  Rebuilt in seconds by `scripts/submit_safe.sh`.
 ## Strategy (the user's own decision, not a guess)
 
 Build a **model-agnostic harness** first, because Gemma 4 is still an infant and
@@ -58,20 +56,19 @@ strong model does into Gemma 4 via LoRA SFT. Roughly two months of runway.
 
 | Path | What it is |
 |---|---|
-| `my_submission/` | the live submission source tree (19 files) |
-| `submission.zip` | **the graded artifact** |
+| `submissions/track1_live/` | the canonical live submission source tree (14 files, 5 skills) |
+| `my_submission` | compatibility symlink to `submissions/track1_live` |
+| `submission.zip` | **the graded artifact** (byte-identical with `submissions/track1_live`) |
 | `HARNESS_README.md` | harness contract; every hard limit lives here |
-| `docs/IRONCLAD_GATES_PLAN.md` | the four-gate plan to make infra failures impossible |
-| `docs/IRONCLAD_RULE_TABLE.md` | machine-checkable constraint list with current values |
+| `docs/IRONCLAD_GATES_PLAN.md` | the gate plan and architecture verification specifications |
+| `docs/IRONCLAD_RULE_TABLE.md` | machine-checkable constraint list with verified gate mapping |
 | `docs/FINDINGS.md` | evidence store, F1-F11, each with a `file:line` |
-| `docs/0*.md` | numbered context docs (constraints, failure modes, verify protocol) |
-| `scripts/preflight_check.py` | current gate — 8 checks, **no config/serving layer** |
-| legacy packaging check (deleted) | packaging gate — **wrong artifact for most checks** |
-| `scripts/build_kaggle_kernel.py` | builds the Kaggle notebook; contains the silent-failure code |
-| `cloud_results/` | the only real Gemma 4 artifacts |
+| `scripts/check_submission.py` | authoritative 16-gate checker |
+| `scripts/baseline_gate.py` | locked 0.13 leaderboard baseline gate (`--mode=leaderboard|compute`) |
+| `scripts/bootstrap_test_env.sh` | persistent `.venv` test environment setup |
+| `cloud_results/` | the historical real Gemma 4 evaluation artifacts |
 | `adapters_staging/`, `checkpoints/` | LoRA weights; **not** in the submission |
 | `tasks.jsonl`, `test.txt`, `test_all.txt` | 129 tasks; 77-task and 129-task manifests |
-
 ## Traps that have already cost real time
 
 - `my_submission/skills/<n>/<n>.py` **and** `skills/<n>/scripts/<n>.py` both

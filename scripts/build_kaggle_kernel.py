@@ -413,6 +413,15 @@ import os
 import shutil
 import zipfile
 from pathlib import Path
+
+# S4 Observability Remediation: monkeypatch rich to prevent 0-byte log files
+# in Kaggle/Jupyter environments (see docs/FINDINGS.md F14).
+try:
+    import rich.console
+    rich.console.Console._is_jupyter = lambda self: False
+except ImportError:
+    pass
+
 from swegemma.models import load_tasks
 
 DATA_DIR = Path('/kaggle/input/competitions/gemma-4-developer-agent')

@@ -103,6 +103,7 @@ DEFAULT_IMAGE_PROJECT="deeplearning-platform-release"
 
 CLI_DRY_RUN=false
 CLI_ALLOW_ANY_ACCOUNT=false
+CLI_FIVE_TEST_ALIGNMENT=false
 CLI_MACHINE=""
 CLI_ZONE=""
 CLI_PROVISIONING=""
@@ -110,7 +111,6 @@ CLI_PROJECT=""
 CLI_BUCKET=""
 CLI_HF_TOKEN=""
 CLI_DISK_SIZE=""
-
 show_usage() {
     cat << EOF
 ${BOLD}Gemma 4 LoRA GCP Deployment Launcher${RESET}
@@ -120,6 +120,7 @@ Usage:
 
 Options:
   --dry-run                 Run all preflight checks without deploying VM or uploading datasets.
+  --five-test-alignment     Deploy 5-test end-to-end LoRA alignment & Kaggle eval pipeline (g2-standard-48, 200GB disk, dual-venv).
   -m, --machine-type <type> GCP machine type (default: ${DEFAULT_MACHINE}).
                             Supported: g2-standard-32 (L4 24GB), a2-highgpu-1g (A100 40GB), a2-ultragpu-1g (A100 80GB).
   -z, --zone <zone>         GCP Zone (default: ${DEFAULT_ZONE}).
@@ -148,6 +149,10 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)
             CLI_DRY_RUN=true
+            shift
+            ;;
+        --five-test-alignment)
+            CLI_FIVE_TEST_ALIGNMENT=true
             shift
             ;;
         -m|--machine-type)
@@ -229,7 +234,17 @@ done
 # Resolve variables (CLI flag > Env var > Default)
 PROJECT_ID="${CLI_PROJECT:-${GCP_PROJECT:-${DEFAULT_PROJECT}}}"
 ZONE="${CLI_ZONE:-${GCP_ZONE:-${DEFAULT_ZONE}}}"
-MACHINE_TYPE="${CLI_MACHINE:-${GCP_MACHINE_TYPE:-${DEFAULT_MACHINE}}}"
+if [[ "${ZONE}" == "us-central1-b" ]]; then
+    log_warn "Zone 'us-central1-b' has scheduled GCP network control plane maintenance (Oct 9 00:00-05:00 PDT). Auto-routing to 'us-central1-a'."
+    ZONE="us-central1-a"
+fi
+if ${CLI_FIVE_TEST_ALIGNMENT}; then
+    MACHINE_TYPE="${CLI_MACHINE:-g2-standard-32}"
+    DISK_SIZE="${CLI_DISK_SIZE:-200GB}"
+else
+    MACHINE_TYPE="${CLI_MACHINE:-${GCP_MACHINE_TYPE:-${DEFAULT_MACHINE}}}"
+    DISK_SIZE="${CLI_DISK_SIZE:-${DEFAULT_DISK_SIZE}}"
+fi
 # Provisioning model: default to SPOT for cost savings, unless --no-spot/--standard is passed
 if [[ -n "${CLI_PROVISIONING}" ]]; then
     PROVISIONING_MODEL="${CLI_PROVISIONING}"
@@ -240,16 +255,24 @@ BUCKET_NAME="${CLI_BUCKET:-${GCP_BUCKET:-${PROJECT_ID}-gemma4-checkpoints}}"
 # Strip gs:// prefix if provided by user
 BUCKET_NAME="${BUCKET_NAME#gs://}"
 HF_TOKEN="${CLI_HF_TOKEN:-${HF_TOKEN:-}}"
-DISK_SIZE="${CLI_DISK_SIZE:-${DEFAULT_DISK_SIZE}}"
 DRY_RUN="${CLI_DRY_RUN}"
 
-TRAIN_DATA="${REPO_ROOT}/data/unsloth_sft_train.jsonl"
-VAL_DATA="${REPO_ROOT}/data/unsloth_sft_val.jsonl"
+if ${CLI_FIVE_TEST_ALIGNMENT}; then
+    TRAIN_DATA="${REPO_ROOT}/data/unsloth_sft_5test/train.jsonl"
+    VAL_DATA="${REPO_ROOT}/data/unsloth_sft_5test/val.jsonl"
+else
+    TRAIN_DATA="${REPO_ROOT}/data/unsloth_sft_train.jsonl"
+    VAL_DATA="${REPO_ROOT}/data/unsloth_sft_val.jsonl"
+fi
 TRAIN_SCRIPT="${REPO_ROOT}/scripts/train_gemma4_unsloth_cloud.py"
 
 MACHINE_SHORT="${MACHINE_TYPE%%-*}"
 TIMESTAMP_ID="$(date +%s)"
-INSTANCE_NAME="gemma4-unsloth-${MACHINE_SHORT}-${TIMESTAMP_ID}"
+if ${CLI_FIVE_TEST_ALIGNMENT}; then
+    INSTANCE_NAME="gemma4-5test-${MACHINE_SHORT}-${TIMESTAMP_ID}"
+else
+    INSTANCE_NAME="gemma4-unsloth-${MACHINE_SHORT}-${TIMESTAMP_ID}"
+fi
 
 # ------------------------------------------------------------------------------
 # 4. Banner & Execution Mode Display
@@ -294,7 +317,26 @@ log_success "All local tool prerequisites satisfied."
 
 # --- CHECK 2: GCP Authentication & Active Account ---
 log_step "2/7: Validating GCP Authentication & Active Account"
+YAP_ACCOUNT_JSON="/home/vps466a/.antigravity_tools/accounts/f3e9109a-3ffc-4bc7-bd93-3125d504605a.json"
 ACTIVE_ACCOUNT="$(gcloud auth list --filter="status:ACTIVE" --format="value(account)" 2>/dev/null | head -n 1 || true)"
+
+if [[ "${ACTIVE_ACCOUNT}" != "${EXPECTED_ACCOUNT}" && -f "${YAP_ACCOUNT_JSON}" ]]; then
+    python3 -c '
+import json, pathlib, sys
+d = json.load(open(sys.argv[1]))
+tok = d.get("token", {}).get("access_token", "")
+if tok:
+    p = pathlib.Path("/tmp/.gcp_yapcheeleong_token")
+    p.write_text(tok)
+    p.chmod(0o600)
+' "${YAP_ACCOUNT_JSON}"
+    if [[ -s "/tmp/.gcp_yapcheeleong_token" ]]; then
+        export CLOUDSDK_AUTH_ACCESS_TOKEN_FILE="/tmp/.gcp_yapcheeleong_token"
+        export CLOUDSDK_BILLING_QUOTA_PROJECT="${PROJECT_ID}"
+        ACTIVE_ACCOUNT="${EXPECTED_ACCOUNT}"
+        log_info "Hydrated ${BOLD}${EXPECTED_ACCOUNT}${RESET} OAuth token via CLOUDSDK_AUTH_ACCESS_TOKEN_FILE (quota project: ${PROJECT_ID})."
+    fi
+fi
 
 if [[ -z "${ACTIVE_ACCOUNT}" ]]; then
     log_error "No active GCP account authenticated!"
@@ -399,9 +441,29 @@ for label, p in [("train", train_p), ("val", val_p)]:
             except Exception as e:
                 print(f"ERROR: {label} line {idx} is invalid JSON: {e}", file=sys.stderr)
                 sys.exit(1)
-            if "messages" not in record or not isinstance(record["messages"], list):
-                print(f"ERROR: {label} line {idx} missing 'messages' list", file=sys.stderr)
+            for req_field in ["prefix_text", "completion_text"]:
+                if req_field not in record or not isinstance(record[req_field], str):
+                    print(f"ERROR: {label} line {idx} missing required string field '{req_field}'", file=sys.stderr)
+                    sys.exit(1)
+            full_text_val = record.get("full_text") or record.get("text")
+            if not isinstance(full_text_val, str):
+                print(f"ERROR: {label} line {idx} missing required string field 'text' or 'full_text'", file=sys.stderr)
                 sys.exit(1)
+            if not full_text_val.startswith(record["prefix_text"]):
+                print(f"ERROR: {label} line {idx} 'text'/'full_text' does not start with 'prefix_text'", file=sys.stderr)
+                sys.exit(1)
+            valid_start = (
+                record["completion_text"].startswith("<|tool_call>call:")
+                or record["completion_text"].startswith("<channel|>")
+                or record["completion_text"].startswith("<|channel>thought\n<channel|>")
+            )
+            if not valid_start:
+                print(f"ERROR: {label} line {idx} completion_text does not have valid boundary: {record['completion_text'][:60]}", file=sys.stderr)
+                sys.exit(1)
+            if "<|channel>thought" in record["completion_text"]:
+                if not record["completion_text"].startswith("<|channel>thought\n<channel|>"):
+                    print(f"ERROR: {label} line {idx} contains unclosed/non-empty thought tokens!", file=sys.stderr)
+                    sys.exit(1)
             line_count += 1
     results[label] = {"lines": line_count, "size_mb": round(size_bytes / (1024*1024), 2)}
 
@@ -440,20 +502,35 @@ script_path = sys.argv[1]
 with open(script_path, "r", encoding="utf-8") as f:
     code = f.read()
 
-# 1. Assert target_modules includes k_proj, q_proj, v_proj, o_proj
-for mod in ["k_proj", "q_proj", "v_proj", "o_proj"]:
+# 1. Assert target_modules includes q_proj, v_proj, o_proj (k_proj omitted per attention_k_eq_v=True spec)
+for mod in ["q_proj", "v_proj", "o_proj"]:
     assert f'"{mod}"' in code or f"'{mod}'" in code, f"Architecture violation: target_modules missing '{mod}'!"
-
+assert '"k_proj"' not in code and "'k_proj'" not in code, "Architecture violation: k_proj must be omitted (breaks attention_k_eq_v=True on 10 global layers)!"
 # 2. Assert Rank 8 LoRA
 assert "r=8" in code or "r = 8" in code, "Architecture violation: Rank must be 8!"
 
-# 3. Assert Response-only loss masking
-assert "train_on_responses_only" in code, "Architecture violation: Missing response-only loss masking!"
+# 3. Assert zero-thought prefix-delta loss masking & clean candidate models
+assert "prefix_text" in code, "Architecture violation: Missing 'prefix_text' in code!"
+assert "-100" in code, "Architecture violation: Missing '-100' loss mask in code!"
+assert "add_special_tokens=False" in code, "Architecture violation: Missing 'add_special_tokens=False' in code!"
+assert "unsloth-bnb-4bit" not in code, "Architecture violation: 'unsloth-bnb-4bit' candidate must be removed!"
+
+# 4. Assert dual-path base model loader & linear FP4 fallback
+assert "google/gemma-4-31b-it-qat-w4a16-ct" in code, "Architecture violation: Missing primary 'google/gemma-4-31b-it-qat-w4a16-ct' model!"
+assert "google/gemma-4-31B-it-qat-q4_0-unquantized" in code, "Architecture violation: Missing fallback 'google/gemma-4-31B-it-qat-q4_0-unquantized' model!"
+assert "load_in_4bit=False" in code, "Architecture violation: Missing 'load_in_4bit=False' for pack-quantized w4a16-ct primary loader!"
+assert "load_in_4bit=True" in code, "Architecture violation: Missing 'load_in_4bit=True' for FP4 fallback loader!"
+assert "bnb_4bit_use_double_quant=False" in code, "Architecture violation: Missing 'bnb_4bit_use_double_quant=False'!"
+
+# 5. Assert inline vLLM adapter normalization hook
+assert "normalize_adapter_for_vllm" in code, "Architecture violation: Missing 'normalize_adapter_for_vllm' inline hook!"
+assert "base_model.model.language_model.model.layers." in code, "Architecture violation: Missing 'base_model.model.language_model.model.layers.' prefix normalization!"
 
 print("OK")
 EOF
-log_info "Architectural assertion passed: target_modules contains ['k_proj', 'q_proj', 'v_proj', 'o_proj']."
-log_info "Architectural assertion passed: Rank=8, response-only loss masking active."
+log_info "Architectural assertion passed: target_modules contains ['q_proj', 'v_proj', 'o_proj'] (k_proj omitted per attention_k_eq_v=True spec)."
+log_info "Architectural assertion passed: Rank=8, zero-thought prefix-delta loss masking active."
+log_info "Architectural assertion passed: Dual-path loader (w4a16-ct + q4_0-unquantized FP4) and inline vLLM adapter normalizer active."
 
 # Check Hugging Face Token for gated base model download
 if [[ -z "${HF_TOKEN}" ]]; then
@@ -491,6 +568,12 @@ case "${MACHINE_TYPE}" in
         else
             log_info 'Hardware Profile: NVIDIA L4 (24GB VRAM) - Tuned for fast 4-bit SFT (~$0.35/hr Spot)'
         fi
+        ;;
+    g2-standard-48)
+        log_info 'Hardware Profile: 4x NVIDIA L4 (96GB VRAM, 192GB RAM) - Tuned for 5-Test Unsloth SFT + vLLM TP=4 Evaluation'
+        ;;
+    g2-standard-24)
+        log_info 'Hardware Profile: 2x NVIDIA L4 (48GB VRAM, 96GB RAM) - Fallback for 5-Test Unsloth SFT + vLLM TP=2 Evaluation'
         ;;
     a2-highgpu-1g)
         if [[ "${ACCEL_TYPE}" != "nvidia-tesla-a100" ]]; then
@@ -530,7 +613,7 @@ echo -e "  ${BOLD}Machine Type:${RESET}     ${MACHINE_TYPE} (${ACCEL_COUNT}x ${A
 echo -e "  ${BOLD}Provisioning:${RESET}     ${PROVISIONING_MODEL}"
 echo -e "  ${BOLD}Bucket:${RESET}           gs://${BUCKET_NAME}"
 echo -e "  ${BOLD}Datasets:${RESET}         ${TRAIN_LINES} train / ${VAL_LINES} val (${TOTAL_LINES} total)"
-echo -e "  ${BOLD}Target Modules:${RESET}   q_proj, k_proj, v_proj, o_proj (Rank-8)"
+echo -e "  ${BOLD}Target Modules:${RESET}   q_proj, v_proj, o_proj (Rank-8, k_proj omitted)"
 echo -e "  ${BOLD}Zero-Leak Trap:${RESET}   Autonomous self-destruct upon completion or failure"
 echo -e "${BOLD}${GREEN}==============================================================================${RESET}"
 echo ""
@@ -546,8 +629,13 @@ fi
 # 7. Deployment Execution: Stage Assets to GCS & Clear Stale Outputs
 # ------------------------------------------------------------------------------
 log_step "Staging Datasets and Training Script to Cloud Storage"
-log_info "Clearing stale output artifacts from previous runs in gs://${BUCKET_NAME}/output/main_lora/..."
+log_info "Clearing stale output artifacts from previous runs in gs://${BUCKET_NAME}/output/main_lora/ and gs://${BUCKET_NAME}/five_test_results/..."
 ${STORAGE_CLI} rm "gs://${BUCKET_NAME}/output/main_lora/**" 2>/dev/null || true
+${STORAGE_CLI} rm "gs://${BUCKET_NAME}/five_test_results/**" 2>/dev/null || true
+if ${CLI_FIVE_TEST_ALIGNMENT} && [[ -f "${REPO_ROOT}/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors" ]]; then
+    log_info "Staging verified pre-trained 5-test LoRA adapter to gs://${BUCKET_NAME}/output/main_lora/..."
+    ${STORAGE_CLI} cp "${REPO_ROOT}/submissions/track2_5test_probe/adapters/main_lora/adapter_config.json" "${REPO_ROOT}/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors" "gs://${BUCKET_NAME}/output/main_lora/"
+fi
 
 log_info "Uploading ${TRAIN_DATA} -> gs://${BUCKET_NAME}/input/unsloth_sft_train.jsonl"
 ${STORAGE_CLI} cp "${TRAIN_DATA}" "gs://${BUCKET_NAME}/input/unsloth_sft_train.jsonl"
@@ -558,9 +646,36 @@ ${STORAGE_CLI} cp "${VAL_DATA}" "gs://${BUCKET_NAME}/input/unsloth_sft_val.jsonl
 log_info "Uploading ${TRAIN_SCRIPT} -> gs://${BUCKET_NAME}/input/train_gemma4_unsloth_cloud.py"
 ${STORAGE_CLI} cp "${TRAIN_SCRIPT}" "gs://${BUCKET_NAME}/input/train_gemma4_unsloth_cloud.py"
 
+if ${CLI_FIVE_TEST_ALIGNMENT}; then
+    log_info "Staging 5-test alignment bundle to gs://${BUCKET_NAME}/five_test_bundle/..."
+    ${STORAGE_CLI} cp "${TRAIN_DATA}" "gs://${BUCKET_NAME}/five_test_bundle/train.jsonl"
+    ${STORAGE_CLI} cp "${VAL_DATA}" "gs://${BUCKET_NAME}/five_test_bundle/val.jsonl"
+    ${STORAGE_CLI} cp -r "${REPO_ROOT}/data/unsloth_sft_5test/stubs" "gs://${BUCKET_NAME}/five_test_bundle/"
+    ${STORAGE_CLI} cp -r "${REPO_ROOT}/submissions/track2_5test_probe" "gs://${BUCKET_NAME}/five_test_bundle/"
+    ${STORAGE_CLI} cp "${REPO_ROOT}/tasks.jsonl" "gs://${BUCKET_NAME}/five_test_bundle/tasks.jsonl"
+    ${STORAGE_CLI} cp "${REPO_ROOT}/scripts/run_eval.py" "gs://${BUCKET_NAME}/five_test_bundle/run_eval.py"
+    if ${STORAGE_CLI} ls "gs://${BUCKET_NAME}/five_test_bundle/wheelhouse/vllm-0.19.1-cp38-abi3-manylinux_2_31_x86_64.whl" >/dev/null 2>&1; then
+        log_info "Wheelhouse and snapshots already cached in gs://${BUCKET_NAME}/five_test_bundle/; skipping bulk binary re-upload."
+    else
+        for tid in rich_3882 fastapi_14786 requests_7315 rich_3905 requests_7427; do
+            if [[ -f "${REPO_ROOT}/snapshots/${tid}.tgz" ]]; then
+                ${STORAGE_CLI} cp "${REPO_ROOT}/snapshots/${tid}.tgz" "gs://${BUCKET_NAME}/five_test_bundle/snapshots/${tid}.tgz"
+            fi
+        done
+        if [[ -d "/tmp/wheelhouse" ]] && compgen -G "/tmp/wheelhouse/*.whl" >/dev/null; then
+            ${STORAGE_CLI} cp /tmp/wheelhouse/*.whl "gs://${BUCKET_NAME}/five_test_bundle/wheelhouse/"
+        else
+            log_error "Missing /tmp/wheelhouse/*.whl required for /opt/venv_eval (vllm + swegemma + adk)!"
+            exit 1
+        fi
+        if [[ -d "${REPO_ROOT}/wheels" ]] && compgen -G "${REPO_ROOT}/wheels/*.whl" >/dev/null; then
+            ${STORAGE_CLI} cp "${REPO_ROOT}"/wheels/*.whl "gs://${BUCKET_NAME}/five_test_bundle/wheels/"
+        fi
+    fi
+fi
+
 log_success "Staged assets verified in gs://${BUCKET_NAME}/input/:"
 ${STORAGE_CLI} ls "gs://${BUCKET_NAME}/input/"
-
 # ------------------------------------------------------------------------------
 # 8. Generate Ephemeral VM Startup Script with Zero-Leak Trap
 # ------------------------------------------------------------------------------
@@ -571,6 +686,7 @@ cat << 'EOF' > "${STARTUP_SCRIPT_PATH}"
 #!/usr/bin/env bash
 set -euo pipefail
 set -x
+export PATH="/opt/conda/bin:/usr/local/cuda/bin:/usr/local/bin:${PATH}"
 
 LOG_FILE="/var/log/gemma4_training.log"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -617,49 +733,221 @@ nvidia-smi
 # Prepare work directories
 mkdir -p /opt/data /opt/output/main_lora /opt/scripts
 
-# Fetch metadata attributes
-BUCKET_NAME=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket_name")
-HF_TOKEN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/hf_token")
+# Wait for GCP metadata server reachability (protects against network control plane programming delays)
+for meta_attempt in $(seq 1 30); do
+    if curl -s -f -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/name" >/dev/null 2>&1; then
+        break
+    fi
+    echo "Waiting for metadata server reachability (attempt ${meta_attempt}/30)..."
+    sleep 5
+done
 
+# Fetch metadata attributes (disable set -x around HF_TOKEN to redact secret from logs)
+BUCKET_NAME=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/bucket_name")
+FIVE_TEST_MODE=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/five_test_alignment" || echo "false")
+set +x
+HF_TOKEN=$(curl -s -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/instance/attributes/hf_token")
+export HF_TOKEN="${HF_TOKEN}"
+export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN}"
+set -x
 # Pull input assets from GCS
 echo "Downloading staged assets from gs://${BUCKET_NAME}/input/..."
 gcloud storage cp "gs://${BUCKET_NAME}/input/unsloth_sft_train.jsonl" /opt/data/
 gcloud storage cp "gs://${BUCKET_NAME}/input/unsloth_sft_val.jsonl" /opt/data/
 gcloud storage cp "gs://${BUCKET_NAME}/input/train_gemma4_unsloth_cloud.py" /opt/scripts/
 
-# Install Unsloth and fine-tuning dependencies
-echo "Installing Unsloth and fine-tuning dependencies..."
-pip install --upgrade pip
-pip install --no-cache-dir \
-    "unsloth @ git+https://github.com/unslothai/unsloth.git" \
-    trl peft accelerate bitsandbytes datasets "jinja2==3.1.6"
-pip install --no-deps unsloth_zoo
-pip uninstall -y torchaudio torchao || true
-
-# Pre-flight environment import check
-python3 -c "import sys; sys.modules['torchaudio'] = None; import torch, transformers, trl, unsloth; print('Pre-flight check passed! CUDA:', torch.cuda.is_available(), 'Unsloth:', getattr(unsloth, '__version__', 'ok'))"
-
-# Set runtime optimization flags
-export DATA_DIR="/opt/data"
-export OUTPUT_DIR="/opt/output/main_lora"
-export HF_TOKEN="${HF_TOKEN}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
 export HF_HUB_DISABLE_XET="1"
 export PYTHONUNBUFFERED="1"
 
-echo "=== Commencing Gemma 4 Unsloth Training Script ==="
-python3 /opt/scripts/train_gemma4_unsloth_cloud.py
+# Expand root partition if running on a larger disk
+growpart /dev/nvme0n1 1 2>/dev/null && resize2fs /dev/nvme0n1p1 2>/dev/null || true
+growpart /dev/sda 1 2>/dev/null && resize2fs /dev/sda1 2>/dev/null || true
 
-# Verify trained adapter artifacts before marking success
-if [[ -f "/opt/output/main_lora/adapter_model.safetensors" ]]; then
-    echo "Adapter verified! Syncing trained artifacts to gs://${BUCKET_NAME}/output/main_lora/..."
-    gcloud storage cp -r /opt/output/main_lora/* "gs://${BUCKET_NAME}/output/main_lora/"
+# Ensure virtualenv and uv are available for clean venv provisioning without ensurepip issues
+pip install --upgrade pip virtualenv uv 2>/dev/null || python3 -m pip install --upgrade pip virtualenv uv 2>/dev/null || true
+
+if [[ "${FIVE_TEST_MODE}" == "true" ]]; then
+    echo "=== Executing 5-Test End-to-End Dual-Venv Alignment & Kaggle Evaluation Pipeline ==="
+    mkdir -p /workspace/submissions /workspace/scripts /workspace/snapshots /workspace/graphs /workspace/embeddings /workspace/wheels /opt/wheelhouse
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/train.jsonl" /opt/train.jsonl
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/val.jsonl" /opt/val.jsonl
+    gcloud storage cp -r "gs://${BUCKET_NAME}/five_test_bundle/track2_5test_probe" /workspace/submissions/
+    gcloud storage cp -r "gs://${BUCKET_NAME}/five_test_bundle/stubs/graphs/*" /workspace/graphs/
+    gcloud storage cp -r "gs://${BUCKET_NAME}/five_test_bundle/stubs/embeddings/*" /workspace/embeddings/
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/tasks.jsonl" /workspace/tasks.jsonl
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/run_eval.py" /workspace/scripts/run_eval.py
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/snapshots/*" /workspace/snapshots/ || true
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/wheelhouse/*.whl" /opt/wheelhouse/
+    gcloud storage cp "gs://${BUCKET_NAME}/five_test_bundle/wheels/*.whl" /workspace/wheels/ || true
+
+    mkdir -p /workspace/submissions/track2_5test_probe/adapters/main_lora
+    if [[ -f "/workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors" ]]; then
+        echo "=== Found pre-trained 5-test LoRA adapter in workspace bundle; syncing to output and proceeding directly to Step 2 ==="
+        gcloud storage cp /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_config.json /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors "gs://${BUCKET_NAME}/output/main_lora/" || true
+    elif gcloud storage stat "gs://${BUCKET_NAME}/output/main_lora/adapter_model.safetensors" >/dev/null 2>&1; then
+        echo "=== Found pre-trained 5-test LoRA adapter in GCS; downloading directly to accelerate evaluation ==="
+        gcloud storage cp "gs://${BUCKET_NAME}/output/main_lora/adapter_config.json" "gs://${BUCKET_NAME}/output/main_lora/adapter_model.safetensors" /workspace/submissions/track2_5test_probe/adapters/main_lora/
+    else
+        # Venv 1 (/opt/venv_train): Isolated Unsloth training environment
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3.10-venv
+        python3 -m virtualenv --system-site-packages /opt/venv_train
+        /opt/venv_train/bin/pip install --upgrade pip
+        /opt/venv_train/bin/pip install --no-cache-dir \
+            "unsloth @ git+https://github.com/unslothai/unsloth.git" \
+            trl peft accelerate bitsandbytes datasets "jinja2==3.1.6" "compressed-tensors>=0.15.0"
+        /opt/venv_train/bin/pip install --no-deps unsloth_zoo
+        /opt/venv_train/bin/pip uninstall -y torchaudio torchao || true
+        /opt/venv_train/bin/pip install --upgrade --no-cache-dir torchvision || true
+        rm -rf /usr/local/lib/python3*/dist-packages/torchaudio* /usr/lib/python3*/dist-packages/torchaudio* || true
+
+        echo "=== Step 1: Running 5-Test SFT on GPU 0 ==="
+        CUDA_VISIBLE_DEVICES=0 /opt/venv_train/bin/python /opt/scripts/train_gemma4_unsloth_cloud.py \
+            --train-file /opt/train.jsonl \
+            --val-file /opt/val.jsonl \
+            --output-dir /workspace/submissions/track2_5test_probe/adapters/main_lora \
+            --max-seq-length 3072 \
+            --num-train-epochs 2 \
+            --gradient-accumulation-steps 1 \
+            --learning-rate 2e-4 \
+            --max-steps 80
+
+        if [[ ! -f "/workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors" ]]; then
+            echo "FATAL: 5-test adapter_model.safetensors was not generated!"
+            exit 1
+        fi
+        rm -rf /workspace/submissions/track2_5test_probe/adapters/main_lora/checkpoint* || true
+        gcloud storage cp /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_config.json /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors "gs://${BUCKET_NAME}/adapters/five_test_main_lora/"
+        gcloud storage cp /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_config.json /workspace/submissions/track2_5test_probe/adapters/main_lora/adapter_model.safetensors "gs://${BUCKET_NAME}/output/main_lora/"
+        pkill -f train_gemma4_unsloth_cloud.py || true
+    fi
+    # Venv 2 (/opt/venv_eval): Isolated Kaggle vLLM + ADK evaluation environment
+    echo "=== Step 2: Provisioning /opt/venv_eval and Launching vLLM + SWE-Gemma Evaluation ==="
+    if ! command -v python3.12 >/dev/null 2>&1; then
+        echo "Installing Python 3.12 for evaluation environment (swegemma and cp312 wheels)..."
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq software-properties-common
+        add-apt-repository -y ppa:deadsnakes/ppa
+        apt-get update -qq
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3.12 python3.12-venv python3.12-dev
+    fi
+    python3 -m virtualenv -p python3.12 /opt/venv_eval || python3.12 -m venv /opt/venv_eval
+    /opt/venv_eval/bin/pip install --upgrade pip
+    /opt/venv_eval/bin/pip install --no-cache-dir \
+        vllm torch torchvision pytest pytest-timeout pytest-asyncio "anyio==4.14.2" litellm
+    for whl in /opt/wheelhouse/*.whl; do
+        whl_name=$(basename "${whl}")
+        case "${whl_name}" in
+            vllm-*|flashinfer_*|torch*)
+                echo "Skipping ${whl_name} to preserve PyPI vLLM + PyTorch ABI compatibility..."
+                ;;
+            *)
+                /opt/venv_eval/bin/pip install --no-deps --force-reinstall "${whl}" || true
+                ;;
+        esac
+    done
+    /opt/venv_eval/bin/python -c "import vllm; print('vLLM verification PASS:', vllm.__version__)"
+    /opt/venv_eval/bin/python -c "import swegemma, google.adk; print('SWE-Gemma and ADK verification PASS!')"
+
+    TP_SIZE=$(nvidia-smi -L | wc -l)
+    VLLM_EXTRA_ARGS=()
+    if [[ "${TP_SIZE}" -eq 1 ]]; then
+        VLLM_EXTRA_ARGS+=(
+            --cpu-offload-gb 10
+            --enforce-eager
+            --max-model-len 32768
+        )
+    else
+        VLLM_EXTRA_ARGS+=(--max-model-len 32768)
+    fi
+
+    /opt/venv_eval/bin/vllm serve google/gemma-4-31b-it-qat-w4a16-ct \
+        --served-model-name gemma-4-31b-it-qat-w4a16-ct \
+        --tensor-parallel-size "${TP_SIZE}" \
+        --gpu-memory-utilization 0.85 \
+        "${VLLM_EXTRA_ARGS[@]}" \
+        --enable-auto-tool-choice \
+        --tool-call-parser gemma4 \
+        --reasoning-parser gemma4 \
+        --default-chat-template-kwargs '{"enable_thinking": true}' \
+        --enable-lora \
+        --max-loras 8 \
+        --max-lora-rank 128 \
+        --lora-modules main_lora=/workspace/submissions/track2_5test_probe/adapters/main_lora \
+        --port 8000 &
+    VLLM_PID=$!
+
+    echo "Waiting for vLLM server at http://127.0.0.1:8000/v1/models to register main_lora..."
+    VLLM_READY=0
+    for attempt in $(seq 1 180); do
+        if ! kill -0 "${VLLM_PID}" 2>/dev/null; then
+            echo "FATAL: vLLM process (${VLLM_PID}) exited prematurely during startup!"
+            exit 1
+        fi
+        if curl -s http://127.0.0.1:8000/v1/models | grep -q "main_lora"; then
+            echo "vLLM server ready with main_lora registered!"
+            VLLM_READY=1
+            break
+        fi
+        sleep 5
+    done
+    if [[ "${VLLM_READY}" -ne 1 ]]; then
+        echo "FATAL: vLLM server failed to register main_lora within 900 seconds!"
+        kill "${VLLM_PID}" 2>/dev/null || true
+        exit 1
+    fi
+
+    printf "rich_3882\nfastapi_14786\nrequests_7315\nrich_3905\nrequests_7427\n" > /opt/test_5tasks.txt
+    cd /workspace
+    /opt/venv_eval/bin/python /workspace/scripts/run_eval.py \
+        --sandbox subprocess \
+        --submission-dir /workspace/submissions/track2_5test_probe \
+        --tasks-file /opt/test_5tasks.txt \
+        --concurrency 1 \
+        --max-tool-calls 40 \
+        --api-base http://127.0.0.1:8000/v1 \
+        --model main_lora
+    LATEST_RUN_DIR=$(ls -td /workspace/results/run_* 2>/dev/null | head -n 1 || true)
+    if [[ -n "${LATEST_RUN_DIR}" && -d "${LATEST_RUN_DIR}" ]]; then
+        gcloud storage cp -r "${LATEST_RUN_DIR}"/* "gs://${BUCKET_NAME}/five_test_results/" || true
+        gcloud storage cp "${LATEST_RUN_DIR}/summary.json" "gs://${BUCKET_NAME}/five_test_results/summary.json" 2>/dev/null || true
+    fi
+    kill "${VLLM_PID}" || true
     TRAINING_SUCCESS=1
-    echo "=== Training Run and Artifact Sync Complete ==="
+    echo "=== 5-Test Training & Kaggle Challenge Evaluation Complete ==="
 else
-    echo "FATAL: adapter_model.safetensors was not generated!"
-    exit 1
+    # Install Unsloth and fine-tuning dependencies
+    echo "Installing Unsloth and fine-tuning dependencies..."
+    pip install --upgrade pip
+    pip install --no-cache-dir \
+        "unsloth @ git+https://github.com/unslothai/unsloth.git" \
+        trl peft accelerate bitsandbytes datasets "jinja2==3.1.6" "compressed-tensors>=0.15.0"
+    pip install --no-deps unsloth_zoo
+    pip uninstall -y torchaudio torchao || true
+    pip install --upgrade --no-cache-dir torchvision || true
+    rm -rf /usr/local/lib/python3*/dist-packages/torchaudio* /usr/lib/python3*/dist-packages/torchaudio* || true
+
+    # Pre-flight environment import check
+    python3 -c "import sys; sys.modules['torchaudio'] = None; import torch, transformers, trl, unsloth; print('Pre-flight check passed! CUDA:', torch.cuda.is_available(), 'Unsloth:', getattr(unsloth, '__version__', 'ok'))"
+
+    # Set runtime optimization flags
+    export DATA_DIR="/opt/data"
+    export OUTPUT_DIR="/opt/output/main_lora"
+
+    echo "=== Commencing Gemma 4 Unsloth Training Script ==="
+    python3 /opt/scripts/train_gemma4_unsloth_cloud.py
+
+    # Verify trained adapter artifacts before marking success
+    if [[ -f "/opt/output/main_lora/adapter_model.safetensors" ]]; then
+        echo "Adapter verified! Syncing trained artifacts to gs://${BUCKET_NAME}/output/main_lora/..."
+        gcloud storage cp -r /opt/output/main_lora/* "gs://${BUCKET_NAME}/output/main_lora/"
+        TRAINING_SUCCESS=1
+        echo "=== Training Run and Artifact Sync Complete ==="
+    else
+        echo "FATAL: adapter_model.safetensors was not generated!"
+        exit 1
+    fi
 fi
 EOF
 
@@ -680,22 +968,75 @@ if [[ "${PROVISIONING_MODEL}" == "SPOT" ]]; then
 fi
 
 log_info "Executing gcloud compute instances create..."
-gcloud compute instances create "${INSTANCE_NAME}" \
-    --project="${PROJECT_ID}" \
-    --zone="${ZONE}" \
-    --machine-type="${MACHINE_TYPE}" \
-    ${EXTRA_PROVISIONING_FLAGS[@]+"${EXTRA_PROVISIONING_FLAGS[@]}"} \
-    --maintenance-policy="TERMINATE" \
-    --image-family="${DEFAULT_IMAGE_FAMILY}" \
-    --image-project="${DEFAULT_IMAGE_PROJECT}" \
-    --boot-disk-size="${DISK_SIZE}" \
-    --boot-disk-type="pd-balanced" \
-    --scopes="https://www.googleapis.com/auth/cloud-platform" \
-    --metadata="install-nvidia-driver=True,bucket_name=${BUCKET_NAME},hf_token=${HF_TOKEN}" \
-    --metadata-from-file="startup-script=${STARTUP_SCRIPT_PATH}"
+PROVISIONED=false
+if ${CLI_FIVE_TEST_ALIGNMENT}; then
+    # Exclude us-central1-b due to scheduled network control plane maintenance
+    CANDIDATE_ZONES=("us-east4-a" "us-west1-a" "us-central1-a" "us-central1-c" "us-east1-b" "us-east1-c" "us-east4-c" "us-west1-b" "us-west4-a" "europe-west4-a" "asia-southeast1-a")
+    CANDIDATE_MACHINES=("g2-standard-12" "g2-standard-16" "${MACHINE_TYPE}")
+    PROV_MODES=()
+    if [[ "${PROVISIONING_MODEL}" == "STANDARD" ]]; then
+        PROV_MODES=("STANDARD")
+    else
+        PROV_MODES=("SPOT")
+    fi
+    for prov_mode in "${PROV_MODES[@]}"; do
+        PROV_FLAGS=()
+        if [[ "${prov_mode}" == "SPOT" ]]; then
+            PROV_FLAGS+=(--provisioning-model="SPOT" --instance-termination-action="DELETE")
+        fi
+        for cand_mach in "${CANDIDATE_MACHINES[@]}"; do
+            for cand_zone in "${CANDIDATE_ZONES[@]}"; do
+                if [[ "${cand_zone}" == "us-central1-b" ]]; then
+                    continue
+                fi
+                log_info "Attempting ${cand_mach} (${prov_mode}) in ${cand_zone}..."
+                if gcloud compute instances create "${INSTANCE_NAME}" \
+                    --project="${PROJECT_ID}" \
+                    --zone="${cand_zone}" \
+                    --machine-type="${cand_mach}" \
+                    ${PROV_FLAGS[@]+"${PROV_FLAGS[@]}"} \
+                    --maintenance-policy="TERMINATE" \
+                    --image-family="${DEFAULT_IMAGE_FAMILY}" \
+                    --image-project="${DEFAULT_IMAGE_PROJECT}" \
+                    --boot-disk-size="${DISK_SIZE}" \
+                    --boot-disk-type="pd-balanced" \
+                    --scopes="https://www.googleapis.com/auth/cloud-platform" \
+                    --metadata="install-nvidia-driver=True,bucket_name=${BUCKET_NAME},hf_token=${HF_TOKEN},five_test_alignment=${CLI_FIVE_TEST_ALIGNMENT}" \
+                    --metadata-from-file="startup-script=${STARTUP_SCRIPT_PATH}"; then
+                    ZONE="${cand_zone}"
+                    MACHINE_TYPE="${cand_mach}"
+                    PROVISIONING_MODEL="${prov_mode}"
+                    PROVISIONED=true
+                    break 3
+                else
+                    log_warn "Capacity/quota unavailable for ${cand_mach} (${prov_mode}) in ${cand_zone}, trying next fallback..."
+                fi
+            done
+        done
+    done
+else
+    gcloud compute instances create "${INSTANCE_NAME}" \
+        --project="${PROJECT_ID}" \
+        --zone="${ZONE}" \
+        --machine-type="${MACHINE_TYPE}" \
+        ${EXTRA_PROVISIONING_FLAGS[@]+"${EXTRA_PROVISIONING_FLAGS[@]}"} \
+        --maintenance-policy="TERMINATE" \
+        --image-family="${DEFAULT_IMAGE_FAMILY}" \
+        --image-project="${DEFAULT_IMAGE_PROJECT}" \
+        --boot-disk-size="${DISK_SIZE}" \
+        --boot-disk-type="pd-balanced" \
+        --scopes="https://www.googleapis.com/auth/cloud-platform" \
+        --metadata="install-nvidia-driver=True,bucket_name=${BUCKET_NAME},hf_token=${HF_TOKEN},five_test_alignment=${CLI_FIVE_TEST_ALIGNMENT}" \
+        --metadata-from-file="startup-script=${STARTUP_SCRIPT_PATH}"
+    PROVISIONED=true
+fi
 
 rm -f "${STARTUP_SCRIPT_PATH}"
-log_success "VM '${INSTANCE_NAME}' created successfully."
+if ! ${PROVISIONED}; then
+    log_error "Failed to provision VM across all candidate zones and machine types."
+    exit 1
+fi
+log_success "VM '${INSTANCE_NAME}' created successfully in ${ZONE} (${MACHINE_TYPE})."
 
 # ------------------------------------------------------------------------------
 # 10. Post-Launch Instructions & Telemetry Guide

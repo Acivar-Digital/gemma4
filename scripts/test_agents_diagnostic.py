@@ -47,10 +47,17 @@ async def test_agent(agent, agent_name: str):
                     print(f"TOOL CALL: {p.function_call.name}({p.function_call.args})")
 
 async def main():
+    served_model = os.getenv("SWEGEMMA_MODEL", "gemma-4-31b-it-qat-w4a16-ct")
+    allow_proxy = os.getenv("SWEGEMMA_ALLOW_PROXY", "0").lower() in ("1", "true", "yes")
+    if served_model != "gemma-4-31b-it-qat-w4a16-ct" and not allow_proxy:
+        raise ValueError(
+            f"Refusing proxy model in diagnostic test: '{served_model}'. "
+            f"Must be 'gemma-4-31b-it-qat-w4a16-ct' unless SWEGEMMA_ALLOW_PROXY=1."
+        )
     models = setup_gemma_model_registry(
-        api_base="http://literouter.lan:7766/v1",
+        api_base=os.getenv("SWEGEMMA_API_BASE", "http://literouter.lan:7766/v1"),
         api_key=os.getenv("SWEGEMMA_API_KEY", "EMPTY"),
-        served_model="stealth/space-bunny-alpha",
+        served_model=served_model,
     )
     mgr = SubprocessManager(system_site_packages=True)
     sb_id = mgr.start()

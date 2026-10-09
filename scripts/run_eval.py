@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -29,8 +30,12 @@ class EvalRunConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     model: str = Field(
-        default_factory=lambda: os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
-        description="Model identifier on LiteRouter (default: stealth/space-bunny-alpha)",
+        default_factory=lambda: os.getenv("SWEGEMMA_MODEL", "gemma-4-31b-it-qat-w4a16-ct"),
+        description="Model identifier (default: gemma-4-31b-it-qat-w4a16-ct)",
+    )
+    allow_proxy: bool = Field(
+        default_factory=lambda: os.getenv("SWEGEMMA_ALLOW_PROXY", "0").lower() in ("1", "true", "yes"),
+        description="Allow running against proxy models rather than authentic Gemma 4",
     )
     api_base: str = Field(
         default_factory=lambda: os.getenv("SWEGEMMA_API_BASE", "http://literouter.lan:7766/v1"),
@@ -78,6 +83,14 @@ class EvalRunConfig(BaseModel):
     run_name: str | None = Field(
         default=None,
         description="Explicit run name (e.g. run_B05). If not set, auto-increments run_Bxx",
+    )
+    submission_dir: str = Field(
+        default="submissions/track1_live",
+        description="Path to submission directory (default: submissions/track1_live)",
+    )
+    sandbox: str = Field(
+        default="subprocess",
+        description="Sandbox execution backend: subprocess or docker (default: subprocess)",
     )
 
 
@@ -285,8 +298,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         type=str,
-        default=os.getenv("SWEGEMMA_MODEL", "stealth/space-bunny-alpha"),
-        help="Model identifier on LiteRouter (default: stealth/space-bunny-alpha)",
+        default=os.getenv("SWEGEMMA_MODEL", "gemma-4-31b-it-qat-w4a16-ct"),
+        help="Model identifier (default: gemma-4-31b-it-qat-w4a16-ct)",
+    )
+    parser.add_argument(
+        "--allow-proxy",
+        action="store_true",
+        default=os.getenv("SWEGEMMA_ALLOW_PROXY", "0").lower() in ("1", "true", "yes"),
+        help="Allow running evaluation against proxy models (e.g. LiteRouter space-bunny-alpha). Disabled by default to prevent silent proxy contamination.",
     )
     parser.add_argument(
         "--api-base",
@@ -318,6 +337,18 @@ def parse_args() -> argparse.Namespace:
         default="dashboard",
         help="Display mode (default: dashboard)",
     )
+    parser.add_argument(
+        "--submission-dir",
+        type=str,
+        default="submissions/track1_live",
+        help="Path to submission directory (default: submissions/track1_live)",
+    )
+    parser.add_argument(
+        "--sandbox",
+        type=str,
+        default="subprocess",
+        help="Sandbox execution backend: subprocess or docker (default: subprocess)",
+    )
     return parser.parse_args()
 
 
@@ -325,6 +356,24 @@ def main() -> int:
     raw_args = parse_args()
     run_config = EvalRunConfig.model_validate(vars(raw_args))
 
+
+    sub_path = Path(run_config.submission_dir)
+    submission_dir = sub_path if sub_path.is_absolute() else (ROOT_DIR / sub_path).resolve()
+    has_adapters = (submission_dir / "adapters").exists() and any((submission_dir / "adapters").iterdir())
+    allowed_models = {"gemma-4-31b-it-qat-w4a16-ct"}
+    if has_adapters:
+        allowed_models.update({"main_lora", "openai/main_lora"})
+
+    # Assert served model is authentic Gemma 4 or loaded adapter unless proxy is explicitly permitted
+    if run_config.model not in allowed_models and not run_config.allow_proxy:
+        print(f"\n============================================================")
+        print(f"❌ ERROR: PROXY MODEL DETECTED ('{run_config.model}')")
+        print(f"============================================================")
+        print(f"Every eval path must assert served model_name is authentic Gemma 4 (allowed: {allowed_models}).")
+        print(f"Runs B01-B40 silently measured LiteRouter proxy ('stealth/space-bunny-alpha')")
+        print(f"instead of Gemma 4 because of unset proxy assertions.")
+        print(f"To run with a proxy model intentionally, pass '--allow-proxy' or set SWEGEMMA_ALLOW_PROXY=1.\n")
+        return 1
     # Determine tasks
     tasks_file_path = ROOT_DIR / run_config.tasks_file
     if run_config.task_ids:
@@ -382,7 +431,6 @@ def main() -> int:
     )
 
     # Clean any rogue macOS metadata or bytecode before compiling agents
-    submission_dir = ROOT_DIR / "submissions/track1_live"
     if submission_dir.exists():
         for f in submission_dir.rglob("*.pyc"):
             try:
@@ -411,7 +459,7 @@ def main() -> int:
         submission_dir=submission_dir,
         results_dir=run_dir,
         models=models,
-        sandbox="subprocess",
+        sandbox=run_config.sandbox,
         task_ids=selected_tasks,
         concurrency=run_config.concurrency,
         max_tool_calls=run_config.max_tool_calls,
@@ -438,6 +486,29 @@ def main() -> int:
     else:
         summary = RunSummary.from_evaluation_result(result, task_eval_results)
         summary_file.write_text(summary.model_dump_json(indent=2), encoding="utf-8")
+
+    # Verify served model across traces unless proxy is permitted
+    if not run_config.allow_proxy:
+        proxy_traces: list[tuple[str, str]] = []
+        for trace_path in run_dir.glob("trace_*.json"):
+            try:
+                trace_data = json.loads(trace_path.read_text(encoding="utf-8"))
+                steps = trace_data.get("steps") or []
+                for s in steps:
+                    m = s.get("model_name") or s.get("model")
+                    if m and m not in allowed_models:
+                        proxy_traces.append((trace_path.name, str(m)))
+                        break
+            except Exception:
+                pass
+        if proxy_traces:
+            print("\n" + "=" * 60)
+            print("❌ ERROR: PROXY MODEL DETECTED IN EVALUATION TRACES!")
+            print("=" * 60)
+            print(f"Traces contain non-Gemma-4 model names: {proxy_traces[:5]}")
+            print("Evaluation results are INVALIDated to prevent proxy contamination.")
+            print("To permit proxy evaluation, re-run with --allow-proxy.")
+            return 1
 
     print("\n============================================================")
     print(" EVALUATION FINISHED")

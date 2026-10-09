@@ -33,13 +33,13 @@ During the forensic autopsy of the canary runs and the external consultant audit
     this skill. That gate — not the base string — is what decides whether an adapter ships.
   - GCP A100 GPUs (40GB/80GB VRAM) have the memory capacity to load full precision or uncompressed base layers with Unsloth gradient checkpointing, eliminating the aggressive NF4 distortion forced on low-memory 24GB GPUs.
 
-### The Target Modules Nuance (`k_proj` Dropping Bug)
-* Past configurations used a regex like `(?i).*(q_proj|v_proj|o_proj).*` which silently **dropped `k_proj`**.
-* Attention query-key interaction requires reciprocal adaptation. For Track 2, target modules must be explicitly defined as an explicit array:
+### Attention Geometry & `k_proj` Omission Rule (`attention_k_eq_v=True`)
+* Binary header inspection of `models/gemma-4-31b-it-qat-w4a16-ct/model.safetensors` proves that across the 60 language layers, the 50 sliding-window layers have `q_proj, k_proj, v_proj, o_proj`, whereas the **10 global full-attention layers** configure `attention_k_eq_v=True` (where `k_proj` serves simultaneously as both the RoPE-rotated Key and unrotated Value $K=V$, while `v_proj` is physically omitted in weights).
+* Adapting `k_proj` alters RoPE long-range positional routing and disrupts tool syntax across long contexts.
+* LoRA target modules are strictly locked to:
   ```python
-  target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+  target_modules = ["q_proj", "v_proj", "o_proj"]
   ```
-
 ### Chat Template and Special Token Isolation
 * Gemma 4 uses strict turn tokens: `<start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n...`.
 * The tokenizer used during training must match the Google Gemma 4 IT tokenizer exactly. Any synthetic prompt formatting must remove the leading `<bos>` token if the chat template injects it automatically, preventing double BOS corruption.
@@ -148,7 +148,7 @@ Execute the production-grade deployment launcher. The script runs a 7-gate prefl
 ```
 
 **What the deployment script does automatically:**
-1. Runs 7 preflight check gates: system binaries, `yapcheeleong@gmail.com` identity, GCS bucket write test, dataset formatting (1,107 samples), training script target modules (`q_proj, k_proj, v_proj, o_proj`), and zone GPU availability.
+1. Runs 7 preflight check gates: system binaries, `yapcheeleong@gmail.com` identity, GCS bucket write test, dataset formatting (1,107 samples), training script target modules (`q_proj, v_proj, o_proj`, with `k_proj` omitted), and zone GPU availability.
 2. Uploads `data/unsloth_sft_train.jsonl`, `data/unsloth_sft_val.jsonl`, and `scripts/train_gemma4_unsloth_cloud.py` to `gs://${BUCKET}/input/`.
 3. Injects the self-destruct startup script into VM metadata.
 4. Boots the ephemeral Spot VM with Deep Learning VM image (`pytorch-2-9-cu129-ubuntu-2204-nvidia-580`).
@@ -201,7 +201,9 @@ with open("my_submission/adapters/main_lora/adapter_config.json", "r") as f:
     cfg = json.load(f)
 
 assert cfg["r"] == 8, f"Expected rank 8, got {cfg.get(\"r\")}"
-assert "k_proj" in cfg["target_modules"], "k_proj missing from target_modules!"
+for mod in ["q_proj", "v_proj", "o_proj"]:
+    assert mod in cfg["target_modules"], f"{mod} missing from target_modules!"
+assert "k_proj" not in cfg["target_modules"], "k_proj must be omitted (breaks attention_k_eq_v=True)!"
 print("✅ Adapter config is valid and matches competition standards!")
 '
 ```

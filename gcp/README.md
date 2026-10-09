@@ -15,13 +15,13 @@ Fine-tuning for SWE-bench-style developer agents requires strict alignment betwe
    - **Development Trap:** Training against post-training bitsandbytes NormalFloat4 (`bnb-4bit`) distorts base linear activations, degrading tool call syntax precision and reasoning stability.
    - **GCP Infrastructure:** Provisioning L4 (24 GB) or A100 (40 GB/80 GB) instances allows training against official base distributions with Unsloth gradient checkpointing, eliminating quantization mismatch.
 
-2. **The Reciprocal Attention Rule (`k_proj` Dropping Bug):**
-   - Past configurations used regex filters that silently dropped `k_proj`.
-   - Attention query-key interaction requires reciprocal adaptation. Target modules must explicitly include:
+2. **The Attention Geometry & `k_proj` Omission Rule (`attention_k_eq_v=True`):**
+   - Gemma 4 31B features 50 sliding-window layers and 10 global full-attention layers.
+   - The 10 global layers configure `attention_k_eq_v=True`, where `k_proj` physically serves as both the RoPE-rotated Key and unrotated Value ($K=V$), while `v_proj` is physically omitted in `model.safetensors`.
+   - Adapting `k_proj` alters RoPE long-range positional routing and disrupts tool syntax across long contexts. LoRA target modules are strictly locked to:
      ```python
-     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+     target_modules = ["q_proj", "v_proj", "o_proj"]
      ```
-
 3. **Response-Only Loss Masking & Tokenizer Isolation:**
    - Training masks user prompts and applies loss exclusively to model response turns (`<start_of_turn>model\n...<end_of_turn>\n`).
    - The tokenizer removes leading `<bos>` prefixes when chat templates inject them to prevent double-BOS sequence corruption.
@@ -62,7 +62,7 @@ Before staging any files or launching cloud compute instances, `deploy_gemma4_lo
 3. **Project & API Enablement:** Ensures project `gen-lang-client-0266946478` is active and that `compute.googleapis.com` is enabled.
 4. **Cloud Storage Writeability:** Verifies bucket `gs://gen-lang-client-0266946478-gemma4-checkpoints` exists, is accessible, and passes write/delete probes.
 5. **Dataset Integrity & JSONL Schema:** Verifies `data/unsloth_sft_train.jsonl` and `data/unsloth_sft_val.jsonl` exist, are non-empty, parse cleanly line-by-line, and contain valid `messages` lists. Reports line counts and train/val split ratio.
-6. **Training Script Integrity:** Syntax-checks `scripts/train_gemma4_unsloth_cloud.py`, asserts `target_modules` contains `["q_proj", "k_proj", "v_proj", "o_proj"]`, checks Rank-8 configuration, verifies response-only loss masking, and checks `HF_TOKEN`.
+6. **Training Script Integrity:** Syntax-checks `scripts/train_gemma4_unsloth_cloud.py`, asserts `target_modules` contains `["q_proj", "v_proj", "o_proj"]` (with `k_proj` omitted), checks Rank-8 configuration, verifies response-only loss masking, and checks `HF_TOKEN`.
 7. **Zone Hardware Capacity:** Verifies that the requested zone supports the target machine type and GPU accelerator.
 
 ---

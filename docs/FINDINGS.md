@@ -293,3 +293,62 @@ layout (`scripts/` only, no flat copy) is correct**. The repo's five gauntlet/or
 files were the stale side: they asserted a flat `skills/<name>/<verb>.py` existed and was
 byte-identical to the `scripts/` copy. Those constants now point at the real shipped scripts and the
 byte-identity invariant is gone — there is only one copy, and the harness loads exactly that one.
+
+## F14 — CONFIRMED: 0-byte task logs on Kaggle caused by rich Jupyter auto-detection
+
+**Status: CONFIRMED (reproduced independently, 2026-10-05)**
+
+**Root Cause**: A Jupyter auto-detection defect in the `rich` display layer of the third-party harness
+(`swegemma 0.2.7` / `adk_eval_core 0.1.0`), NOT an infrastructure, config, or packaging failure.
+
+1. `agent_runner.py:220-226` creates every `results/logs/<id>.log` unconditionally (`logs_dir.mkdir`,
+   then `open(log_path, 'w')`) before agent execution begins — which is why all 129 log files exist
+   even when tasks crash or produce no trace.
+2. The logger initializes `Console(file=log_file, force_terminal=True, width=120)`. Because `force_jupyter`
+   is not explicitly passed, `rich.console.Console._is_jupyter()` auto-detects `ZMQInteractiveShell` in the
+   Kaggle notebook kernel environment and sets `self._console.is_jupyter = True`.
+3. In `event_display.py` `_flush_logs()`:
+   ```python
+   if logs and not self._console.is_jupyter:
+       self._console.print(...)
+   ```
+   Under Kaggle/Jupyter, that branch is skipped entirely. Log lines accumulate only in the in-memory
+   `_persistent_logs` list, which is rendered solely via `_build_live_renderable()`, reachable only when
+   `enable_live=True`. The file display manager is constructed with `enable_live=False`.
+4. Net result: 129 cleanly created, cleanly closed, permanently 0-byte log files.
+
+**Empirical Evidence**:
+- `cloud_results/results/traces`: 95 files, 95 non-empty (bypasses `rich` via `verification.py` `save_trace_artifact`).
+- `cloud_results/results/logs`: 129 files, 0 non-empty (suppressed by `_is_jupyter`).
+- Control: `results/run_B40/logs`: 77 files, 77 non-empty (outside Jupyter / in pure CLI, `_is_jupyter` is False).
+
+**Causality**:
+Symptom / parallel observability defect, NOT a cause of 0/129 or low resolution rate. The defect lives
+purely in the display layer.
+
+**Remediation Proposal**:
+In Kaggle diagnostic notebooks (`simulation/kernels_diag/kaggle_baseline_v1/baseline_v1.ipynb`), monkeypatch
+`rich.console.Console._is_jupyter = lambda self: False` before importing `adk_submission` / `adk_eval_core`
+to force file logging inside Jupyter notebooks.
+
+## F15 — CONFIRMED TIMELINE / BLOCKED ON LOGS: 18-live / 77-zero / 34-no-trace split (`gemma4-az59`)
+
+**Status: TIMELINE CONFIRMED FROM TRACES; ROOT CAUSE BLOCKED BY MISSING VLLM/TASK LOGS (2026-10-08)**
+
+**Empirical Breakdown (`evidence/cloud_runs_results/task_results.jsonl` + `traces/trace_*.json`)**:
+Across all 129 tasks (95 trace files, 34 missing traces, 129 0-byte log files):
+- **Bucket D (`total_completion_tokens > 0`)**: 18 tasks (`10 fastapi`, `8 requests`, `0 rich`, `0 httpx`), rows `0..17`.
+- **Bucket B (trace exists, `final_metrics.total_completion_tokens == 0`, `steps == [system, user]`)**: 77 tasks (`57 fastapi`, `14 rich`, `5 requests`, `1 httpx`).
+- **Bucket A (no trace file constructed)**: 34 tasks (`34 rich` only; `0 fastapi/requests/httpx`).
+
+**Exact Timestamp & Duration Transition (`steps[].extra.timestamp` & `duration_seconds`)**:
+1. **Rows `0..16` (`t = +0.0s` to `+2540.5s`, `0.00h–0.71h`)**: 17 tasks (`10 fastapi`, `7 requests`) execute multi-step tool loops normally (`duration_seconds` `73.7s–332.2s`, `574–8414` completion tokens).
+2. **Row `17` (`requests_7205`, onset boundary)**: Starts at `t = 1790840087.37` (`+2548.1s` / `0.71h`). Emits 5 `run_skill_script` agent steps through `elapsed_s = 19.59s` (`t = 1790840102.43`), then stalls for the remaining `255.4s` (`duration_seconds = 275.0s`, `test_exit_code = -1`) waiting on the next model response.
+3. **Rows `18..53` (36 tasks: `6 rich` Bucket A + `30 fastapi` Bucket B, `+0.71h` to `+4.41h`)**: Every task times out uniformly at `272.2s–289.8s` (`~15s` container setup + `~260s` request timeout) with `0` completion tokens.
+4. **Row `54` (`fastapi_14360`)**: Stalls for `9461.8s` (`2.63h`) with `0` completion tokens.
+5. **Rows `55..128` (74 tasks, `+6.47h` to `+8.30h`)**: Every task fails fast in `93.4s–117.7s` with `0` completion tokens (`B_zero` or `A_notrc`), indicating the local vLLM endpoint had transitioned from hanging requests (`~260s` timeout) to immediate connection/request failure after `fastapi_14360`.
+
+**Blocker on Server-Side Root Cause**:
+- All 129 per-task logs (`evidence/cloud_runs_results/logs/*.log`) are **0 bytes** due to the `rich.console.Console._is_jupyter` auto-detection bug (F14), which suppressed the Python exception/HTTP error string raised during `requests_7205` step 8 and subsequent tasks.
+- No vLLM server stdout/stderr log was saved in the harvested artifact (`evidence/cloud_runs_results/`).
+- Both observability gaps are now remediated for future runs via the `rich.console.Console._is_jupyter = lambda self: False` monkeypatch (`baseline_v1.ipynb` and `scripts/build_kaggle_kernel.py`) and the Phase 4.6 non-degeneracy smoke test.
